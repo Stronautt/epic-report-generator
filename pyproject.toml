@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "epic-report-generator"
+version = "0.9"
+description = "PySide6 desktop app that generates PDF Epic progress reports from Jira Cloud"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "Epic Report Generator Contributors" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: End Users/Desktop",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Scheduling",
+]
+dependencies = [
+    "PySide6>=6.5,<7",
+    "jira>=3.5,<4",
+    "requests-oauthlib>=1.3,<2",
+    "reportlab>=4.0,<5",
+    "matplotlib>=3.7,<4",
+    "pandas>=2.0,<3",
+    "keyring>=24.0,<26",
+    "platformdirs>=3.0,<5",
+    "python-dateutil>=2.8,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-qt>=4.2", "pytest-cov>=4.0", "build>=1.0"]
+
+[project.scripts]
+epic-report-generator = "epic_report_generator.__main__:main"
+
+[project.gui-scripts]
+epic-report-generator-gui = "epic_report_generator.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+epic_report_generator = ["resources/**/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+qt_api = "pyside6"

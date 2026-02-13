@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Epic Report Generator
+Comment=Generate PDF Epic progress reports from Jira Cloud
+Exec=epic-report-generator-gui
+Terminal=false
+Icon=epic-report-generator
+Categories=Office;ProjectManagement;
+Keywords=jira;epic;report;pdf;
+StartupWMClass=epic-report-generator
