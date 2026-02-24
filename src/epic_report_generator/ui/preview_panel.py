@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QThread, Signal
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QPixmap, QResizeEvent
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -37,7 +37,7 @@ class _GenerateWorker(QObject):
     """Fetch Jira data and build PDF in a background thread."""
 
     progress = Signal(str, int)  # message, percent
-    finished = Signal(object)  # ReportData | None
+    finished = Signal(object, object, int)  # (pdf_bytes | None, errors, epic_count)
 
     def __init__(self, jira: JiraClient, config: ReportConfig) -> None:
         super().__init__()
@@ -69,6 +69,8 @@ class _GenerateWorker(QObject):
                     start_date_field=self._config.start_date_field,
                     due_date_field=self._config.due_date_field,
                     include_subtasks=self._config.include_subtasks,
+                    timeline_start_field=self._config.timeline_start_field,
+                    timeline_end_field=self._config.timeline_end_field,
                 )
                 if epic is None:
                     logger.warning("Epic %s not found or inaccessible", item.key)
@@ -99,6 +101,8 @@ class _GenerateWorker(QObject):
                     start_date_field=self._config.start_date_field,
                     due_date_field=self._config.due_date_field,
                     include_subtasks=self._config.include_subtasks,
+                    timeline_start_field=self._config.timeline_start_field,
+                    timeline_end_field=self._config.timeline_end_field,
                 )
                 if not label_epics:
                     report.errors.append(f"No epics found for label '{item.key}'.")
@@ -123,6 +127,7 @@ class _GenerateWorker(QObject):
                         estimation_method=self._config.estimation_method,
                         progress_method=self._config.progress_method,
                     )
+                    em.scope_certainty = item.scope_certainty
                     source_pairs.append((e, em))
                     if "-" in e.key:
                         project_keys.add(e.key.rsplit("-", 1)[0])
@@ -146,15 +151,22 @@ class _GenerateWorker(QObject):
             except Exception as exc:
                 logger.warning("Failed to fetch versions for %s: %s", pk, exc)
 
+        # Generate PDF in the worker thread (off UI thread)
+        pdf_bytes: bytes | None = None
         if report.epics:
             self.progress.emit("Generating PDF…", 85)
+            try:
+                pdf_bytes = generate_pdf(report)
+            except Exception as exc:
+                logger.exception("PDF generation failed in worker")
+                report.errors.append(f"PDF generation failed: {exc}")
 
         logger.info(
             "Worker finished: %d item(s) fetched, %d error(s)",
             len(report.epics),
             len(report.errors),
         )
-        self.finished.emit(report)
+        self.finished.emit(pdf_bytes, report.errors, len(report.epics))
 
 
 class PreviewPanel(QWidget):
@@ -170,6 +182,13 @@ class PreviewPanel(QWidget):
         self._thread: QThread | None = None
         self._worker: _GenerateWorker | None = None
         self._dark = False
+        # Pixmap cache: (pdf_id, width, dpr) -> list[QPixmap]
+        self._pixmap_cache: tuple[int, int, float, list[QPixmap]] | None = None
+        # Debounce timer for resize events
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.setInterval(150)
+        self._resize_timer.timeout.connect(self._on_resize_debounced)
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -211,6 +230,12 @@ class PreviewPanel(QWidget):
 
     # -- public API -----------------------------------------------------------
 
+    def shutdown(self) -> None:
+        """Wait for the generation thread to finish before closing."""
+        if self._thread is not None and self._thread.isRunning():
+            self._thread.quit()
+            self._thread.wait()
+
     def set_dark(self, dark: bool) -> None:
         """Update the theme flag for preview rendering."""
         self._dark = dark
@@ -223,6 +248,10 @@ class PreviewPanel(QWidget):
         if not self._jira.connected:
             logger.warning("Generate called but Jira is not connected")
             QMessageBox.warning(self, "Not Connected", "Connect to Jira first.")
+            return
+
+        if self._thread is not None and self._thread.isRunning():
+            logger.warning("Generate called while a previous run is still active")
             return
 
         item_count = len(config.items) or len(config.epic_keys)
@@ -240,18 +269,25 @@ class PreviewPanel(QWidget):
         self._worker.finished.connect(self._on_generate_finished)
         self._worker.finished.connect(self._thread.quit)
         self._worker.finished.connect(self._cleanup_worker)
-        self._thread.finished.connect(self._thread.deleteLater)
+        self._thread.finished.connect(self._clear_thread)
         self._thread.start()
 
     def clear_preview(self) -> None:
         """Public method to clear the preview and reset state."""
         self._clear_preview()
         self._pdf_bytes = None
+        self._pixmap_cache = None
         self._export_btn.setEnabled(False)
         self._status_label.clear()
         self._progress_bar.hide()
 
     # -- slots ----------------------------------------------------------------
+
+    def _clear_thread(self) -> None:
+        """Release the thread reference after it finishes."""
+        if self._thread is not None:
+            self._thread.deleteLater()
+            self._thread = None
 
     def _cleanup_worker(self) -> None:
         """Release the worker reference after generation completes."""
@@ -263,48 +299,54 @@ class PreviewPanel(QWidget):
         self._progress_bar.setValue(pct)
         self._status_label.setText(message)
 
-    def _on_generate_finished(self, report: ReportData | None) -> None:
+    def _on_generate_finished(
+        self,
+        pdf_bytes: bytes | None,
+        errors: list[str],
+        epic_count: int,
+    ) -> None:
         self._progress_bar.setValue(100)
 
-        if report is None or not report.epics:
+        if epic_count == 0:
             self._progress_bar.hide()
             logger.warning("No epics returned — nothing to generate")
             self._status_label.setText("No data to generate a report.")
-            if report and report.errors:
+            if errors:
                 QMessageBox.warning(
                     self,
                     "Errors",
-                    "\n".join(report.errors),
+                    "\n".join(errors),
                 )
             return
 
-        if report.errors:
+        # Show non-fatal errors (e.g. some epics failed)
+        pdf_errors = [e for e in errors if e.startswith("PDF generation failed")]
+        fetch_errors = [e for e in errors if e not in pdf_errors]
+        if fetch_errors:
             QMessageBox.warning(
                 self,
                 "Some Epics Failed",
-                "The following errors occurred:\n" + "\n".join(report.errors),
+                "The following errors occurred:\n" + "\n".join(fetch_errors),
             )
 
-        logger.info("Building PDF from %d epic(s)", len(report.epics))
-        self._status_label.setText("Building PDF…")
-        try:
-            self._pdf_bytes = generate_pdf(report)
-        except Exception as exc:
-            logger.exception("PDF generation failed")
-            QMessageBox.critical(self, "PDF Error", f"Failed to generate PDF: {exc}")
+        if pdf_bytes is None:
             self._progress_bar.hide()
+            logger.error("PDF generation failed in worker")
+            msg = pdf_errors[0] if pdf_errors else "PDF generation failed."
+            QMessageBox.critical(self, "PDF Error", msg)
             self._status_label.setText("PDF generation failed.")
             return
 
+        self._pdf_bytes = pdf_bytes
+        self._pixmap_cache = None
         self._progress_bar.hide()
         logger.info(
             "PDF generated: %d epic(s), %s bytes",
-            len(report.epics),
+            epic_count,
             f"{len(self._pdf_bytes):,}",
         )
         self._status_label.setText(
-            f"Report ready — {len(report.epics)} epic(s), "
-            f"{len(self._pdf_bytes):,} bytes"
+            f"Report ready — {epic_count} epic(s), " f"{len(self._pdf_bytes):,} bytes"
         )
         self._export_btn.setEnabled(True)
         self._render_preview()
@@ -323,12 +365,21 @@ class PreviewPanel(QWidget):
     # -- preview rendering ----------------------------------------------------
 
     def resizeEvent(self, event: QResizeEvent) -> None:
-        """Re-render preview when panel is resized so pages scale to fit."""
+        """Re-render preview when panel is resized so pages scale to fit.
+
+        Debounced via a 150ms timer so rapid resize events don't trigger
+        expensive re-renders on every frame.
+        """
         super().resizeEvent(event)
         # Keep the preview area at least one 16:9 page tall
         w = self._scroll.viewport().width()
         if w > 0:
             self._scroll.setMinimumHeight(int(w * 9 / 16))
+        if self._pdf_bytes:
+            self._resize_timer.start()
+
+    def _on_resize_debounced(self) -> None:
+        """Called after the resize debounce timer fires."""
         if self._pdf_bytes:
             self._render_preview()
 
@@ -341,7 +392,11 @@ class PreviewPanel(QWidget):
                     w.deleteLater()
 
     def _render_preview(self) -> None:
-        """Render PDF pages as QPixmap images scaled to fit the panel width."""
+        """Render PDF pages as QPixmap images scaled to fit the panel width.
+
+        Caches rendered pixmaps keyed by (pdf_id, available_width, dpr).
+        On cache hit, rebuilds QLabels from cached pixmaps without re-rendering.
+        """
         self._clear_preview()
         if not self._pdf_bytes:
             return
@@ -352,61 +407,74 @@ class PreviewPanel(QWidget):
         else:
             self._preview_container.setStyleSheet("background: #E0E0E0;")
 
-        try:
-            from PySide6.QtCore import QBuffer, QIODevice, QSize
-            from PySide6.QtPdf import QPdfDocument
+        available_width = self._scroll.viewport().width() - 16
+        dpr = self.devicePixelRatio() or 1.0
+        pdf_id = id(self._pdf_bytes)
 
-            buf = QBuffer(self)
-            buf.setData(self._pdf_bytes)
-            buf.open(QIODevice.OpenModeFlag.ReadOnly)
+        # Check pixmap cache
+        cached_pixmaps: list[QPixmap] | None = None
+        if (
+            self._pixmap_cache is not None
+            and self._pixmap_cache[0] == pdf_id
+            and self._pixmap_cache[1] == available_width
+            and self._pixmap_cache[2] == dpr
+        ):
+            cached_pixmaps = self._pixmap_cache[3]
 
-            doc = QPdfDocument(self)
-            doc.load(buf)
+        if cached_pixmaps is None:
+            # Render from PDF
+            try:
+                from PySide6.QtCore import QBuffer, QIODevice, QSize
+                from PySide6.QtPdf import QPdfDocument
 
-            # Available width for rendering (scroll area viewport minus small margin)
-            available_width = self._scroll.viewport().width() - 16
-            dpr = self.devicePixelRatio() or 1.0
+                buf = QBuffer(self)
+                buf.setData(self._pdf_bytes)
+                buf.open(QIODevice.OpenModeFlag.ReadOnly)
 
-            for i in range(doc.pageCount()):
-                page_size = doc.pagePointSize(i)
-                # Scale page to fit available width
-                if page_size.width() > 0:
-                    scale = available_width / page_size.width()
-                else:
-                    scale = 1.5
-                # Ensure minimum reasonable scale and cap at 3x
-                scale = max(0.5, min(scale, 3.0))
-                # Render at device-pixel-ratio resolution for sharp HiDPI output
-                render_size = QSize(
-                    int(page_size.width() * scale * dpr),
-                    int(page_size.height() * scale * dpr),
+                doc = QPdfDocument(self)
+                doc.load(buf)
+
+                cached_pixmaps = []
+                for i in range(doc.pageCount()):
+                    page_size = doc.pagePointSize(i)
+                    if page_size.width() > 0:
+                        scale = available_width / page_size.width()
+                    else:
+                        scale = 1.5
+                    scale = max(0.5, min(scale, 3.0))
+                    render_size = QSize(
+                        int(page_size.width() * scale * dpr),
+                        int(page_size.height() * scale * dpr),
+                    )
+                    image = doc.render(i, render_size)
+                    pixmap = QPixmap.fromImage(image)
+                    pixmap.setDevicePixelRatio(dpr)
+                    cached_pixmaps.append(pixmap)
+
+                doc.close()
+                buf.close()
+
+                # Store in cache
+                self._pixmap_cache = (pdf_id, available_width, dpr, cached_pixmaps)
+
+            except ImportError:
+                lbl = QLabel(
+                    "PDF preview requires PySide6-QtPdf.\n"
+                    "Use 'Export as PDF' to view the report."
                 )
-                image = doc.render(i, render_size)
+                lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                self._preview_layout.addWidget(lbl)
+                return
 
-                pixmap = QPixmap.fromImage(image)
-                pixmap.setDevicePixelRatio(dpr)
-
-                label = QLabel()
-                label.setPixmap(pixmap)
-                label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                # Add subtle shadow/border around each page
-                if self._dark:
-                    label.setStyleSheet(
-                        "border: 1px solid #333; background: transparent; padding: 2px;"
-                    )
-                else:
-                    label.setStyleSheet(
-                        "border: 1px solid #ccc; background: transparent; padding: 2px;"
-                    )
-                self._preview_layout.addWidget(label)
-
-            doc.close()
-            buf.close()
-        except ImportError:
-            # QtPdf not available — show a simple message
-            lbl = QLabel(
-                "PDF preview requires PySide6-QtPdf.\n"
-                "Use 'Export as PDF' to view the report."
-            )
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self._preview_layout.addWidget(lbl)
+        # Build QLabels from pixmaps
+        border_style = (
+            "border: 1px solid #333; background: transparent; padding: 2px;"
+            if self._dark
+            else "border: 1px solid #ccc; background: transparent; padding: 2px;"
+        )
+        for pixmap in cached_pixmaps:
+            label = QLabel()
+            label.setPixmap(pixmap)
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            label.setStyleSheet(border_style)
+            self._preview_layout.addWidget(label)

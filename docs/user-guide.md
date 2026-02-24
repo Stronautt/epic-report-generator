@@ -23,6 +23,7 @@
    - [Sidebar Navigation](#sidebar-navigation)
    - [Keyboard Shortcuts](#keyboard-shortcuts)
 4. [Configuring a Report](#4-configuring-a-report)
+   - [Configuration Profiles](#configuration-profiles)
    - [Report Items — Epics & Labels](#report-items--epics--labels)
    - [Title Page](#title-page)
    - [Estimation & Progress](#estimation--progress)
@@ -61,7 +62,8 @@ Pre-built installers are available for each platform:
 | Platform | Installer |
 |----------|-----------|
 | Windows  | `epic-report-generator-setup.exe` |
-| macOS    | `epic-report-generator.dmg` |
+| macOS (Apple Silicon) | `epic-report-generator-arm64.dmg` |
+| macOS (Intel) | `epic-report-generator-intel.dmg` |
 | Linux    | `epic-report-generator.AppImage` |
 
 ### Launching the App
@@ -212,6 +214,30 @@ Step 1 is expanded by default. It contains several collapsible sections.
 
 ---
 
+### Configuration Profiles
+
+The **Profile Bar** at the top of the configuration panel lets you save and switch between multiple named configuration sets. Each profile stores its own report items, field mappings, estimation settings, and title page values independently, while sharing global settings like the Jira connection and theme.
+
+#### Profile Controls
+
+| Button | Action |
+|--------|--------|
+| **Profile dropdown** | Switch between saved profiles. The active profile's settings load immediately. |
+| **Save As…** | Clone all current settings into a new named profile. |
+| **Rename** | Rename the active profile. Disabled for the "Default" profile. |
+| **Delete** | Delete the active profile after confirmation. Disabled for the "Default" profile. The app switches to "Default" automatically. |
+
+#### How It Works
+
+- A **"Default"** profile is always present and cannot be renamed or deleted.
+- When you change any setting, it auto-saves to the active profile.
+- Switching profiles reloads all configuration fields instantly.
+- **"Save As…"** copies every setting from the current profile, making it easy to create variants of an existing report template.
+
+> **Note:** If you're upgrading from an older version, your existing settings are automatically migrated into the "Default" profile — no action required.
+
+---
+
 ### Report Items — Epics & Labels
 
 This is the main section where you define what appears in the report. You can add two types of items:
@@ -233,7 +259,7 @@ Each item has an optional **Cert.** dropdown:
 #### Buttons
 
 - **+ Add Row** — add a new row (defaults to Epic)
-- **Validate Epics** — checks each epic key against Jira and shows inline results (`✓` valid, `✗` invalid)
+- **Validate Epics** — checks each epic key against Jira in the background and shows inline results (`✓` valid, `✗` invalid). The UI remains responsive while validation runs.
 
 ---
 
@@ -297,7 +323,7 @@ When checked (default), the app fetches sub-tasks linked via the `parent` field 
 
 ### Timeline Chart
 
-Configure the Gantt-style timeline that appears in the report:
+Configure the Gantt-style timeline that appears in the report. Timeline dates are configured **independently** from the estimation dates used for progress calculation, so you can use different Jira fields for each purpose.
 
 | Option | Default | Description |
 |--------|---------|-------------|
@@ -306,6 +332,16 @@ Configure the Gantt-style timeline that appears in the report:
 | **End Date Field** | `duedate` | Jira field for epic timeline end |
 | **Fixed Start Date** | *(empty)* | Lock the timeline x-axis start; leave empty to auto-scale |
 | **Fixed End Date** | *(empty)* | Lock the timeline x-axis end; leave empty to auto-scale |
+
+#### Date Fallback Cascade
+
+When an epic or child issue has no explicit timeline date set, the app applies a fallback cascade to determine its position on the chart:
+
+1. **Explicit timeline field** value (highest priority)
+2. **Sprint start/end dates** from child issues (matches Jira Cloud Timeline behaviour)
+3. **Estimation start/due date** field values
+
+This means epics will appear on the timeline even if you haven't set explicit start/end dates, as long as their children are assigned to sprints.
 
 > **Note:** When setting fixed dates, the start must be at least 5 days before the end. The app will auto-correct the other date if this constraint is violated.
 
@@ -321,7 +357,7 @@ Override the Jira custom field IDs used to fetch data. Most users can leave thes
 
 #### Auto-Detection
 
-Click **Detect Fields** to scan your Jira instance. The app queries available fields and opens a picker dialog where you can select the correct field IDs from dropdowns. This is useful when your Jira instance uses non-standard custom field IDs.
+Click **Detect Fields** to scan your Jira instance in the background. The app queries available fields and opens a picker dialog where you can select the correct field IDs from dropdowns — including both estimation and timeline date fields. This is useful when your Jira instance uses non-standard custom field IDs.
 
 ---
 
@@ -332,11 +368,22 @@ Click **Detect Fields** to scan your Jira instance. The app queries available fi
 1. Configure your report items and options in Step 1.
 2. Click **Generate Report** (or press `Ctrl+G`).
 
+The entire generation process runs in a **background thread**, so the UI stays responsive — you can continue browsing settings or logs while the report builds.
+
 The app will:
 - Collapse Step 1 and expand Step 2
-- Fetch data for each epic/label from Jira (progress shown as a percentage)
+- Fetch data for each epic/label from Jira
 - Fetch fix versions
 - Build the PDF
+
+A **progress bar** tracks each stage:
+
+| Progress | Stage |
+|----------|-------|
+| 0–70% | Fetching epics and labels |
+| 75% | Fetching fix versions |
+| 85% | Generating PDF |
+| 100% | Complete |
 
 Status messages keep you informed:
 - *"Fetching PROJ-123…"*
@@ -417,9 +464,10 @@ The **Logs** panel shows a live stream of application events. It's useful for de
 ### General Tips
 
 - **All configuration auto-saves.** You don't need to manually save report settings — they persist automatically between sessions.
+- **Use profiles** to maintain separate report templates (e.g. per project or per client) and switch between them instantly.
 - **Use Validate Epics** before generating to catch typos in epic keys early.
 - **Detect Fields** saves time if your Jira instance uses non-standard custom field IDs.
-- **Labels are powerful** — adding a single label can pull in dozens of epics automatically.
+- **Labels are powerful** — adding a single label can pull in dozens of epics automatically. The PDF summary table shows aggregated statistics (total issues, done issues, estimates) in each label group's header row.
 
 ### Common Issues
 
@@ -452,5 +500,5 @@ The **Logs** panel shows a live stream of application events. It's useful for de
 ---
 
 <p align="center">
-  <sub>Epic Report Generator v0.9.1</sub>
+  <sub>Epic Report Generator</sub>
 </p>

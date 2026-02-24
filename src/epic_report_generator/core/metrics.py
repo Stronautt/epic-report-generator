@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 
 from epic_report_generator.core.data_models import EpicData, EpicMetrics, JiraIssue
 
@@ -35,22 +35,20 @@ def calculate_metrics(
         logger.debug("Epic %s has no children — returning empty metrics", epic.key)
         return m
 
+    # Pre-compute estimates once per child (avoids 4+ calls per child)
+    child_estimates: list[tuple[JiraIssue, float | None]] = [
+        (c, _get_estimate(c, estimation_method)) for c in children
+    ]
+
     m.total_issues = len(children)
     m.completed_issues = sum(1 for c in children if c.status_category == "Done")
     m.open_issues = m.total_issues - m.completed_issues
-    m.unestimated_issues = sum(
-        1 for c in children if _get_estimate(c, estimation_method) is None
-    )
-    m.total_sp = sum(
-        est
-        for c in children
-        if (est := _get_estimate(c, estimation_method)) is not None
-    )
+    m.unestimated_issues = sum(1 for _, est in child_estimates if est is None)
+    m.total_sp = sum(est for _, est in child_estimates if est is not None)
     m.completed_sp = sum(
-        _get_estimate(c, estimation_method) or 0
-        for c in children
-        if c.status_category == "Done"
-        and _get_estimate(c, estimation_method) is not None
+        est
+        for c, est in child_estimates
+        if c.status_category == "Done" and est is not None
     )
     m.remaining_sp = m.total_sp - m.completed_sp
     m.progress = _progress(
@@ -103,6 +101,8 @@ def merge_metrics(
     all_fix_versions: list[str] = []
     start_dates: list[date] = []
     due_dates: list[date] = []
+    tl_starts: list[date] = []
+    tl_ends: list[date] = []
 
     for epic in epics:
         all_labels.extend(epic.labels)
@@ -111,29 +111,51 @@ def merge_metrics(
             start_dates.append(epic.start_date)
         if epic.due_date:
             due_dates.append(epic.due_date)
+        if epic.timeline_start:
+            tl_starts.append(epic.timeline_start)
+        if epic.timeline_end:
+            tl_ends.append(epic.timeline_end)
         for child in epic.children:
             if child.key not in seen:
                 seen.add(child.key)
                 merged_children.append(child)
 
     keys = [e.key for e in epics]
-    # Fallback: derive dates from ALL merged children if no epic-level dates.
+    # Always include child dates so the synthetic epic spans the full range
+    # of all source epics and their children.
     # Per-child: prefer start_date/due_date, fall back to created/resolved
     # so every child contributes to the range.
-    if not start_dates:
-        for c in merged_children:
+    # Timeline: cascade timeline fields → sprint dates → start_date/due_date
+    # (matches Jira Cloud Timeline behaviour).
+    for c in merged_children:
+        if c.start_date:
+            start_dates.append(c.start_date)
+        elif c.created:
+            start_dates.append(c.created.date())
+        if c.due_date:
+            due_dates.append(c.due_date)
+        elif c.resolved and c.status_category == "Done":
+            due_dates.append(c.resolved.date())
+        # Timeline start cascade
+        if c.timeline_start:
+            tl_starts.append(c.timeline_start)
+        else:
+            for sp in c.sprints:
+                if sp.start_date:
+                    tl_starts.append(sp.start_date)
             if c.start_date:
-                start_dates.append(c.start_date)
-            elif c.created:
-                start_dates.append(c.created.date())
-    if not due_dates:
-        for c in merged_children:
+                tl_starts.append(c.start_date)
+        # Timeline end cascade
+        if c.timeline_end:
+            tl_ends.append(c.timeline_end)
+        else:
+            for sp in c.sprints:
+                if sp.end_date:
+                    tl_ends.append(sp.end_date)
             if c.due_date:
-                due_dates.append(c.due_date)
-            elif c.resolved and c.status_category == "Done":
-                due_dates.append(c.resolved.date())
-        if not due_dates and start_dates:
-            due_dates = [date.today()]
+                tl_ends.append(c.due_date)
+    if not due_dates and start_dates:
+        due_dates = [date.today()]
 
     synthetic = EpicData(
         key=", ".join(keys) if keys else "LABEL",
@@ -149,6 +171,8 @@ def merge_metrics(
         children=merged_children,
         start_date=min(start_dates) if start_dates else None,
         due_date=max(due_dates) if due_dates else None,
+        timeline_start=min(tl_starts) if tl_starts else None,
+        timeline_end=max(tl_ends) if tl_ends else None,
     )
 
     m = calculate_metrics(synthetic, estimation_method, progress_method)
@@ -210,14 +234,14 @@ def _velocity(
     weeks: int = 4,
 ) -> float | None:
     """Estimate completed per week over the last *weeks* weeks."""
-    cutoff = datetime.now().astimezone() - timedelta(weeks=weeks)
+    cutoff_date = date.today() - timedelta(weeks=weeks)
     sp = sum(
         est
         for c in children
         if (est := _get_estimate(c, estimation_method)) is not None
         and c.status_category == "Done"
         and c.resolved
-        and c.resolved >= cutoff
+        and c.resolved.date() >= cutoff_date
     )
     return sp / weeks if sp else None
 
@@ -248,7 +272,11 @@ def _build_time_series(
     children: list[JiraIssue],
     estimation_method: str = "story_points",
 ) -> None:
-    """Build daily time-series arrays for the trend chart."""
+    """Build daily time-series arrays for the trend chart.
+
+    Uses an O(n log n + d) algorithm with sorted event lists and incremental
+    pointers instead of the previous O(n × d) approach.
+    """
     dated = [(c, c.created) for c in children if c.created is not None]
     if not dated:
         return
@@ -258,39 +286,71 @@ def _build_time_series(
     if min_date >= max_date:
         return
 
-    day = min_date
+    # Pre-compute estimates once
+    est_map: dict[str, float | None] = {
+        c.key: _get_estimate(c, estimation_method) for c, _ in dated
+    }
+
+    # Sort by creation date for incremental pointer
+    created_sorted = sorted(dated, key=lambda pair: pair[1])
+    # Build resolved list: (resolved_date as date, child) sorted by resolved date.
+    # Use .date() to avoid timezone-aware vs naive datetime comparison issues.
+    resolved_sorted = sorted(
+        [
+            (c.resolved.date(), c)
+            for c, _ in dated
+            if c.status_category == "Done" and c.resolved
+        ],
+        key=lambda pair: pair[0],
+    )
+
+    num_days = (max_date - min_date).days + 1
     dates: list[date] = []
     total_sp_ts: list[float] = []
     completed_sp_ts: list[float] = []
     cum_issues: list[int] = []
     cum_unest: list[int] = []
 
-    while day <= max_date:
-        day_end = datetime(day.year, day.month, day.day, 23, 59, 59)
-        day_end = day_end.astimezone()
+    # Running totals
+    running_total_sp = 0.0
+    running_done_sp = 0.0
+    running_issues = 0
+    running_unest = 0
 
-        created_by_day = [c for c, dt in dated if dt.date() <= day]
-        done_by_day = [
-            c
-            for c in created_by_day
-            if c.status_category == "Done" and c.resolved and c.resolved <= day_end
-        ]
+    created_ptr = 0
+    resolved_ptr = 0
+
+    for i in range(num_days):
+        day = min_date + timedelta(days=i)
+
+        # Advance created pointer
+        while created_ptr < len(created_sorted):
+            c, dt = created_sorted[created_ptr]
+            if dt.date() <= day:
+                est = est_map[c.key]
+                running_total_sp += est or 0
+                running_issues += 1
+                if est is None:
+                    running_unest += 1
+                created_ptr += 1
+            else:
+                break
+
+        # Advance resolved pointer (compare date-to-date, no timezone issues)
+        while resolved_ptr < len(resolved_sorted):
+            resolved_date, c = resolved_sorted[resolved_ptr]
+            if resolved_date <= day:
+                est = est_map[c.key]
+                running_done_sp += est or 0
+                resolved_ptr += 1
+            else:
+                break
 
         dates.append(day)
-        total_sp_ts.append(
-            sum(_get_estimate(c, estimation_method) or 0 for c in created_by_day)
-        )
-        completed_sp_ts.append(
-            sum(_get_estimate(c, estimation_method) or 0 for c in done_by_day)
-        )
-        cum_issues.append(len(created_by_day))
-        cum_unest.append(
-            sum(
-                1 for c in created_by_day if _get_estimate(c, estimation_method) is None
-            )
-        )
-
-        day += timedelta(days=1)
+        total_sp_ts.append(running_total_sp)
+        completed_sp_ts.append(running_done_sp)
+        cum_issues.append(running_issues)
+        cum_unest.append(running_unest)
 
     m.dates = dates
     m.total_sp_over_time = total_sp_ts

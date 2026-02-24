@@ -9,7 +9,6 @@ permissions:
   contents: write
 
 env:
-  APP_VERSION: "0.9.1"
   # Shared Nuitka flags applied on every platform
   NUITKA_COMMON: >-
     --standalone
@@ -18,6 +17,7 @@ env:
     --lto=yes
     --python-flag=no_docstrings
     --python-flag=no_asserts
+    --python-flag=-m
     --python-flag=isolated
     --jobs=4
     --noinclude-qt-translations
@@ -46,8 +46,10 @@ jobs:
         include:
           - os: ubuntu-22.04
             installer_path: "epic-report-generator.AppImage"
-          - os: macos-14
-            installer_path: "epic-report-generator.dmg"
+          - os: macos-15
+            installer_path: "epic-report-generator-arm64.dmg"
+          - os: macos-15-intel
+            installer_path: "epic-report-generator-intel.dmg"
           - os: windows-2022
             installer_path: "packaging/windows/Output/epic-report-generator-setup.exe"
     runs-on: ${{ matrix.os }}
@@ -78,14 +80,35 @@ jobs:
       - name: Build wheel
         run: python -m build --wheel
 
+      - name: Read version from pyproject.toml
+        id: meta
+        shell: bash
+        run: |
+          VERSION=$(python -c "
+          import tomllib, pathlib
+          data = tomllib.loads(pathlib.Path('pyproject.toml').read_text())
+          print(data['project']['version'])
+          ")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
       - name: Convert PNG to ICO (Windows)
         if: runner.os == 'Windows'
+        shell: bash
         run: |
           python -c "
           from PIL import Image
           img = Image.open('src/epic_report_generator/resources/logo.png')
           img.save('src/epic_report_generator/resources/logo.ico', sizes=[(16,16),(32,32),(48,48),(256,256)])
           "
+
+      # Homebrew on Intel places an openssl@3 symlink at /usr/local/lib/libcrypto.dylib
+      # pointing to /usr/local/opt/openssl@3/lib/libcrypto.3.dylib. Nuitka's dependency
+      # scanner cannot reconcile the two paths and aborts with a FATAL error. Unlinking
+      # removes the symlink so the scanner never encounters it. The setup-python Python
+      # ships its own OpenSSL, so nothing else is affected.
+      - name: Unlink Homebrew OpenSSL (macOS Intel)
+        if: matrix.os == 'macos-15-intel'
+        run: brew unlink openssl@3 || true
 
       - name: Build Nuitka binary
         shell: bash
@@ -104,8 +127,8 @@ jobs:
                 "--windows-icon-from-ico=src/epic_report_generator/resources/logo.ico"
                 "--windows-company-name=Epic Report Generator"
                 "--windows-product-name=Epic Report Generator"
-                "--windows-file-version=${APP_VERSION}.0"
-                "--windows-product-version=${APP_VERSION}.0"
+                "--windows-file-version=${{ steps.meta.outputs.version }}.0"
+                "--windows-product-version=${{ steps.meta.outputs.version }}.0"
                 "--output-filename=epic-report-generator.exe"
               )
               ;;
@@ -114,7 +137,7 @@ jobs:
                 --macos-create-app-bundle
                 "--macos-app-name=Epic Report Generator"
                 "--macos-app-icon=src/epic_report_generator/resources/logo.png"
-                "--macos-app-version=$APP_VERSION"
+                "--macos-app-version=${{ steps.meta.outputs.version }}"
                 "--output-filename=epic-report-generator"
                 "--output-dir=."
               )
@@ -131,19 +154,24 @@ jobs:
           python -m nuitka $NUITKA_COMMON \
             "${NOFOLLOW_FLAGS[@]}" \
             "${PLATFORM_FLAGS[@]}" \
-            src/epic_report_generator/__main__.py
+            src/epic_report_generator
 
-          # Nuitka names output dirs after the source module (__main__),
-          # not --output-filename; rename to the expected names.
+          # Nuitka names output dirs after the package name;
+          # rename to the expected names.
           case "$RUNNER_OS" in
-            Linux)  mv __main__.dist epic-report-generator.dist ;;
-            macOS)  mv __main__.app  epic-report-generator.app  ;;
+            Linux)  mv epic_report_generator.dist epic-report-generator.dist ;;
+            macOS)  mv epic_report_generator.app  epic-report-generator.app  ;;
           esac
 
       # ── Windows installer ──────────────────────────────────────────
       - name: Install Inno Setup (Windows)
         if: runner.os == 'Windows'
         run: choco install innosetup -y
+
+      - name: Patch Inno Setup version
+        if: runner.os == 'Windows'
+        shell: bash
+        run: sed -i "s/@@VERSION@@/${{ steps.meta.outputs.version }}/g" packaging/windows/setup.iss
 
       - name: Build Windows installer
         if: runner.os == 'Windows'
@@ -162,7 +190,7 @@ jobs:
             --window-size 600 400 \
             --icon-size 100 \
             --app-drop-link 450 200 \
-            "epic-report-generator.dmg" \
+            "${{ matrix.installer_path }}" \
             "epic-report-generator.app"
 
       # ── Linux AppImage ─────────────────────────────────────────────

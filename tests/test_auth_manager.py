@@ -7,18 +7,21 @@ import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from epic_report_generator.services.auth_manager import KEYRING_SERVICE, AuthManager
 from epic_report_generator.services.config_manager import ConfigManager
 
 
 def _make_config(tmp_path: Path) -> ConfigManager:
     """Isolated ConfigManager backed by *tmp_path*."""
-    mgr = ConfigManager()
+    import copy
+
+    from epic_report_generator.services.config_manager import _DEFAULTS
+
+    mgr = ConfigManager.__new__(ConfigManager)
     mgr._dir = tmp_path
     mgr._path = tmp_path / "config.json"
-    mgr.reset()
+    mgr._dir_created = False
+    mgr._data = copy.deepcopy(_DEFAULTS)
     return mgr
 
 

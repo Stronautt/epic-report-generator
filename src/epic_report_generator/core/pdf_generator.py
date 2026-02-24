@@ -24,6 +24,7 @@ from reportlab.platypus import (
 )
 
 from epic_report_generator.core.chart_generator import (
+    _MONTHS_ABBR,
     generate_epic_chart,
     generate_timeline_chart,
 )
@@ -34,7 +35,6 @@ from epic_report_generator.core.data_models import (
     ReportConfig,
     ReportData,
     ReportItem,
-    SprintInfo,
     TimelineItem,
 )
 
@@ -53,20 +53,6 @@ _MONTHS_FULL = [
     "October",
     "November",
     "December",
-]
-_MONTHS_ABBR = [
-    "Jan",
-    "Feb",
-    "Mar",
-    "Apr",
-    "May",
-    "Jun",
-    "Jul",
-    "Aug",
-    "Sep",
-    "Oct",
-    "Nov",
-    "Dec",
 ]
 
 
@@ -145,7 +131,7 @@ def generate_pdf(report: ReportData) -> bytes:
 
     # Page 1 — Title
     logger.debug("Building title page")
-    _add_title_page(story, report.config, styles, pal)
+    _add_title_page(story, report.config, styles)
 
     # Page 2+ — Summary table
     logger.debug("Building summary table for %d epic(s)", len(report.epics))
@@ -155,7 +141,7 @@ def generate_pdf(report: ReportData) -> bytes:
     # Timeline page (after summary, before epic details)
     logger.debug("Building timeline page")
     story.append(PageBreak())
-    _add_timeline_page(story, report, styles, pal, dark)
+    _add_timeline_page(story, report, styles, dark)
 
     # Pages 3+ — Individual Epic pages
     show_additional = report.config.show_additional_metrics
@@ -228,7 +214,7 @@ def _create_doc(buf: io.BytesIO, pal: dict[str, Any]) -> BaseDocTemplate:
     )
     frame = Frame(MARGIN, MARGIN, PAGE_W - 2 * MARGIN, PAGE_H - 2 * MARGIN, id="main")
 
-    def _on_page(canvas: Any, doc: Any) -> None:
+    def _on_page(canvas: Any, _doc: Any) -> None:
         canvas.saveState()
         canvas.setFillColor(pal["bg"])
         canvas.rect(0, 0, PAGE_W, PAGE_H, fill=1, stroke=0)
@@ -357,7 +343,6 @@ def _add_title_page(
     story: list[Any],
     config: ReportConfig,
     styles: dict[str, ParagraphStyle],
-    pal: dict[str, Any],
 ) -> None:
     story.append(Spacer(1, 60 * mm))
     story.append(Paragraph(config.title, styles["title"]))
@@ -418,7 +403,6 @@ def _add_summary_table(
 
     data_rows = []
     group_header_indices: list[int] = []  # row indices (1-based) that are group headers
-    num_cols = len(headers)
 
     def _epic_row(
         epic: EpicData, metrics: EpicMetrics, key_text: str = ""
@@ -443,13 +427,34 @@ def _add_summary_table(
     if report.resolved_items:
         for item, epic, metrics in report.resolved_items:
             if item.kind == "label" and item.key in report.label_source_epics:
-                # Group header row for the label
+                # Group header row for the label with aggregated statistics
                 label_name = item.display_name or item.key
+                n_epics = len(report.label_source_epics[item.key])
                 header_cell = Paragraph(
-                    f'<b>{label_name}</b> <font size="7">({len(report.label_source_epics[item.key])} epics)</font>',
+                    f'<b>{label_name}</b> <font size="7">({n_epics} epics)</font>',
                     styles["cell"],
                 )
-                group_row = [header_cell] + [""] * (num_cols - 1)
+                group_row = [
+                    header_cell,
+                    "",  # Summary (spanned with Key)
+                    _progress_bar_para(metrics.progress, styles, pal),
+                    _certainty_para(metrics.scope_certainty, styles, pal),
+                    Paragraph(f"<b>{_aggregate_status(epic)}</b>", styles["cell"]),
+                    Paragraph(f"<b>{metrics.total_issues}</b>", styles["cell_right"]),
+                    Paragraph(
+                        f"<b>{metrics.completed_issues}</b>",
+                        styles["cell_right"],
+                    ),
+                    Paragraph(
+                        f"<b>{metrics.unestimated_issues}</b>",
+                        styles["cell_right"],
+                    ),
+                    Paragraph(f"<b>{metrics.total_sp:.0f}</b>", styles["cell_right"]),
+                    Paragraph(
+                        f"<b>{metrics.completed_sp:.0f}</b>",
+                        styles["cell_right"],
+                    ),
+                ]
                 data_rows.append(group_row)
                 group_header_indices.append(
                     len(data_rows)
@@ -499,9 +504,9 @@ def _add_summary_table(
         ("BOTTOMPADDING", (0, 1), (-1, -1), 4),
     ]
 
-    # Group header row styling (span + background)
+    # Group header row styling (span Key+Summary columns, background for full row)
     for gi in group_header_indices:
-        style_cmds.append(("SPAN", (0, gi), (-1, gi)))
+        style_cmds.append(("SPAN", (0, gi), (1, gi)))
         style_cmds.append(("BACKGROUND", (0, gi), (-1, gi), pal["label_header"]))
         style_cmds.append(("TOPPADDING", (0, gi), (-1, gi), 6))
         style_cmds.append(("BOTTOMPADDING", (0, gi), (-1, gi), 6))
@@ -565,7 +570,6 @@ def _add_timeline_page(
     story: list[Any],
     report: ReportData,
     styles: dict[str, ParagraphStyle],
-    pal: dict[str, Any],
     dark: bool,
 ) -> None:
     """Add a Gantt-style timeline page after the summary table."""
@@ -583,11 +587,20 @@ def _add_timeline_page(
         group: str = "",
     ) -> None:
         """Append a timeline item for an epic and optionally its children."""
+        tl_start = epic.timeline_start or epic.start_date
+        tl_end = epic.timeline_end or epic.due_date
+        logger.debug(
+            "Timeline item %r: timeline_start=%s, timeline_end=%s, progress=%.1f%%",
+            name,
+            tl_start,
+            tl_end,
+            metrics.progress,
+        )
         timeline_items.append(
             TimelineItem(
                 name=name,
-                start_date=epic.start_date,
-                end_date=epic.due_date,
+                start_date=tl_start,
+                end_date=tl_end,
                 scope_certainty=metrics.scope_certainty,
                 progress=metrics.progress,
                 group=group,
@@ -595,12 +608,14 @@ def _add_timeline_page(
         )
         if show_children and epic.children:
             for child in epic.children:
-                if child.start_date and child.due_date:
+                c_start = child.timeline_start or child.start_date
+                c_end = child.timeline_end or child.due_date
+                if c_start and c_end:
                     timeline_items.append(
                         TimelineItem(
                             name=f"  {child.key}",
-                            start_date=child.start_date,
-                            end_date=child.due_date,
+                            start_date=c_start,
+                            end_date=c_end,
                             scope_certainty=None,
                             progress=100.0 if child.status_category == "Done" else 0.0,
                             is_child=True,
@@ -715,7 +730,10 @@ def _add_epic_page(
     if display_key == epic.summary:
         heading_text = f'{tag_html}<font color="{accent_hex}">{display_key}</font>'
     else:
-        heading_text = f'{tag_html}<font color="{accent_hex}">{display_key}</font> — {epic.summary}'
+        heading_text = (
+            f'{tag_html}<font color="{accent_hex}">{display_key}</font>'
+            f" — {epic.summary}"
+        )
     story.append(Paragraph(heading_text, styles["heading"]))
     status = _aggregate_status(epic)
     story.append(Paragraph(f"Status: <b>{status}</b>", styles["body"]))

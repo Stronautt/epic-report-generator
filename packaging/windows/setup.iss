@@ -1,6 +1,6 @@
 [Setup]
 AppName=Epic Report Generator
-AppVersion=0.9.1
+AppVersion=@@VERSION@@
 AppPublisher=Epic Report Generator
 DefaultDirName={autopf}\Epic Report Generator
 DefaultGroupName=Epic Report Generator

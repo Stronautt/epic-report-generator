@@ -526,8 +526,20 @@ class LoginPanel(QWidget):
         self._worker.finished.connect(self._on_login_finished)
         self._worker.finished.connect(self._thread.quit)
         self._worker.finished.connect(self._cleanup_worker)
-        self._thread.finished.connect(self._thread.deleteLater)
+        self._thread.finished.connect(self._clear_thread)
         self._thread.start()
+
+    def shutdown(self) -> None:
+        """Wait for the login thread to finish before closing."""
+        if self._thread is not None and self._thread.isRunning():
+            self._thread.quit()
+            self._thread.wait()
+
+    def _clear_thread(self) -> None:
+        """Release the thread reference after it finishes."""
+        if self._thread is not None:
+            self._thread.deleteLater()
+            self._thread = None
 
     def _cleanup_worker(self) -> None:
         """Release the worker reference after the login flow completes."""

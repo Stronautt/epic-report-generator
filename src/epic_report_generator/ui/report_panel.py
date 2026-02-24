@@ -1,4 +1,4 @@
-"""Combined Report panel — config (Step 1) + preview (Step 2) in collapsible sections."""
+"""Report panel — config (Step 1) + preview (Step 2) in collapsible sections."""
 
 from __future__ import annotations
 

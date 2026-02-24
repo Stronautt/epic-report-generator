@@ -11,6 +11,7 @@ from PySide6.QtCore import (
     QRect,
     QSize,
     Qt,
+    QTimer,
     Signal,
 )
 from PySide6.QtGui import (
@@ -25,10 +26,12 @@ from PySide6.QtWidgets import (
     QCompleter,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLayout,
     QLayoutItem,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QVBoxLayout,
@@ -37,6 +40,10 @@ from PySide6.QtWidgets import (
 )
 
 from epic_report_generator.core.data_models import ReportItem
+from epic_report_generator.services.config_manager import (
+    DEFAULT_PROFILE_NAME,
+    ConfigManager,
+)
 
 
 class _IgnoreScrollFilter(QObject):
@@ -50,7 +57,7 @@ class _IgnoreScrollFilter(QObject):
 
 
 def no_scroll_wheel(widget: QWidget) -> None:
-    """Make *widget* ignore mouse-wheel events (useful for combo boxes and date edits)."""
+    """Ignore mouse-wheel events on *widget* (combo boxes, date edits)."""
     widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
     widget.installEventFilter(_IgnoreScrollFilter(widget))
 
@@ -160,8 +167,6 @@ class CopyField(QWidget):
         if clipboard:
             clipboard.setText(self._field.text())
         self._btn.setText("Copied!")
-        from PySide6.QtCore import QTimer
-
         QTimer.singleShot(1500, lambda: self._btn.setText("Copy"))
 
 
@@ -254,7 +259,7 @@ class GuideStep(QWidget):
 
 
 class FlowLayout(QLayout):
-    """A flow layout that arranges child widgets left-to-right, wrapping to the next row."""
+    """Flow layout that arranges widgets left-to-right, wrapping rows."""
 
     def __init__(self, parent: QWidget | None = None, spacing: int = 6) -> None:
         super().__init__(parent)
@@ -409,7 +414,8 @@ class CollapsibleSection(QWidget):
 
     def _update_arrow(self) -> None:
         arrow = "▼" if self._expanded else "▶"
-        self._header.setText(f"{arrow}  {self._title}")
+        escaped = self._title.replace("&", "&&")
+        self._header.setText(f"{arrow}  {escaped}")
 
 
 # ---------------------------------------------------------------------------
@@ -511,12 +517,14 @@ class EpicKeyTagInput(QWidget):
         # Split on commas, newlines, whitespace for paste support
         parts = re.split(r"[,\n\s]+", raw)
         any_added = False
+        existing_keys = {c.key for c in self._chips}
         for part in parts:
             part = part.strip().upper()
             if not part:
                 continue
-            if RE_EPIC_KEY.match(part) and part not in {c.key for c in self._chips}:
+            if RE_EPIC_KEY.match(part) and part not in existing_keys:
                 self._add_chip(part)
+                existing_keys.add(part)
                 any_added = True
         self._line_edit.clear()
         if any_added:
@@ -635,8 +643,8 @@ class _ReportItemRow(QWidget):
     def _on_kind_changed(self) -> None:
         """Toggle display name enabled/placeholder based on kind."""
         is_label = self.kind_combo.currentData() == "label"
-        self.name_edit.setEnabled(True)
         if is_label:
+            self.name_edit.setEnabled(True)
             self.name_edit.setPlaceholderText("Display name (required)")
             self.key_edit.setPlaceholderText("label-name")
             if self._label_completions:
@@ -758,6 +766,7 @@ class ReportItemTable(QWidget):
 
     def set_items(self, items: list[dict]) -> None:
         """Restore rows from a list of dicts."""
+        self.blockSignals(True)
         self.clear()
         for d in items:
             self.add_row(
@@ -766,17 +775,26 @@ class ReportItemTable(QWidget):
                 display_name=d.get("display_name", ""),
                 scope_certainty=d.get("scope_certainty", ""),
             )
+        self.blockSignals(False)
+        self.items_changed.emit()
 
     def set_from_epic_keys(self, keys: list[str]) -> None:
         """Migration helper: convert old epic key list to rows."""
+        self.blockSignals(True)
         self.clear()
         for key in keys:
             self.add_row(kind="epic", key=key)
+        self.blockSignals(False)
+        self.items_changed.emit()
 
     def clear(self) -> None:
-        """Remove all rows."""
-        for row in list(self._rows):
-            self._remove_row(row)
+        """Remove all rows without per-row signal emission."""
+        for row in self._rows:
+            self._rows_layout.removeWidget(row)
+            row.deleteLater()
+        self._rows.clear()
+        if not self.signalsBlocked():
+            self.items_changed.emit()
 
     def row_count(self) -> int:
         """Return the number of rows."""
@@ -908,3 +926,138 @@ class SidebarUserInfo(QWidget):
         self._auth_label.clear()
         self._avatar.clear()
         self.hide()
+
+
+# ---------------------------------------------------------------------------
+# ProfileBar — profile selector bar for the config panel
+# ---------------------------------------------------------------------------
+
+
+class ProfileBar(QWidget):
+    """Always-visible bar for switching between configuration profiles."""
+
+    profile_changed = Signal(str)
+
+    def __init__(self, config: ConfigManager, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._config = config
+        self.setObjectName("profileBar")
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 8)
+        layout.setSpacing(6)
+
+        lbl = QLabel("Profile:")
+        layout.addWidget(lbl)
+
+        self._combo = QComboBox()
+        no_scroll_wheel(self._combo)
+        self._combo.setMinimumWidth(140)
+        self._combo.currentTextChanged.connect(self._on_combo_changed)
+        layout.addWidget(self._combo, 1)
+
+        self._save_as_btn = QPushButton("Save As...")
+        self._save_as_btn.setProperty("secondary", "true")
+        self._save_as_btn.setToolTip("Clone current settings into a new named profile")
+        self._save_as_btn.clicked.connect(self._save_as)
+        layout.addWidget(self._save_as_btn)
+
+        self._rename_btn = QPushButton("Rename")
+        self._rename_btn.setProperty("secondary", "true")
+        self._rename_btn.setToolTip("Rename the current profile")
+        self._rename_btn.clicked.connect(self._rename)
+        layout.addWidget(self._rename_btn)
+
+        self._delete_btn = QPushButton("Delete")
+        self._delete_btn.setProperty("danger", "true")
+        self._delete_btn.setToolTip("Delete the current profile")
+        self._delete_btn.clicked.connect(self._delete)
+        layout.addWidget(self._delete_btn)
+
+        self.refresh()
+
+    def refresh(self) -> None:
+        """Re-sync the combo box from ConfigManager."""
+        self._combo.blockSignals(True)
+        self._combo.clear()
+        for name in self._config.profile_names:
+            self._combo.addItem(name)
+        active = self._config.active_profile_name
+        idx = self._combo.findText(active)
+        if idx >= 0:
+            self._combo.setCurrentIndex(idx)
+        self._combo.blockSignals(False)
+        self._update_button_state()
+
+    def _update_button_state(self) -> None:
+        """Disable Rename/Delete for the Default profile."""
+        is_default = self._combo.currentText() == DEFAULT_PROFILE_NAME
+        self._rename_btn.setEnabled(not is_default)
+        self._delete_btn.setEnabled(not is_default)
+
+    def _on_combo_changed(self, name: str) -> None:
+        if not name:
+            return
+        self._config.switch_profile(name)
+        self._update_button_state()
+        self.profile_changed.emit(name)
+
+    def _save_as(self) -> None:
+        name, ok = QInputDialog.getText(
+            self,
+            "Save Profile As",
+            "Profile name:",
+        )
+        name = name.strip()
+        if not ok or not name:
+            return
+        if name in self._config.profile_names:
+            QMessageBox.warning(
+                self,
+                "Duplicate Name",
+                f'A profile named "{name}" already exists.',
+            )
+            return
+        self._config.create_profile(name, clone_from=self._config.active_profile_name)
+        self.refresh()
+        self.profile_changed.emit(name)
+
+    def _rename(self) -> None:
+        old_name = self._combo.currentText()
+        if old_name == DEFAULT_PROFILE_NAME:
+            return
+        new_name, ok = QInputDialog.getText(
+            self,
+            "Rename Profile",
+            "New name:",
+            text=old_name,
+        )
+        new_name = new_name.strip()
+        if not ok or not new_name or new_name == old_name:
+            return
+        if new_name in self._config.profile_names:
+            QMessageBox.warning(
+                self,
+                "Duplicate Name",
+                f'A profile named "{new_name}" already exists.',
+            )
+            return
+        self._config.rename_profile(old_name, new_name)
+        self.refresh()
+
+    def _delete(self) -> None:
+        name = self._combo.currentText()
+        if name == DEFAULT_PROFILE_NAME:
+            return
+        reply = QMessageBox.question(
+            self,
+            "Delete Profile",
+            f'Delete profile "{name}"?\n\nThis cannot be undone.',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._config.delete_profile(name)
+        self.refresh()
+        self.profile_changed.emit(self._config.active_profile_name)

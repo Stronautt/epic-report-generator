@@ -33,6 +33,8 @@ class JiraIssue:
     assignee: str | None
     start_date: date | None = None
     due_date: date | None = None
+    timeline_start: date | None = None
+    timeline_end: date | None = None
     sprints: list[SprintInfo] = field(default_factory=list)
 
 
@@ -53,6 +55,8 @@ class EpicData:
     children: list[JiraIssue] = field(default_factory=list)
     start_date: date | None = None
     due_date: date | None = None
+    timeline_start: date | None = None
+    timeline_end: date | None = None
 
 
 @dataclass

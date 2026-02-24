@@ -53,8 +53,8 @@ src/epic_report_generator/
 ├── __main__.py                    # Entry point
 ├── app.py                         # QApplication setup, signal handlers
 ├── core/
-│   ├── data_models.py             # Dataclasses: JiraIssue, EpicData, EpicMetrics, ReportConfig, ReportData
-│   ├── jira_client.py             # JIRA library wrapper, API-token + OAuth connection, pagination, retry
+│   ├── data_models.py             # Dataclasses: JiraIssue, EpicData, EpicMetrics, ReportConfig, ReportData, TimelineItem
+│   ├── jira_client.py             # JIRA library wrapper, API-token + OAuth connection, pagination, retry, date expansion
 │   ├── metrics.py                 # Progress, velocity, cycle time, scope change, forecasting, time-series
 │   ├── chart_generator.py         # Matplotlib Jira-style trend charts (light/dark)
 │   └── pdf_generator.py           # ReportLab PDF builder (title, summary table, epic detail pages)
@@ -104,6 +104,23 @@ The `estimation_method` field on `ReportConfig` (`"story_points"` or `"time_days
 
 When `include_subtasks` is enabled (default `True`), `_fetch_children()` performs a second paginated JQL query (`parent in (CHILD-1, CHILD-2, ...)`) after fetching direct epic children. Subtasks are merged into the children list with key-based deduplication. Child keys are batched in groups of 100 to respect JQL `IN` clause limits. The option is exposed as a checkbox in the Config panel under "Custom Field Mapping" and stored in `ReportConfig.include_subtasks`.
 
+### Timeline Date Computation
+
+Timeline dates determine when epics appear on the Gantt-style timeline chart. Each `EpicData` and `JiraIssue` has separate `timeline_start`/`timeline_end` fields alongside the estimation `start_date`/`due_date`.
+
+Two independent date field pairs are configurable in the Config panel under "Custom Field Mapping":
+
+1. **Estimation dates** (`start_date_field`/`due_date_field`): used for time-based estimation (`time_days` method) and the trend chart time-series. Stored on `ReportConfig` as `start_date_field`/`due_date_field`.
+
+2. **Timeline dates** (`timeline_start_field`/`timeline_end_field`): used for the Gantt chart. Stored on `ReportConfig` as `timeline_start_field`/`timeline_end_field`. Defaults to the estimation fields when not explicitly set.
+
+Epic-level date expansion (`_fill_epic_dates_from_children`) pools dates from the epic itself and all children:
+
+- **Estimation dates**: cascade `start_date`/`due_date` → `created`/`resolved`.
+- **Timeline dates**: cascade `timeline_start`/`timeline_end` → sprint start/end dates → `start_date`/`due_date`. The sprint fallback matches Jira Cloud Timeline behaviour, which derives epic ranges from child sprint assignments when no explicit date fields are set.
+
+The same cascade is applied in `merge_metrics()` when building synthetic label-group epics.
+
 ### Progress Calculation
 
 ```python
@@ -115,7 +132,7 @@ progress = (completed_estimate / total_estimate) * (closed_issues / total_issues
 
 ### PDF Layout
 
-Landscape 16:9 pages (406mm x 228.4mm). Page 1: title page. Page 2+: summary table with progress bars. Pages 3+: per-epic detail with trend chart + metrics sidebar.
+Landscape 16:9 pages (406mm x 228.4mm). Page 1: title page. Page 2: summary table with progress bars (label-group header rows show aggregated statistics). Page 3: Gantt-style timeline chart. Pages 4+: per-epic detail with trend chart + metrics sidebar.
 
 ## Code Standards
 
@@ -125,6 +142,7 @@ Landscape 16:9 pages (406mm x 228.4mm). Page 1: title page. Page 2+: summary tab
 - Exponential backoff for Jira rate limiting (429 responses)
 - `RE_EPIC_KEY` regex (in `widgets.py`) is the single source of truth for epic key validation
 - matplotlib backend set to `Agg` before any matplotlib submodule imports
+- Custom/configurable Jira fields read via `_get_raw_field()` (raw JSON dict) rather than the `jira` library's `PropertyHolder` which may drop custom fields
 
 ## Security
 

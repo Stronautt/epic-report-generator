@@ -149,7 +149,7 @@ def generate_epic_chart(
     unit = metrics.estimation_unit  # "SP" or "Days"
 
     # Total estimate area (gray)
-    date_nums = [_d2n(d) for d in dates]
+    date_nums = mdates.date2num(dates)
     ax1.fill_between(
         date_nums,
         metrics.total_sp_over_time,
@@ -236,6 +236,7 @@ def generate_epic_chart(
     plt.close(fig)
     buf.seek(0)
     data = buf.read()
+    buf.close()
     logger.debug("Chart rendered: %d bytes", len(data))
     return data
 
@@ -294,7 +295,7 @@ def generate_timeline_chart(
     n = len(items)
     natural_height = max(2.5, n * 0.4)
     fig_height = min(natural_height, max_height_inches)
-    epic_bar_height = min(0.6, (fig_height / max(n, 1)) * 0.8)
+    epic_bar_height = min(0.85, (fig_height / max(n, 1)) * 1.1)
     child_bar_height = epic_bar_height * 0.55
     epic_font = max(5.5, min(7.5, epic_bar_height * 12))
     child_font = max(4.5, min(6.0, child_bar_height * 12))
@@ -315,6 +316,16 @@ def generate_timeline_chart(
         if item.start_date and item.end_date:
             full_duration = max((item.end_date - item.start_date).days, 1)
             bar_left = _d2n(item.start_date)
+            logger.debug(
+                "Timeline bar %r: start=%s (ordinal=%.1f), end=%s (ordinal=%.1f), "
+                "duration=%d days",
+                item.name,
+                item.start_date,
+                bar_left,
+                item.end_date,
+                _d2n(item.end_date),
+                full_duration,
+            )
 
             is_child = item.is_child
             h = child_bar_height if is_child else epic_bar_height
@@ -337,6 +348,7 @@ def generate_timeline_chart(
                 color=color,
                 alpha=0.25,
                 edgecolor="none",
+                zorder=3,
             )
             done_duration = full_duration * (item.progress / 100.0)
             if done_duration > 0:
@@ -348,6 +360,7 @@ def generate_timeline_chart(
                     color=color,
                     alpha=0.85,
                     edgecolor="none",
+                    zorder=4,
                 )
 
             # Adaptive text: dark text on light/short bars, white on dark bars
@@ -374,6 +387,7 @@ def generate_timeline_chart(
                 color=text_color,
                 fontweight=fweight,
                 clip_on=True,
+                zorder=5,
                 bbox=dict(
                     boxstyle="round,pad=0.1",
                     facecolor=color,
@@ -484,7 +498,7 @@ def generate_timeline_chart(
                     color=pal["sprint_pill_edge"],
                     linewidth=0.4,
                     linestyle=":",
-                    zorder=1,
+                    zorder=2,
                 )
 
             # Sprint pill label: condensed date range (uses original dates)
@@ -505,6 +519,7 @@ def generate_timeline_chart(
                 va="bottom",
                 annotation_clip=True,
                 multialignment="center",
+                zorder=10,
                 bbox=dict(
                     boxstyle="round,pad=0.35",
                     facecolor=pal["sprint_pill_bg"],
@@ -524,7 +539,7 @@ def generate_timeline_chart(
             color=pal["milestone_pill_edge"],
             linestyle="--",
             linewidth=1.0,
-            zorder=3,
+            zorder=2,
         )
         ax.annotate(
             f"  {ms.name}",
@@ -535,7 +550,8 @@ def generate_timeline_chart(
             color=pal["milestone_text"],
             ha="left",
             va="bottom",
-            annotation_clip=True,
+            annotation_clip=False,
+            zorder=10,
             bbox=dict(
                 boxstyle="round,pad=0.3",
                 facecolor=pal["milestone_pill_bg"],
@@ -621,6 +637,7 @@ def generate_timeline_chart(
     plt.close(fig)
     buf.seek(0)
     data = buf.read()
+    buf.close()
     logger.debug("Timeline chart rendered: %d bytes", len(data))
     return data
 
@@ -695,6 +712,7 @@ def _draw_major_date_labels(
             ha="center",
             va="bottom",
             annotation_clip=False,
+            zorder=10,
         )
         if draw_sep:
             # Full-height vertical separator from bottom of axes through
@@ -708,6 +726,7 @@ def _draw_major_date_labels(
                 textcoords=("data", "axes fraction"),
                 arrowprops=dict(arrowstyle="-", color=pal["grid"], lw=0.7),
                 annotation_clip=False,
+                zorder=2,
             )
 
     if span_days <= 90:
@@ -753,23 +772,37 @@ def _draw_major_date_labels(
 
 
 def _draw_weekend_bands(ax: Any, dates: list[date], color: str) -> None:
-    """Draw light gray vertical bands for weekends."""
+    """Draw light gray vertical bands for weekends.
+
+    Uses arithmetic stepping (7-day intervals) instead of checking every day,
+    reducing iterations from O(d) to O(d/7).
+    """
     if not dates:
         return
 
-    in_weekend = False
-    start: date | None = None
+    first = dates[0]
+    last = dates[-1]
 
-    for d in dates:
-        if d.weekday() >= 5:  # Saturday=5, Sunday=6
-            if not in_weekend:
-                start = d
-                in_weekend = True
-        else:
-            if in_weekend and start is not None:
-                ax.axvspan(_d2n(start), _d2n(d), color=color, zorder=0)
-                in_weekend = False
+    # Find the first Saturday on or before 'first', then advance by 7-day steps.
+    # weekday(): Mon=0 … Sat=5, Sun=6.
+    # days_back_to_sat: how many days to go back to reach Saturday.
+    # For Sunday (6): go back 1 day.  For Saturday (5): go back 0 days.
+    # For weekdays Mon–Fri (0–4): go back (weekday - 5 + 7) % 7 days, but
+    # we want the *next* Saturday, so use forward offset instead.
+    #
+    # Strategy: find the Saturday that starts the first visible weekend band.
+    # If first is Sun, the band started on the previous Saturday.
+    # If first is Sat, the band starts today.
+    # Otherwise, the first band starts on the next Saturday.
+    if first.weekday() == 6:  # Sunday — band started yesterday (Saturday)
+        sat = first - timedelta(days=1)
+    else:
+        days_to_sat = (5 - first.weekday()) % 7
+        sat = first + timedelta(days=days_to_sat)
 
-    # Close trailing weekend
-    if in_weekend and start is not None:
-        ax.axvspan(_d2n(start), _d2n(dates[-1]), color=color, zorder=0)
+    while sat <= last:
+        # Weekend spans Saturday to Monday (exclusive)
+        mon = sat + timedelta(days=2)
+        weekend_end = min(mon, last + timedelta(days=1))
+        ax.axvspan(_d2n(sat), _d2n(weekend_end), color=color, zorder=0)
+        sat += timedelta(days=7)

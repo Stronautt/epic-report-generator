@@ -10,10 +10,15 @@ from epic_report_generator.services.config_manager import ConfigManager
 
 def _make_manager(tmp_path: Path) -> ConfigManager:
     """Create a ConfigManager pointing at *tmp_path* for isolation."""
-    mgr = ConfigManager()
+    mgr = ConfigManager.__new__(ConfigManager)
     mgr._dir = tmp_path
     mgr._path = tmp_path / "config.json"
-    mgr.reset()
+    mgr._dir_created = False
+    import copy
+
+    from epic_report_generator.services.config_manager import _DEFAULTS
+
+    mgr._data = copy.deepcopy(_DEFAULTS)
     return mgr
 
 
@@ -71,30 +76,26 @@ class TestPersistence:
         mgr.set("jira_url", "https://company.atlassian.net")
 
         # Create a fresh manager reading from the same file
-        mgr2 = ConfigManager()
-        mgr2._dir = tmp_path
-        mgr2._path = tmp_path / "config.json"
-        mgr2._data = {}
+        mgr2 = _make_manager(tmp_path)
         mgr2._load()
         assert mgr2.get("theme") == "dark"
         assert mgr2.get("jira_url") == "https://company.atlassian.net"
 
     def test_reset_restores_defaults(self, tmp_path: Path) -> None:
         mgr = _make_manager(tmp_path)
-        mgr.set("theme", "dark")
+        # Use a profile-scoped key since reset() only affects the active profile
+        mgr.set("estimation_method", "time_days")
+        assert mgr.get("estimation_method") == "time_days"
         mgr.reset()
-        assert mgr.get("theme") == "light"
+        assert mgr.get("estimation_method") == "story_points"
 
     def test_corrupt_file_does_not_crash(self, tmp_path: Path) -> None:
         config_path = tmp_path / "config.json"
         config_path.write_text("NOT JSON {{{", encoding="utf-8")
 
-        mgr = ConfigManager()
-        mgr._dir = tmp_path
-        mgr._path = config_path
-        mgr._data = {"theme": "light"}
+        mgr = _make_manager(tmp_path)
         mgr._load()
-        # Should not raise; data stays at prior state
+        # Should not raise; defaults survive corrupt file
         assert mgr.get("theme") == "light"
 
     def test_list_values_persist(self, tmp_path: Path) -> None:

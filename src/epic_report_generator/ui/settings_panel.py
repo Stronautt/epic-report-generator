@@ -109,8 +109,6 @@ class SettingsPanel(QWidget):
 
     def _build_connection_section(self) -> None:
         """Build the auth-method-aware connection group box."""
-        method = self._auth.auth_method
-
         # -- API Token connection info ----------------------------------------
         self._api_token_group = QGroupBox("Connection")
         api_layout = QVBoxLayout(self._api_token_group)

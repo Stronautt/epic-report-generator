@@ -6,7 +6,6 @@ from datetime import date, datetime, timedelta, timezone
 
 from epic_report_generator.core.data_models import (
     EpicData,
-    EpicMetrics,
     JiraIssue,
     ReportConfig,
     ReportData,
@@ -108,7 +107,7 @@ class TestGeneratePdf:
         assert len(pdf_conf) > len(pdf_plain)
 
     def test_empty_epics(self) -> None:
-        """A report with no epics should still produce a valid PDF (title + empty summary)."""
+        """Report with no epics still produces a valid PDF."""
         cfg = ReportConfig(title="Empty Report", project_key="X")
         report = ReportData(config=cfg)
         pdf = generate_pdf(report)

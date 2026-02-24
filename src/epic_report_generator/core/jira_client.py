@@ -8,6 +8,7 @@ from datetime import date, datetime
 from typing import Any
 
 import requests as _requests
+from dateutil.parser import parse as _dt_parse
 from jira import JIRA, JIRAError
 
 from epic_report_generator.core.data_models import EpicData, JiraIssue, SprintInfo
@@ -180,6 +181,8 @@ class JiraClient:
         due_date_field: str = "duedate",
         include_subtasks: bool = True,
         sprint_field: str = "customfield_10020",
+        timeline_start_field: str = "",
+        timeline_end_field: str = "",
     ) -> EpicData | None:
         """Fetch a single Epic and all its child issues.
 
@@ -188,7 +191,14 @@ class JiraClient:
         if not self._jira:
             return None
 
-        logger.info("Fetching epic %s", epic_key)
+        logger.debug(
+            "Fetching epic %s (date_fields=%s/%s, timeline_fields=%s/%s)",
+            epic_key,
+            start_date_field,
+            due_date_field,
+            timeline_start_field or start_date_field,
+            timeline_end_field or due_date_field,
+        )
         try:
             issue = self._search_with_retry(f"key = {epic_key}", max_results=1)
             if not issue:
@@ -199,23 +209,13 @@ class JiraClient:
             logger.error("Failed to fetch epic %s: %s", epic_key, exc)
             return None
 
-        fields: Any = raw.fields
-        epic = EpicData(
-            key=raw.key,
-            summary=getattr(fields, "summary", ""),
-            status=str(getattr(fields, "status", "")),
-            priority=str(getattr(fields, "priority", "")) or None,
-            assignee=self._name(getattr(fields, "assignee", None)),
-            reporter=self._name(getattr(fields, "reporter", None)),
-            created=self._parse_dt(getattr(fields, "created", None)),
-            updated=self._parse_dt(getattr(fields, "updated", None)),
-            labels=getattr(fields, "labels", []) or [],
-            fix_versions=[v.name for v in (getattr(fields, "fixVersions", []) or [])],
+        epic = self._parse_epic_from_raw(
+            raw,
+            start_date_field,
+            due_date_field,
+            timeline_start_field,
+            timeline_end_field,
         )
-
-        # Epic-level dates from configurable fields
-        epic.start_date = self._parse_date(getattr(fields, start_date_field, None))
-        epic.due_date = self._parse_date(getattr(fields, due_date_field, None))
 
         # Fetch children with pagination
         epic.children = self._fetch_children(
@@ -226,9 +226,11 @@ class JiraClient:
             due_date_field,
             include_subtasks=include_subtasks,
             sprint_field=sprint_field,
+            timeline_start_field=timeline_start_field,
+            timeline_end_field=timeline_end_field,
         )
 
-        # Fallback: derive epic dates from ALL children if epic has none.
+        # Expand epic dates to cover the full range of children
         self._fill_epic_dates_from_children(epic)
 
         logger.info(
@@ -293,6 +295,8 @@ class JiraClient:
         due_date_field: str = "duedate",
         include_subtasks: bool = True,
         sprint_field: str = "customfield_10020",
+        timeline_start_field: str = "",
+        timeline_end_field: str = "",
     ) -> list[EpicData]:
         """Fetch all Epics with the given label, including their children.
 
@@ -313,25 +317,13 @@ class JiraClient:
             if not results:
                 break
             for raw in results:
-                fields: Any = raw.fields
-                epic = EpicData(
-                    key=raw.key,
-                    summary=getattr(fields, "summary", ""),
-                    status=str(getattr(fields, "status", "")),
-                    priority=str(getattr(fields, "priority", "")) or None,
-                    assignee=self._name(getattr(fields, "assignee", None)),
-                    reporter=self._name(getattr(fields, "reporter", None)),
-                    created=self._parse_dt(getattr(fields, "created", None)),
-                    updated=self._parse_dt(getattr(fields, "updated", None)),
-                    labels=getattr(fields, "labels", []) or [],
-                    fix_versions=[
-                        v.name for v in (getattr(fields, "fixVersions", []) or [])
-                    ],
+                epic = self._parse_epic_from_raw(
+                    raw,
+                    start_date_field,
+                    due_date_field,
+                    timeline_start_field,
+                    timeline_end_field,
                 )
-                epic.start_date = self._parse_date(
-                    getattr(fields, start_date_field, None)
-                )
-                epic.due_date = self._parse_date(getattr(fields, due_date_field, None))
 
                 epic.children = self._fetch_children(
                     epic.key,
@@ -341,9 +333,11 @@ class JiraClient:
                     due_date_field,
                     include_subtasks=include_subtasks,
                     sprint_field=sprint_field,
+                    timeline_start_field=timeline_start_field,
+                    timeline_end_field=timeline_end_field,
                 )
 
-                # Fallback: derive epic dates from ALL children.
+                # Expand epic dates to cover the full range of children
                 self._fill_epic_dates_from_children(epic)
 
                 epics.append(epic)
@@ -423,33 +417,161 @@ class JiraClient:
 
     @staticmethod
     def _fill_epic_dates_from_children(epic: EpicData) -> None:
-        """Derive missing epic-level dates from child issues.
+        """Expand epic-level dates to cover the full range of child issues.
 
-        For each child, prefer start_date/due_date but fall back to
-        created/resolved so that every child contributes to the range.
+        The epic's start_date becomes the earliest date and due_date the
+        latest date across the epic's own dates and all children.  For each
+        child, prefer start_date/due_date but fall back to created/resolved
+        so that every child contributes to the range.
+
+        Timeline dates (timeline_start / timeline_end) are computed with a
+        cascade: timeline field values → sprint dates → start_date/due_date.
+        This matches Jira Cloud Timeline behaviour, which derives epic ranges
+        from child sprint assignments when no explicit dates are set.
+
+        All four date categories are collected in a single pass over children.
         """
-        if epic.start_date is None and epic.children:
-            child_starts: list[date] = []
-            for c in epic.children:
+        if not epic.children:
+            return
+
+        candidate_starts: list[date] = []
+        candidate_ends: list[date] = []
+        tl_starts: list[date] = []
+        tl_ends: list[date] = []
+
+        if epic.start_date:
+            candidate_starts.append(epic.start_date)
+        if epic.due_date:
+            candidate_ends.append(epic.due_date)
+        if epic.timeline_start:
+            tl_starts.append(epic.timeline_start)
+        if epic.timeline_end:
+            tl_ends.append(epic.timeline_end)
+
+        for c in epic.children:
+            # Estimation start
+            if c.start_date:
+                candidate_starts.append(c.start_date)
+            elif c.created:
+                candidate_starts.append(c.created.date())
+
+            # Estimation end
+            if c.due_date:
+                candidate_ends.append(c.due_date)
+            elif c.resolved and c.status_category == "Done":
+                candidate_ends.append(c.resolved.date())
+
+            # Timeline start: cascade timeline → sprint → start_date
+            if c.timeline_start:
+                tl_starts.append(c.timeline_start)
+            else:
+                for sp in c.sprints:
+                    if sp.start_date:
+                        tl_starts.append(sp.start_date)
                 if c.start_date:
-                    child_starts.append(c.start_date)
-                elif c.created:
-                    child_starts.append(c.created.date())
-            if child_starts:
-                epic.start_date = min(child_starts)
-        if epic.due_date is None and epic.children:
-            child_ends: list[date] = []
-            for c in epic.children:
+                    tl_starts.append(c.start_date)
+
+            # Timeline end: cascade timeline → sprint → due_date
+            if c.timeline_end:
+                tl_ends.append(c.timeline_end)
+            else:
+                for sp in c.sprints:
+                    if sp.end_date:
+                        tl_ends.append(sp.end_date)
                 if c.due_date:
-                    child_ends.append(c.due_date)
-                elif c.resolved and c.status_category == "Done":
-                    child_ends.append(c.resolved.date())
-            if child_ends:
-                epic.due_date = max(child_ends)
-            elif epic.start_date:
-                epic.due_date = date.today()
+                    tl_ends.append(c.due_date)
+
+        if candidate_starts:
+            epic.start_date = min(candidate_starts)
+        if candidate_ends:
+            epic.due_date = max(candidate_ends)
+        elif epic.start_date:
+            epic.due_date = date.today()
+        if tl_starts:
+            epic.timeline_start = min(tl_starts)
+        if tl_ends:
+            epic.timeline_end = max(tl_ends)
 
     # -- internals ------------------------------------------------------------
+
+    def _parse_epic_from_raw(
+        self,
+        raw: Any,
+        start_date_field: str,
+        due_date_field: str,
+        timeline_start_field: str,
+        timeline_end_field: str,
+    ) -> EpicData:
+        """Parse a raw Jira issue into an :class:`EpicData` with date fields."""
+        fields: Any = raw.fields
+        epic = EpicData(
+            key=raw.key,
+            summary=getattr(fields, "summary", ""),
+            status=str(getattr(fields, "status", "")),
+            priority=str(getattr(fields, "priority", "")) or None,
+            assignee=self._name(getattr(fields, "assignee", None)),
+            reporter=self._name(getattr(fields, "reporter", None)),
+            created=self._parse_dt(getattr(fields, "created", None)),
+            updated=self._parse_dt(getattr(fields, "updated", None)),
+            labels=getattr(fields, "labels", []) or [],
+            fix_versions=[v.name for v in (getattr(fields, "fixVersions", []) or [])],
+        )
+
+        tl_start_attr = timeline_start_field or start_date_field
+        tl_end_attr = timeline_end_field or due_date_field
+
+        epic.start_date = self._parse_date(self._get_raw_field(raw, start_date_field))
+        epic.due_date = self._parse_date(self._get_raw_field(raw, due_date_field))
+        epic.timeline_start = self._parse_date(self._get_raw_field(raw, tl_start_attr))
+        epic.timeline_end = self._parse_date(self._get_raw_field(raw, tl_end_attr))
+        logger.debug(
+            "Epic %s dates: estimation=%s/%s, timeline(%s/%s)=%s/%s",
+            epic.key,
+            epic.start_date,
+            epic.due_date,
+            tl_start_attr,
+            tl_end_attr,
+            epic.timeline_start,
+            epic.timeline_end,
+        )
+        return epic
+
+    def _paginated_search(
+        self,
+        jql: str,
+        sp_field: str,
+        start_date_field: str,
+        due_date_field: str,
+        sprint_field: str,
+        timeline_start_field: str,
+        timeline_end_field: str,
+        seen: set[str],
+        children: list[JiraIssue],
+    ) -> None:
+        """Run a paginated JQL search and append deduplicated child issues."""
+        start = 0
+        while True:
+            results = self._search_with_retry(
+                jql, start_at=start, max_results=_MAX_RESULTS
+            )
+            if not results:
+                break
+            for raw in results:
+                issue = self._parse_child_issue(
+                    raw,
+                    sp_field,
+                    start_date_field,
+                    due_date_field,
+                    sprint_field,
+                    timeline_start_field,
+                    timeline_end_field,
+                )
+                if issue.key not in seen:
+                    seen.add(issue.key)
+                    children.append(issue)
+            if len(results) < _MAX_RESULTS:
+                break
+            start += _MAX_RESULTS
 
     def _fetch_children(
         self,
@@ -460,6 +582,8 @@ class JiraClient:
         due_date_field: str = "duedate",
         include_subtasks: bool = True,
         sprint_field: str = "customfield_10020",
+        timeline_start_field: str = "",
+        timeline_end_field: str = "",
     ) -> list[JiraIssue]:
         children: list[JiraIssue] = []
         seen: set[str] = set()
@@ -467,76 +591,52 @@ class JiraClient:
         # 1) Issues linked via the Epic Link custom field (Stories, Bugs, etc.)
         jql = f'"{epic_link_field}" = {epic_key} ORDER BY created ASC'
         logger.debug("Fetching children for %s (field=%s)", epic_key, epic_link_field)
-        start = 0
-        while True:
-            results = self._search_with_retry(
-                jql, start_at=start, max_results=_MAX_RESULTS
-            )
-            if not results:
-                break
-            for raw in results:
-                issue = self._parse_child_issue(
-                    raw, sp_field, start_date_field, due_date_field, sprint_field
-                )
-                if issue.key not in seen:
-                    seen.add(issue.key)
-                    children.append(issue)
-            if len(results) < _MAX_RESULTS:
-                break
-            start += _MAX_RESULTS
+        self._paginated_search(
+            jql,
+            sp_field,
+            start_date_field,
+            due_date_field,
+            sprint_field,
+            timeline_start_field,
+            timeline_end_field,
+            seen,
+            children,
+        )
 
         # 2) Issues linked via the parent hierarchy (Tasks, Defects, etc.)
         #    In Jira Cloud, these may not have the Epic Link field set.
         parent_jql = f"parent = {epic_key} ORDER BY created ASC"
         logger.debug("Fetching parent-linked children for %s", epic_key)
-        start = 0
-        while True:
-            results = self._search_with_retry(
-                parent_jql, start_at=start, max_results=_MAX_RESULTS
-            )
-            if not results:
-                break
-            for raw in results:
-                issue = self._parse_child_issue(
-                    raw, sp_field, start_date_field, due_date_field, sprint_field
-                )
-                if issue.key not in seen:
-                    seen.add(issue.key)
-                    children.append(issue)
-            if len(results) < _MAX_RESULTS:
-                break
-            start += _MAX_RESULTS
+        self._paginated_search(
+            parent_jql,
+            sp_field,
+            start_date_field,
+            due_date_field,
+            sprint_field,
+            timeline_start_field,
+            timeline_end_field,
+            seen,
+            children,
+        )
 
         # Fetch subtasks of direct children
         if include_subtasks and children:
             child_keys = [c.key for c in children]
             for batch_start in range(0, len(child_keys), _MAX_RESULTS):
                 batch = child_keys[batch_start : batch_start + _MAX_RESULTS]
-                parent_jql = f"parent in ({', '.join(batch)}) ORDER BY created ASC"
+                subtask_jql = f"parent in ({', '.join(batch)}) ORDER BY created ASC"
                 logger.debug("Fetching subtasks for %d parent(s)", len(batch))
-                sub_start = 0
-                while True:
-                    results = self._search_with_retry(
-                        parent_jql,
-                        start_at=sub_start,
-                        max_results=_MAX_RESULTS,
-                    )
-                    if not results:
-                        break
-                    for raw in results:
-                        issue = self._parse_child_issue(
-                            raw,
-                            sp_field,
-                            start_date_field,
-                            due_date_field,
-                            sprint_field,
-                        )
-                        if issue.key not in seen:
-                            seen.add(issue.key)
-                            children.append(issue)
-                    if len(results) < _MAX_RESULTS:
-                        break
-                    sub_start += _MAX_RESULTS
+                self._paginated_search(
+                    subtask_jql,
+                    sp_field,
+                    start_date_field,
+                    due_date_field,
+                    sprint_field,
+                    timeline_start_field,
+                    timeline_end_field,
+                    seen,
+                    children,
+                )
             logger.debug(
                 "Total children + subtasks for %s: %d", epic_key, len(children)
             )
@@ -550,17 +650,19 @@ class JiraClient:
         start_date_field: str,
         due_date_field: str,
         sprint_field: str = "customfield_10020",
+        timeline_start_field: str = "",
+        timeline_end_field: str = "",
     ) -> JiraIssue:
         """Parse a raw Jira issue into a :class:`JiraIssue`."""
         fields: Any = raw.fields
-        sp_val = getattr(fields, sp_field, None)
+        sp_val = self._get_raw_field(raw, sp_field)
         if sp_val is None:
             # Try common custom field names
-            sp_val = getattr(fields, "customfield_10016", None)
+            sp_val = self._get_raw_field(raw, "customfield_10016")
 
-        raw_sprints = getattr(fields, sprint_field, None)
+        raw_sprints = self._get_raw_field(raw, sprint_field)
 
-        return JiraIssue(
+        issue = JiraIssue(
             key=raw.key,
             summary=getattr(fields, "summary", ""),
             status=str(getattr(fields, "status", "")),
@@ -571,10 +673,18 @@ class JiraClient:
             created=self._parse_dt(getattr(fields, "created", None)),
             resolved=self._parse_dt(getattr(fields, "resolutiondate", None)),
             assignee=self._name(getattr(fields, "assignee", None)),
-            start_date=self._parse_date(getattr(fields, start_date_field, None)),
-            due_date=self._parse_date(getattr(fields, due_date_field, None)),
+            start_date=self._parse_date(self._get_raw_field(raw, start_date_field)),
+            due_date=self._parse_date(self._get_raw_field(raw, due_date_field)),
             sprints=self._parse_sprints(raw_sprints),
         )
+
+        # Timeline dates: always read from the configured timeline fields
+        tl_start_attr = timeline_start_field or start_date_field
+        tl_end_attr = timeline_end_field or due_date_field
+        issue.timeline_start = self._parse_date(self._get_raw_field(raw, tl_start_attr))
+        issue.timeline_end = self._parse_date(self._get_raw_field(raw, tl_end_attr))
+
+        return issue
 
     def _search_with_retry(
         self, jql: str, *, start_at: int = 0, max_results: int = _MAX_RESULTS
@@ -619,10 +729,8 @@ class JiraClient:
     def _parse_dt(value: Any) -> datetime | None:
         if value is None:
             return None
-        from dateutil.parser import parse as dt_parse
-
         try:
-            return dt_parse(str(value))
+            return _dt_parse(str(value))
         except (ValueError, TypeError):
             return None
 
@@ -677,6 +785,23 @@ class JiraClient:
             except Exception:
                 continue
         return result
+
+    @staticmethod
+    def _get_raw_field(raw_issue: Any, field_name: str) -> Any:
+        """Read a field value from the raw API response dict.
+
+        The ``jira`` library wraps fields in a ``PropertyHolder`` which may
+        silently drop custom fields.  Accessing ``raw_issue.raw['fields']``
+        directly is more reliable for custom and date fields.
+        """
+        raw = getattr(raw_issue, "raw", None)
+        if raw and isinstance(raw, dict):
+            value = raw.get("fields", {}).get(field_name)
+            if value is not None:
+                return value
+        # Fallback to PropertyHolder
+        fields = getattr(raw_issue, "fields", None)
+        return getattr(fields, field_name, None) if fields else None
 
     @staticmethod
     def _parse_date(value: Any) -> date | None:

@@ -360,7 +360,7 @@ class TestFetchSubtasks:
         assert epic is not None
         assert len(epic.children) == 1
         assert epic.children[0].key == "PROJ-2"
-        # Should have 3 calls: epic, epic-link children, parent children (no subtask query)
+        # 3 calls: epic, epic-link children, parent children (no subtask query)
         assert client._jira.search_issues.call_count == 3
 
     def test_subtasks_deduplicated(self, tmp_path: Path) -> None:

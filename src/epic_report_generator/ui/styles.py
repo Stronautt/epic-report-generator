@@ -273,6 +273,12 @@ QLabel[status="disconnected"] {
     background: #FFFFFF;
 }
 
+/* Profile bar */
+#profileBar {
+    border-bottom: 1px solid #DFE1E6;
+    padding-bottom: 8px;
+}
+
 /* Sidebar user info */
 #sidebarUserInfo {
     border-top: 1px solid #DFE1E6;
@@ -562,6 +568,12 @@ QLabel[status="disconnected"] {
     border-radius: 4px;
     background: #0D1424;
     min-height: 40px;
+}
+
+/* Profile bar */
+#profileBar {
+    border-bottom: 1px solid #2C3E5D;
+    padding-bottom: 8px;
 }
 
 /* Sidebar user info */

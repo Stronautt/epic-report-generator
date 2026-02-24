@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QKeySequence, QPixmap, QShortcut
+from PySide6.QtGui import QCloseEvent, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QButtonGroup,
     QHBoxLayout,
@@ -224,6 +223,15 @@ class MainWindow(QMainWindow):
         """Enable or disable sidebar navigation buttons."""
         for btn in self._nav_buttons:
             btn.setEnabled(enabled)
+
+    # -- cleanup --------------------------------------------------------------
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        """Shut down background threads before the window is destroyed."""
+        self._login_panel.shutdown()
+        self._report_panel.preview_panel.shutdown()
+        self._report_panel.config_panel.shutdown()
+        super().closeEvent(event)
 
     # -- theming --------------------------------------------------------------
 

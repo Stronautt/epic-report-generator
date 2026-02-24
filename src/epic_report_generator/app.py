@@ -24,6 +24,8 @@ def run_app(argv: list[str] | None = None) -> int:
         level=logging.DEBUG,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    # Silence noisy matplotlib font manager debug logs
+    logging.getLogger("matplotlib.font_manager").setLevel(logging.WARNING)
 
     logger.info("Starting Epic Report Generator")
 
