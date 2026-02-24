@@ -7,9 +7,10 @@ Epic Report Generator is a desktop app that connects to Jira Cloud, pulls Epic p
 ## What you get
 
 - **Title page** with project name, date, author, and optional confidentiality notice
-- **Summary table** — one row per Epic with progress bars, story points, issue counts, and assignees
+- **Summary table** — one row per Epic with progress bars, story points, issue counts, assignees, and optional scope-certainty legend
+- **Timeline page** — Gantt-style chart showing epic and (optionally) child issue date ranges with milestone markers
 - **Per-Epic detail pages** — trend chart (total vs. completed SP, cumulative issues, weekend bands) plus a metrics sidebar (velocity, cycle time, scope change %, forecast date)
-- **Light & Dark themes** — the PDF and the app UI both follow your preference
+- **Light & Dark themes** — Material Design base with app-specific overlays; the PDF and the app UI both follow your preference
 
 ## Quick start
 
@@ -82,20 +83,27 @@ The app supports two ways to measure issue effort:
 
 Switch between them in **Report → Custom Field Mapping → Estimation Method**. When "Time — Days" is selected, you can configure which Jira fields hold the start and due dates (defaults: `startdate` / `duedate`).
 
-## How the progress formula works
+## How progress works
 
-```
-progress = (completed_estimate / total_estimate) × (closed_issues / total_issues) × 100
-```
+Progress is computed **bottom-up** through the issue hierarchy:
 
-- "estimate" is story points or calendar days, depending on the selected estimation method
-- If no estimates exist, falls back to issue-count ratio
+- **Leaf issues** get 100 % if Done, 0 % otherwise, weighted by their estimate (SP or days)
+- **Parent issues** with subtasks aggregate their subtask progress via weighted average
+- **Epic progress** is the weighted average of its direct children's progress
+
+Two progress methods are available:
+
+| Method | Formula |
+|--------|---------|
+| **Combined** (default) | Bottom-up weighted average × (done issues / total issues) |
+| **Issues Only** | Bottom-up weighted average with weight = 1.0 for every item |
+
 - If there are no issues, progress is 0 %
 - Result is clamped to 0–100 %
 
 ## Tech stack
 
-PySide6 · ReportLab · matplotlib · jira · keyring · platformdirs · pandas
+PySide6 · qt-material · ReportLab · matplotlib · jira · keyring · platformdirs · pandas
 
 ## License
 

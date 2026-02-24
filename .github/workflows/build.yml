@@ -23,6 +23,7 @@ env:
     --noinclude-qt-translations
     --include-qt-plugins=sensible
     --include-package-data=epic_report_generator.resources
+    --include-package-data=qt_material
   # Modules to exclude — space-separated, expanded into --nofollow-import-to= flags at build time
   NUITKA_NOFOLLOW: >-
     tkinter unittest test distutils
@@ -34,7 +35,7 @@ env:
     PySide6.Qt3DAnimation PySide6.Qt3DExtras
     PySide6.QtQuick PySide6.QtQuickWidgets PySide6.QtQml
     PySide6.QtDataVisualization PySide6.QtCharts PySide6.QtDesigner
-    PySide6.QtHelp PySide6.QtUiTools PySide6.QtBluetooth PySide6.QtNfc
+    PySide6.QtHelp PySide6.QtBluetooth PySide6.QtNfc
     PySide6.QtPositioning PySide6.QtSensors PySide6.QtSerialPort
     PySide6.QtRemoteObjects PySide6.QtSpatialAudio PySide6.QtTextToSpeech
 
@@ -124,6 +125,7 @@ jobs:
             Windows)
               PLATFORM_FLAGS=(
                 --onefile
+                --windows-console-mode=disable
                 "--windows-icon-from-ico=src/epic_report_generator/resources/logo.ico"
                 "--windows-company-name=Epic Report Generator"
                 "--windows-product-name=Epic Report Generator"
@@ -160,7 +162,7 @@ jobs:
           # rename to the expected names.
           case "$RUNNER_OS" in
             Linux)  mv epic_report_generator.dist epic-report-generator.dist ;;
-            macOS)  mv epic_report_generator.app  epic-report-generator.app  ;;
+            macOS)  mv epic_report_generator.app  "Epic Report Generator.app"  ;;
           esac
 
       # ── Windows installer ──────────────────────────────────────────
@@ -191,7 +193,7 @@ jobs:
             --icon-size 100 \
             --app-drop-link 450 200 \
             "${{ matrix.installer_path }}" \
-            "epic-report-generator.app"
+            "Epic Report Generator.app"
 
       # ── Linux AppImage ─────────────────────────────────────────────
       - name: Build Linux AppImage

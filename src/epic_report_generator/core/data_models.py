@@ -31,11 +31,14 @@ class JiraIssue:
     created: datetime | None
     resolved: datetime | None
     assignee: str | None
+    parent_key: str | None = None
     start_date: date | None = None
     due_date: date | None = None
     timeline_start: date | None = None
     timeline_end: date | None = None
     sprints: list[SprintInfo] = field(default_factory=list)
+    progress: float = 0.0
+    effective_weight: float = 1.0
 
 
 @dataclass
@@ -132,7 +135,7 @@ class ReportConfig:
     confidential: bool = False
     company_name: str = ""
     estimation_method: str = "story_points"  # "story_points" or "time_days"
-    progress_method: str = "combined"  # "combined" or "story_points_only"
+    progress_method: str = "combined"  # "combined" or "issues_only"
     story_points_field: str = "story_points"
     epic_link_field: str = "customfield_10014"
     start_date_field: str = "startdate"

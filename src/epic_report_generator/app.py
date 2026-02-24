@@ -6,9 +6,16 @@ import logging
 import signal
 import sys
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer
 from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import (
+    QAbstractButton,
+    QAbstractSpinBox,
+    QApplication,
+    QComboBox,
+    QGroupBox,
+    QTabBar,
+)
 
 from epic_report_generator.core.jira_client import JiraClient
 from epic_report_generator.services.auth_manager import AuthManager
@@ -16,6 +23,22 @@ from epic_report_generator.services.config_manager import ConfigManager
 from epic_report_generator.ui.main_window import MainWindow
 
 logger = logging.getLogger(__name__)
+
+# Widget types that should show a pointing-hand cursor
+_POINTER_TYPES = (QAbstractButton, QComboBox, QAbstractSpinBox, QTabBar, QGroupBox)
+
+
+class _JsonCursorFilter(QObject):
+    """Application-wide event filter that sets PointingHandCursor on controls."""
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802
+        if event.type() == QEvent.Type.ChildAdded:
+            child = event.child()  # type: ignore[union-attr]
+            if isinstance(child, _POINTER_TYPES) and not child.testAttribute(
+                Qt.WidgetAttribute.WA_SetCursor
+            ):
+                child.setCursor(Qt.CursorShape.PointingHandCursor)
+        return False
 
 
 def run_app(argv: list[str] | None = None) -> int:
@@ -41,6 +64,7 @@ def run_app(argv: list[str] | None = None) -> int:
         logger.warning("logo.png not found; running without a window icon")
 
     _install_signal_handlers(app)
+    app.installEventFilter(_JsonCursorFilter(app))
 
     # Shared services
     config = ConfigManager()

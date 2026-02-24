@@ -124,24 +124,26 @@ def generate_pdf(report: ReportData) -> bytes:
     )
 
     buf = io.BytesIO()
-    doc = _create_doc(buf, pal)
+    config = report.config
+    footer_h = 10 * mm if (config.confidential and config.company_name) else 0
+    doc = _create_doc(buf, pal, config)
     styles = _build_styles(pal)
 
     story: list[Any] = []
 
     # Page 1 — Title
     logger.debug("Building title page")
-    _add_title_page(story, report.config, styles)
+    _add_title_page(story, config, styles)
 
     # Page 2+ — Summary table
     logger.debug("Building summary table for %d epic(s)", len(report.epics))
     story.append(PageBreak())
-    _add_summary_table(story, report, styles, pal)
+    _add_summary_table(story, report, styles, pal, footer_h=footer_h)
 
     # Timeline page (after summary, before epic details)
     logger.debug("Building timeline page")
     story.append(PageBreak())
-    _add_timeline_page(story, report, styles, dark)
+    _add_timeline_page(story, report, styles, dark, pal, footer_h=footer_h)
 
     # Pages 3+ — Individual Epic pages
     show_additional = report.config.show_additional_metrics
@@ -203,22 +205,60 @@ def generate_pdf(report: ReportData) -> bytes:
 # -- document setup -----------------------------------------------------------
 
 
-def _create_doc(buf: io.BytesIO, pal: dict[str, Any]) -> BaseDocTemplate:
+def _create_doc(
+    buf: io.BytesIO, pal: dict[str, Any], config: ReportConfig | None = None
+) -> BaseDocTemplate:
+    footer_margin = (
+        10 * mm if (config and config.confidential and config.company_name) else 0
+    )
     doc = BaseDocTemplate(
         buf,
         pagesize=(PAGE_W, PAGE_H),
         leftMargin=MARGIN,
         rightMargin=MARGIN,
         topMargin=MARGIN,
-        bottomMargin=MARGIN,
+        bottomMargin=MARGIN + footer_margin,
     )
-    frame = Frame(MARGIN, MARGIN, PAGE_W - 2 * MARGIN, PAGE_H - 2 * MARGIN, id="main")
+    frame = Frame(
+        MARGIN,
+        MARGIN + footer_margin,
+        PAGE_W - 2 * MARGIN,
+        PAGE_H - 2 * MARGIN - footer_margin,
+        id="main",
+    )
+
+    page_counter: list[int] = [0]
 
     def _on_page(canvas: Any, _doc: Any) -> None:
         canvas.saveState()
         canvas.setFillColor(pal["bg"])
         canvas.rect(0, 0, PAGE_W, PAGE_H, fill=1, stroke=0)
         canvas.restoreState()
+
+        page_counter[0] += 1
+
+        # Draw confidential footer on all pages except the title page
+        if (
+            config
+            and config.confidential
+            and config.company_name
+            and page_counter[0] > 1
+        ):
+            canvas.saveState()
+            y = MARGIN - 2 * mm
+            # Left: confidential notice
+            canvas.setFont("Helvetica-Bold", 7)
+            canvas.setFillColor(pal["red"])
+            canvas.drawString(MARGIN, y, f"CONFIDENTIAL — {config.company_name}")
+            # Right: date and author
+            right_parts = [_fmt_date(config.report_date, "%B %d, %Y")]
+            if config.author:
+                right_parts.append(config.author)
+            right_text = "  |  ".join(right_parts)
+            canvas.setFont("Helvetica", 7)
+            canvas.setFillColor(pal["muted"])
+            canvas.drawRightString(PAGE_W - MARGIN, y, right_text)
+            canvas.restoreState()
 
     doc.addPageTemplates([PageTemplate(id="default", frames=[frame], onPage=_on_page)])
     return doc
@@ -378,6 +418,7 @@ def _add_summary_table(
     report: ReportData,
     styles: dict[str, ParagraphStyle],
     pal: dict[str, Any],
+    footer_h: float = 0,
 ) -> None:
     story.append(Paragraph("Epic Progress Summary", styles["heading"]))
     story.append(Spacer(1, 4 * mm))
@@ -525,6 +566,40 @@ def _add_summary_table(
     story.append(tbl)
 
 
+def _build_certainty_legend(
+    styles: dict[str, ParagraphStyle],
+    pal: dict[str, Any],
+) -> Table:
+    """Build a small scope-certainty colour legend aligned to the right."""
+
+    def _dot(color: Any) -> str:
+        hex_c = color.hexval() if hasattr(color, "hexval") else str(color)
+        return f'<font color="{hex_c}" size="10">\u25cf</font>'
+
+    legend_data = [
+        [
+            Paragraph(
+                f"<b>Scope Certainty:</b>&nbsp;&nbsp;"
+                f'{_dot(pal["green"])} High&nbsp;&nbsp;'
+                f'{_dot(pal["yellow"])} Medium&nbsp;&nbsp;'
+                f'{_dot(pal["red"])} Low',
+                styles["small"],
+            ),
+        ]
+    ]
+    legend_tbl = Table(legend_data, colWidths=[PAGE_W - 2 * MARGIN])
+    legend_tbl.setStyle(
+        TableStyle(
+            [
+                ("ALIGN", (0, 0), (-1, -1), "RIGHT"),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+            ]
+        )
+    )
+    return legend_tbl
+
+
 def _progress_bar_para(
     pct: float,
     styles: dict[str, ParagraphStyle],
@@ -571,6 +646,8 @@ def _add_timeline_page(
     report: ReportData,
     styles: dict[str, ParagraphStyle],
     dark: bool,
+    pal: dict[str, Any] | None = None,
+    footer_h: float = 0,
 ) -> None:
     """Add a Gantt-style timeline page after the summary table."""
     story.append(Paragraph("Timeline", styles["heading"]))
@@ -617,7 +694,7 @@ def _add_timeline_page(
                             start_date=c_start,
                             end_date=c_end,
                             scope_certainty=None,
-                            progress=100.0 if child.status_category == "Done" else 0.0,
+                            progress=child.progress,
                             is_child=True,
                             group=group,
                         )
@@ -664,9 +741,11 @@ def _add_timeline_page(
             if release_date:
                 milestones.append(MilestoneItem(name=name, release_date=release_date))
 
-    # Available space: full page width, height minus heading + spacer (~22mm)
+    # Available space: full page width, height minus heading + spacer + footer
+    has_certainty = any(m.scope_certainty for m in report.metrics)
+    legend_h = 8 * mm if has_certainty else 0  # spacer (2mm) + legend line (~6mm)
     avail_w = PAGE_W - 2 * MARGIN
-    avail_h = PAGE_H - 2 * MARGIN - 22 * mm
+    avail_h = PAGE_H - 2 * MARGIN - 22 * mm - legend_h - footer_h
 
     png = generate_timeline_chart(
         timeline_items,
@@ -683,6 +762,10 @@ def _add_timeline_page(
         story.append(img)
     else:
         story.append(Paragraph("<i>No timeline data available</i>", styles["small"]))
+
+    if pal and has_certainty:
+        story.append(Spacer(1, 2 * mm))
+        story.append(_build_certainty_legend(styles, pal))
 
 
 # -- Pages 3+: Individual Epic -----------------------------------------------

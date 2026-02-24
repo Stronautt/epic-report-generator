@@ -256,10 +256,9 @@ class PreviewPanel(QWidget):
 
         item_count = len(config.items) or len(config.epic_keys)
         logger.info("Starting report generation for %d item(s)", item_count)
-        self._export_btn.setEnabled(False)
+        self.clear_preview()
         self._progress_bar.setValue(0)
         self._progress_bar.show()
-        self._clear_preview()
 
         self._thread = QThread()
         self._worker = _GenerateWorker(self._jira, config)

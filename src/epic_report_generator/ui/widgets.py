@@ -57,9 +57,15 @@ class _IgnoreScrollFilter(QObject):
 
 
 def no_scroll_wheel(widget: QWidget) -> None:
-    """Ignore mouse-wheel events on *widget* (combo boxes, date edits)."""
+    """Ignore mouse-wheel events on *widget* (combo boxes, date edits).
+
+    For QComboBox widgets, also removes the icon/decoration space that
+    Qt reserves in the dropdown popup.
+    """
     widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
     widget.installEventFilter(_IgnoreScrollFilter(widget))
+    if isinstance(widget, QComboBox):
+        widget.view().setIconSize(QSize(0, 0))
 
 
 class StatusIndicator(QWidget):

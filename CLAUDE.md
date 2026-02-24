@@ -26,15 +26,17 @@ The GitHub Actions workflow (`.github/workflows/build.yml`) runs on `v*` tags an
 Key Nuitka flags used across all platforms:
 - `--lto=yes`, `--python-flag=no_docstrings`, `--python-flag=no_asserts`, `--python-flag=isolated`
 - `--noinclude-qt-translations`, `--include-qt-plugins=sensible`
+- `--include-package-data=epic_report_generator.resources`, `--include-package-data=qt_material`
 - `--nofollow-import-to` exclusions for unused stdlib modules and heavy PySide6 modules (WebEngine, 3D, Quick/QML, Multimedia, etc.)
 
-Linux uses `--onedir` (not `--onefile`) because AppImage provides its own single-file SquashFS layer. macOS uses `--macos-create-app-bundle` instead of `--onefile`. Windows uses `--onefile` and embeds a `.ico` converted from `logo.png` at build time via Pillow.
+Linux uses `--onedir` (not `--onefile`) because AppImage provides its own single-file SquashFS layer. macOS uses `--macos-create-app-bundle` with the display name `"Epic Report Generator.app"`. Windows uses `--onefile` with `--windows-console-mode=disable` and embeds a `.ico` converted from `logo.png` at build time via Pillow.
 
 Only installer artifacts are uploaded — plain binaries are not retained. The workflow has no release job; GitHub Releases are created manually.
 
 ## Tech Stack
 
 - **GUI**: PySide6 (Qt 6)
+- **Theming**: `qt-material` (Material Design base themes) + app-specific QSS overlays
 - **Jira API**: `jira` library (pycontribs/jira)
 - **OAuth**: `requests_oauthlib` for Atlassian OAuth 2.0 (3LO)
 - **PDF**: ReportLab
@@ -53,9 +55,9 @@ src/epic_report_generator/
 ├── __main__.py                    # Entry point
 ├── app.py                         # QApplication setup, signal handlers
 ├── core/
-│   ├── data_models.py             # Dataclasses: JiraIssue, EpicData, EpicMetrics, ReportConfig, ReportData, TimelineItem
+│   ├── data_models.py             # Dataclasses: JiraIssue (with parent_key, progress, effective_weight), EpicData, EpicMetrics, ReportConfig, ReportData, TimelineItem
 │   ├── jira_client.py             # JIRA library wrapper, API-token + OAuth connection, pagination, retry, date expansion
-│   ├── metrics.py                 # Progress, velocity, cycle time, scope change, forecasting, time-series
+│   ├── metrics.py                 # Bottom-up hierarchical progress, velocity, cycle time, scope change, forecasting, time-series
 │   ├── chart_generator.py         # Matplotlib Jira-style trend charts (light/dark)
 │   └── pdf_generator.py           # ReportLab PDF builder (title, summary table, epic detail pages)
 ├── services/
@@ -72,7 +74,7 @@ src/epic_report_generator/
 │   ├── log_panel.py               # Live log viewer with level filtering
 │   ├── widgets.py                 # Reusable: StatusIndicator, LabelledField, GuideStep, FlowLayout,
 │   │                              #   CollapsibleSection, EpicKeyTagInput, SidebarUserInfo
-│   └── styles.py                  # QSS stylesheets (light/dark themes)
+│   └── styles.py                  # App-specific QSS overlays on top of qt-material base themes
 └── resources/
     ├── fonts/
     └── icons/
@@ -123,16 +125,45 @@ The same cascade is applied in `merge_metrics()` when building synthetic label-g
 
 ### Progress Calculation
 
+Progress is computed **bottom-up** through the issue hierarchy:
+
+1. **Leaf issues** (no subtasks): 100% if Done, 0% otherwise. Weight = estimate (SP or days) when using Combined, or 1.0 for Issues Only.
+2. **Parent issues** (with subtasks): weighted average of subtask progress. Weight = own estimate if set, else sum of subtask weights.
+3. **Epic progress**: weighted average of direct children's progress (excludes subtasks already accounted for through their parent).
+
+Two progress methods are supported (`ReportConfig.progress_method`):
+
+- `"combined"` (default) — bottom-up weighted average × (done_issues / total_issues). Considers both estimate weights and issue-count ratio.
+- `"issues_only"` — bottom-up weighted average with weight = 1.0 for all items (purely counts open vs done). Legacy value `"story_points_only"` is normalised to `"issues_only"` for backward compatibility.
+
 ```python
-progress = (completed_estimate / total_estimate) * (closed_issues / total_issues) * 100
-# "estimate" = story points or calendar days depending on estimation_method
-# Fallback to issue-count ratio when total_estimate == 0
+# Combined example: 1 done (5 SP) + 1 todo (5 SP)
+# weighted_avg = (100*5 + 0*5) / 10 = 50%
+# progress = 50% × (1/2) = 25.0
+#
+# Issues Only: same items
+# progress = (100*1 + 0*1) / 2 = 50.0
+#
 # Returns 0 when total_issues == 0; clamped to [0, 100]
 ```
 
+For **label-group merges** (`merge_metrics`), progress is the weighted average of per-epic progress values (each weighted by the sum of its direct children's effective weights), rather than flattening all children.
+
 ### PDF Layout
 
-Landscape 16:9 pages (406mm x 228.4mm). Page 1: title page. Page 2: summary table with progress bars (label-group header rows show aggregated statistics). Page 3: Gantt-style timeline chart. Pages 4+: per-epic detail with trend chart + metrics sidebar.
+Landscape 16:9 pages (406mm x 228.4mm). Page 1: title page. Page 2: summary table with progress bars (label-group header rows show aggregated statistics) and optional scope-certainty legend. Page 3: Gantt-style timeline chart with optional scope-certainty legend. Pages 4+: per-epic detail with trend chart + metrics sidebar.
+
+When `confidential` is enabled and `company_name` is set, a repeating footer appears on all pages except the title page: "CONFIDENTIAL — {company_name}" on the left, report date and author on the right.
+
+### Theming
+
+The UI uses a two-layer theming architecture:
+
+1. **Base layer**: `qt_material.apply_stylesheet()` applies a Material Design theme (`light_blue.xml` or `dark_blue.xml`) at the `QApplication` level. This handles all standard Qt widgets (buttons, inputs, tabs, checkboxes, progress bars, scroll areas, etc.).
+
+2. **Overlay layer**: `styles.py` contains app-specific QSS overrides applied at the `QMainWindow` level. These use object-name selectors (`#sidebar`, `#collapsibleHeader`, etc.) and property selectors (`QPushButton[secondary="true"]`) to style custom UI components without duplicating base widget rules.
+
+A global `_JsonCursorFilter` event filter in `app.py` sets `PointingHandCursor` on interactive controls (`QAbstractButton`, `QComboBox`, `QAbstractSpinBox`, `QTabBar`, `QGroupBox`).
 
 ## Code Standards
 

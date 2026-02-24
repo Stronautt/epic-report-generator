@@ -31,6 +31,17 @@ coverage.xml
 *.build/
 *.dist/
 *.onefile-build/
+*.AppImage
+
+# Packaging build artifacts
+appimagetool
+packaging/linux/AppDir/usr/
+
+# qt-material runtime-generated theme assets
+theme/
+
+# Generated icons (created at CI build time)
+src/epic_report_generator/resources/logo.ico
 
 # App config (generated at runtime)
 *.log

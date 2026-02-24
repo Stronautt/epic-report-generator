@@ -9,11 +9,37 @@ from epic_report_generator.core.data_models import EpicData, EpicMetrics, JiraIs
 
 logger = logging.getLogger(__name__)
 
+# -- Named constants ----------------------------------------------------------
+
+PROGRESS_COMBINED = "combined"
+PROGRESS_ISSUES_ONLY = "issues_only"
+
+STATUS_DONE = "Done"
+
+DEFAULT_WEIGHT = 1.0
+PROGRESS_MIN = 0.0
+PROGRESS_MAX = 100.0
+PROGRESS_DONE = 100.0
+
+
+def _normalise_progress_method(method: str) -> str:
+    """Map legacy progress method values to current constants.
+
+    Treats ``"story_points_only"`` as ``PROGRESS_ISSUES_ONLY`` for backward
+    compatibility with configs saved before the rename.
+    """
+    if method == "story_points_only":
+        return PROGRESS_ISSUES_ONLY
+    return method
+
+
+# -- Public API ---------------------------------------------------------------
+
 
 def calculate_metrics(
     epic: EpicData,
     estimation_method: str = "story_points",
-    progress_method: str = "combined",
+    progress_method: str = PROGRESS_COMBINED,
 ) -> EpicMetrics:
     """Compute all metrics for a single Epic from its child issues.
 
@@ -24,9 +50,15 @@ def calculate_metrics(
 
     *progress_method* controls the progress formula:
 
-    * ``"combined"`` — ``(done_sp/total_sp) * (done/total) * 100`` (default).
-    * ``"story_points_only"`` — ``(done_sp/total_sp) * 100``.
+    * ``"combined"`` — bottom-up weighted average × (done_issues/total_issues).
+    * ``"issues_only"`` — bottom-up weighted average with weight = 1.0 for all
+      items (purely counts open vs done).
+
+    Progress is computed **bottom-up**: leaf issues get 100% if Done else 0%.
+    Parents aggregate their subtasks' progress via weighted average.  The epic
+    progress is the weighted average of its direct children's progress.
     """
+    progress_method = _normalise_progress_method(progress_method)
     children = epic.children
     m = EpicMetrics()
     m.estimation_unit = "Days" if estimation_method == "time_days" else "SP"
@@ -35,36 +67,105 @@ def calculate_metrics(
         logger.debug("Epic %s has no children — returning empty metrics", epic.key)
         return m
 
-    # Pre-compute estimates once per child (avoids 4+ calls per child)
-    child_estimates: list[tuple[JiraIssue, float | None]] = [
-        (c, _get_estimate(c, estimation_method)) for c in children
-    ]
+    use_estimates = progress_method != PROGRESS_ISSUES_ONLY
 
+    # Pre-compute direct estimates once per child
+    direct_estimates: dict[str, float | None] = {
+        c.key: _get_estimate(c, estimation_method) for c in children
+    }
+
+    # Build parent→subtasks mapping (only among this epic's children)
+    child_key_set = {c.key for c in children}
+    parent_to_subs: dict[str, list[JiraIssue]] = {}
+    subtask_keys: set[str] = set()
+    for c in children:
+        if c.parent_key and c.parent_key in child_key_set:
+            parent_to_subs.setdefault(c.parent_key, []).append(c)
+            subtask_keys.add(c.key)
+
+    # Compute bottom-up progress for every issue and set .progress / .effective_weight
+    _compute_all_issue_progress(
+        children, direct_estimates, parent_to_subs, use_estimates
+    )
+
+    # Direct children of the epic (not subtasks of other children)
+    direct_children = [c for c in children if c.key not in subtask_keys]
+
+    # Epic progress = weighted average of direct children's progress
+    weighted_sum = sum(c.progress * c.effective_weight for c in direct_children)
+    weight_total = sum(c.effective_weight for c in direct_children)
+    raw_progress = weighted_sum / weight_total if weight_total > 0 else PROGRESS_MIN
+
+    # Apply progress method
     m.total_issues = len(children)
-    m.completed_issues = sum(1 for c in children if c.status_category == "Done")
+    m.completed_issues = sum(1 for c in children if c.status_category == STATUS_DONE)
     m.open_issues = m.total_issues - m.completed_issues
-    m.unestimated_issues = sum(1 for _, est in child_estimates if est is None)
-    m.total_sp = sum(est for _, est in child_estimates if est is not None)
+
+    if progress_method == PROGRESS_COMBINED and m.total_issues > 0:
+        issue_ratio = m.completed_issues / m.total_issues
+        m.progress = _clamp_progress(raw_progress * issue_ratio)
+    else:
+        m.progress = _clamp_progress(raw_progress)
+
+    # SP display fields: use effective estimates, exclude subtasks accounted
+    # for through their parent
+    accounted_keys: set[str] = set()
+    effective_est: dict[str, float | None] = {}
+    effective_done: dict[str, float] = {}
+
+    for c in children:
+        direct = direct_estimates[c.key]
+        if direct is not None or c.key not in parent_to_subs:
+            effective_est[c.key] = direct
+            effective_done[c.key] = (
+                direct
+                if (direct is not None and c.status_category == STATUS_DONE)
+                else 0.0
+            )
+            continue
+
+        # Unestimated parent with subtasks — derive from subtask completion
+        subs = parent_to_subs[c.key]
+        sub_ests = [direct_estimates.get(s.key) for s in subs]
+
+        if any(e is not None for e in sub_ests):
+            effective_est[c.key] = sum(e for e in sub_ests if e is not None)
+            effective_done[c.key] = sum(
+                float(direct_estimates[s.key])  # type: ignore[arg-type]
+                for s in subs
+                if direct_estimates.get(s.key) is not None
+                and s.status_category == STATUS_DONE
+            )
+        else:
+            effective_est[c.key] = float(len(subs))
+            effective_done[c.key] = float(
+                sum(1 for s in subs if s.status_category == STATUS_DONE)
+            )
+        accounted_keys.update(s.key for s in subs)
+
+    non_accounted = [c for c in children if c.key not in accounted_keys]
+    m.unestimated_issues = sum(
+        1 for c in non_accounted if effective_est.get(c.key) is None
+    )
+    m.total_sp = sum(
+        float(effective_est[c.key])  # type: ignore[arg-type]
+        for c in non_accounted
+        if effective_est.get(c.key) is not None
+    )
     m.completed_sp = sum(
-        est
-        for c, est in child_estimates
-        if c.status_category == "Done" and est is not None
+        effective_done.get(c.key, 0.0)
+        for c in non_accounted
+        if effective_est.get(c.key) is not None
     )
     m.remaining_sp = m.total_sp - m.completed_sp
-    m.progress = _progress(
-        m.completed_sp,
-        m.total_sp,
-        m.completed_issues,
-        m.total_issues,
-        progress_method=progress_method,
-    )
+
     m.avg_cycle_time_days = _avg_cycle_time(children)
     m.velocity_sp_per_week = _velocity(children, estimation_method, weeks=4)
     m.scope_change_pct = _scope_change(children)
     m.blocked_issues = sum(
         1
         for c in children
-        if "blocked" in c.status.lower() and c.status_category != "Done"
+        if "blocked" in c.status.lower() and c.status_category != STATUS_DONE
     )
     m.forecast_date = _forecast(m.remaining_sp, m.velocity_sp_per_week)
 
@@ -87,14 +188,16 @@ def calculate_metrics(
 def merge_metrics(
     epics: list[EpicData],
     estimation_method: str = "story_points",
-    progress_method: str = "combined",
+    progress_method: str = PROGRESS_COMBINED,
 ) -> tuple[EpicData, EpicMetrics]:
     """Merge multiple epics into a single synthetic epic and compute metrics.
 
-    Children are merged with key-based deduplication. The resulting
-    :class:`EpicData` is synthetic — its key is the concatenation of source
-    epic keys and its dates span the full range of the source epics.
+    Children are merged with key-based deduplication.  The label-group progress
+    is computed as the weighted average of per-epic progress values (each
+    weighted by the sum of its direct children's effective weights), rather than
+    flattening all children and re-computing.
     """
+    progress_method = _normalise_progress_method(progress_method)
     seen: set[str] = set()
     merged_children: list[JiraIssue] = []
     all_labels: list[str] = []
@@ -134,7 +237,7 @@ def merge_metrics(
             start_dates.append(c.created.date())
         if c.due_date:
             due_dates.append(c.due_date)
-        elif c.resolved and c.status_category == "Done":
+        elif c.resolved and c.status_category == STATUS_DONE:
             due_dates.append(c.resolved.date())
         # Timeline start cascade
         if c.timeline_start:
@@ -175,7 +278,41 @@ def merge_metrics(
         timeline_end=max(tl_ends) if tl_ends else None,
     )
 
+    # Compute per-epic metrics to get individual progress values, then
+    # override label-group progress as weighted average of source epic progress.
+    epic_metrics_list: list[EpicMetrics] = []
+    for epic in epics:
+        epic_metrics_list.append(
+            calculate_metrics(epic, estimation_method, progress_method)
+        )
+
+    # Compute the label-group metrics from the merged synthetic epic
     m = calculate_metrics(synthetic, estimation_method, progress_method)
+
+    # Override progress: weighted average of per-epic progress values
+    if epic_metrics_list:
+        # Each epic's weight = sum of its direct children's effective weights
+        epic_weights: list[float] = []
+        for epic in epics:
+            child_key_set = {c.key for c in epic.children}
+            subtask_keys: set[str] = set()
+            for c in epic.children:
+                if c.parent_key and c.parent_key in child_key_set:
+                    subtask_keys.add(c.key)
+            direct_children = [c for c in epic.children if c.key not in subtask_keys]
+            epic_weights.append(
+                sum(c.effective_weight for c in direct_children)
+                if direct_children
+                else DEFAULT_WEIGHT
+            )
+
+        weighted_sum = sum(
+            em.progress * w for em, w in zip(epic_metrics_list, epic_weights)
+        )
+        weight_total = sum(epic_weights)
+        if weight_total > 0:
+            m.progress = _clamp_progress(weighted_sum / weight_total)
+
     return synthetic, m
 
 
@@ -198,31 +335,87 @@ def _get_estimate(issue: JiraIssue, method: str) -> float | None:
     return issue.story_points if issue.story_points else None
 
 
-def _progress(
-    completed_sp: float,
-    total_sp: float,
-    completed_issues: int,
-    total_issues: int,
-    *,
-    progress_method: str = "combined",
-) -> float:
-    if total_issues == 0:
-        return 0.0
-    if progress_method == "story_points_only":
-        if total_sp == 0:
-            return 0.0
-        return max(0.0, min(100.0, (completed_sp / total_sp) * 100))
-    # combined (default)
-    if total_sp == 0:
-        return max(0.0, min(100.0, (completed_issues / total_issues) * 100))
-    value = (completed_sp / total_sp) * (completed_issues / total_issues) * 100
-    return max(0.0, min(100.0, value))
+def _clamp_progress(value: float) -> float:
+    """Clamp a progress value to [0, 100]."""
+    return max(PROGRESS_MIN, min(PROGRESS_MAX, value))
+
+
+def _compute_all_issue_progress(
+    children: list[JiraIssue],
+    direct_estimates: dict[str, float | None],
+    parent_to_subs: dict[str, list[JiraIssue]],
+    use_estimates: bool,
+) -> None:
+    """Compute bottom-up progress for every issue.
+
+    Sets ``.progress`` and ``.effective_weight`` on each issue.
+
+    Args:
+        children: All child issues of the epic (flat list).
+        direct_estimates: Pre-computed estimate per issue key.
+        parent_to_subs: Mapping of parent key → list of subtask issues.
+        use_estimates: If True, weight = estimate (SP/days); if False, weight = 1.0.
+
+    Side effects:
+        Sets ``issue.progress`` and ``issue.effective_weight`` on every issue
+        in *children*.
+    """
+    computed: set[str] = set()
+
+    def _compute(issue: JiraIssue) -> tuple[float, float]:
+        """Recursively compute (progress, effective_weight) for an issue.
+
+        Returns:
+            A tuple of (progress_pct, effective_weight).
+        """
+        if issue.key in computed:
+            return issue.progress, issue.effective_weight
+
+        subs = parent_to_subs.get(issue.key, [])
+        est = direct_estimates.get(issue.key)
+
+        if not subs:
+            # Leaf node: 100% if Done, 0% otherwise
+            progress = (
+                PROGRESS_DONE if issue.status_category == STATUS_DONE else PROGRESS_MIN
+            )
+            weight = (
+                (est if est is not None else DEFAULT_WEIGHT)
+                if use_estimates
+                else DEFAULT_WEIGHT
+            )
+            issue.progress = progress
+            issue.effective_weight = weight
+            computed.add(issue.key)
+            return progress, weight
+
+        # Parent with subtasks: aggregate children bottom-up
+        weighted_sum = 0.0
+        weight_total = 0.0
+        for sub in subs:
+            sub_progress, sub_weight = _compute(sub)
+            weighted_sum += sub_progress * sub_weight
+            weight_total += sub_weight
+
+        progress = weighted_sum / weight_total if weight_total > 0 else PROGRESS_MIN
+        # Parent weight: own estimate if available, else sum of subtask weights
+        if use_estimates:
+            weight = est if est is not None else weight_total
+        else:
+            weight = DEFAULT_WEIGHT
+        issue.progress = progress
+        issue.effective_weight = weight
+        computed.add(issue.key)
+        return progress, weight
+
+    for c in children:
+        _compute(c)
 
 
 def _avg_cycle_time(children: list[JiraIssue]) -> float | None:
     durations: list[float] = []
     for c in children:
-        if c.status_category == "Done" and c.created and c.resolved:
+        if c.status_category == STATUS_DONE and c.created and c.resolved:
             delta = c.resolved - c.created
             durations.append(delta.total_seconds() / 86400)
     return sum(durations) / len(durations) if durations else None
@@ -239,7 +432,7 @@ def _velocity(
         est
         for c in children
         if (est := _get_estimate(c, estimation_method)) is not None
-        and c.status_category == "Done"
+        and c.status_category == STATUS_DONE
         and c.resolved
         and c.resolved.date() >= cutoff_date
     )
@@ -299,7 +492,7 @@ def _build_time_series(
         [
             (c.resolved.date(), c)
             for c, _ in dated
-            if c.status_category == "Done" and c.resolved
+            if c.status_category == STATUS_DONE and c.resolved
         ],
         key=lambda pair: pair[0],
     )

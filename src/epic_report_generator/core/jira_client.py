@@ -662,6 +662,14 @@ class JiraClient:
 
         raw_sprints = self._get_raw_field(raw, sprint_field)
 
+        # Extract parent key (for subtask → parent relationship)
+        parent_obj = getattr(fields, "parent", None)
+        parent_key: str | None = None
+        if parent_obj is not None:
+            parent_key = getattr(parent_obj, "key", None)
+            if parent_key is None and isinstance(parent_obj, dict):
+                parent_key = parent_obj.get("key")
+
         issue = JiraIssue(
             key=raw.key,
             summary=getattr(fields, "summary", ""),
@@ -673,6 +681,7 @@ class JiraClient:
             created=self._parse_dt(getattr(fields, "created", None)),
             resolved=self._parse_dt(getattr(fields, "resolutiondate", None)),
             assignee=self._name(getattr(fields, "assignee", None)),
+            parent_key=parent_key,
             start_date=self._parse_date(self._get_raw_field(raw, start_date_field)),
             due_date=self._parse_date(self._get_raw_field(raw, due_date_field)),
             sprints=self._parse_sprints(raw_sprints),

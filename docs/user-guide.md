@@ -254,7 +254,9 @@ Set the **Type** dropdown to *Label* and enter a Jira label name. All epics tagg
 
 Each item has an optional **Cert.** dropdown:
 - `--` — no certainty badge
-- `Low` / `Med` / `High` — shown as a badge on the PDF timeline
+- `Low` / `Med` / `High` — shown as a coloured badge on the PDF timeline and summary table
+
+When any item has a scope certainty set, a colour-coded legend (green = High, yellow = Medium, red = Low) appears at the bottom of both the summary table and the timeline page.
 
 #### Buttons
 
@@ -273,8 +275,8 @@ Customize what appears on the report's cover page:
 | **Author** | *(empty)* | Shown as the report creator |
 | **Project Name** | *(auto from Jira)* | Overrides the Jira project name |
 | **Report Date** | Today | Date printed on the cover |
-| **Include confidentiality notice** | Off | Adds a confidentiality statement to the footer |
-| **Company Name** | *(empty)* | Referenced in the confidentiality text |
+| **Include confidentiality notice** | Off | Adds a repeating "CONFIDENTIAL — {Company Name}" footer on every page except the title page, with the report date and author on the right |
+| **Company Name** | *(empty)* | Referenced in the confidentiality footer |
 
 ---
 
@@ -291,12 +293,14 @@ Choose how issue size is measured:
 
 #### Progress Calculation
 
+Progress is computed **bottom-up** through the issue hierarchy. Leaf issues get 100% if Done, 0% otherwise. Parent issues with subtasks aggregate their children's progress via weighted average. The epic's progress is the weighted average of its direct children.
+
 | Method | Formula |
 |--------|---------|
-| **Combined (Estimates x Issues)** | `(completed_estimate / total_estimate) × (closed_issues / total_issues) × 100` |
-| **Estimates Only** | `(completed_estimate / total_estimate) × 100` |
+| **Combined (Estimates x Issues)** | Bottom-up weighted average × (done issues / total issues). Weights = estimates (SP or days). |
+| **Issues Only** | Bottom-up weighted average with weight = 1.0 for every item (counts open vs done equally). |
 
-Falls back to issue-count ratio when total estimate is zero.
+Falls back to weight = 1.0 for unestimated items in Combined mode.
 
 #### Custom Fields
 
@@ -308,7 +312,7 @@ Depending on the estimation method, configure the Jira field IDs:
 
 #### Include Subtasks
 
-When checked (default), the app fetches sub-tasks linked via the `parent` field and includes them in progress calculations. Subtasks are batched in groups of 100 for efficient JQL queries.
+When checked (default), the app fetches sub-tasks linked via the `parent` field and includes them in progress calculations. Subtasks are batched in groups of 100 for efficient JQL queries. Subtask progress is aggregated into their parent issue's progress via weighted average (bottom-up), so a parent with 2 of 3 subtasks done shows ~67% rather than being binary.
 
 ---
 
@@ -423,7 +427,7 @@ Click **Save Settings** to persist.
 
 ### Theme
 
-Switch between **Light** and **Dark** themes from the *Appearance* section. The change applies immediately to both the app UI and generated PDF charts.
+Switch between **Light** and **Dark** themes from the *Appearance* section. The app uses Material Design base themes (`light_blue` / `dark_blue`) with app-specific style overlays. The change applies immediately to both the app UI and generated PDF charts.
 
 ### OAuth Configuration
 

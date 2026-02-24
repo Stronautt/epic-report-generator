@@ -6,6 +6,7 @@ import logging
 
 from PySide6.QtGui import QCloseEvent, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
+    QApplication,
     QButtonGroup,
     QHBoxLayout,
     QMainWindow,
@@ -15,6 +16,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from qt_material import apply_stylesheet
 
 from epic_report_generator.core.jira_client import JiraClient
 from epic_report_generator.services.auth_manager import AuthManager
@@ -23,7 +25,7 @@ from epic_report_generator.ui.log_panel import LogPanel
 from epic_report_generator.ui.login_panel import LoginPanel
 from epic_report_generator.ui.report_panel import ReportPanel
 from epic_report_generator.ui.settings_panel import SettingsPanel
-from epic_report_generator.ui.styles import DARK_THEME, LIGHT_THEME
+from epic_report_generator.ui.styles import COMMON_THEME, DARK_THEME, LIGHT_THEME
 from epic_report_generator.ui.widgets import SidebarUserInfo
 
 logger = logging.getLogger(__name__)
@@ -48,7 +50,7 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("Epic Report Generator")
         self.setMinimumSize(960, 600)
-        self.resize(1200, 720)
+        self.resize(1280, 900)
 
         self._build_ui()
         self._setup_shortcuts()
@@ -235,9 +237,34 @@ class MainWindow(QMainWindow):
 
     # -- theming --------------------------------------------------------------
 
+    # Material Design theme names
+    _MATERIAL_THEMES = {"light": "light_blue.xml", "dark": "dark_blue.xml"}
+
+    _MATERIAL_EXTRA = {
+        "font_family": '"Segoe UI", "SF Pro Display", "Helvetica Neue", sans-serif',
+        "density_scale": "-1",
+    }
+
     def _apply_theme(self, theme: str) -> None:
         logger.info("Applying theme: %s", theme)
         is_dark = theme == "dark"
-        self.setStyleSheet(DARK_THEME if is_dark else LIGHT_THEME)
+
+        # Apply Material Design base theme at the application level
+        app = QApplication.instance()
+        assert isinstance(app, QApplication)
+        theme_xml = self._MATERIAL_THEMES.get(theme, self._MATERIAL_THEMES["light"])
+        apply_stylesheet(app, theme=theme_xml, extra=self._MATERIAL_EXTRA)
+
+        # Patch the generated stylesheet to reduce QComboBox dropdown
+        # spacing — the popup is a top-level widget so window-level
+        # overrides cannot reach it.
+        css = app.styleSheet()
+        css += "\nQComboBox { padding-left: 4px; }\n"
+        app.setStyleSheet(css)
+
+        # Apply app-specific overrides at the window level:
+        # structural (COMMON_THEME) first, then the color overrides.
+        self.setStyleSheet(COMMON_THEME + (DARK_THEME if is_dark else LIGHT_THEME))
+
         self._log_panel.set_dark(is_dark)
         self._report_panel.set_dark(is_dark)

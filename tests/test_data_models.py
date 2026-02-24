@@ -53,6 +53,22 @@ class TestJiraIssue:
         assert issue.assignee is None
         assert issue.created is None
 
+    def test_progress_and_weight_defaults(self) -> None:
+        issue = JiraIssue(
+            key="X-1",
+            summary="",
+            status="",
+            status_category="To Do",
+            resolution=None,
+            issue_type="Task",
+            story_points=None,
+            created=None,
+            resolved=None,
+            assignee=None,
+        )
+        assert issue.progress == 0.0
+        assert issue.effective_weight == 1.0
+
     def test_date_fields_default_none(self) -> None:
         issue = JiraIssue(
             key="X-1",

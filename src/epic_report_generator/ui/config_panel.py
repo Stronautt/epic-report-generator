@@ -242,6 +242,8 @@ class ConfigPanel(QWidget):
         self._persisting = False  # guard against saves during init/restore
         self._labels_fetched = False
         self._bg_threads: list[QThread] = []
+        self._bg_workers: list[_JiraCallWorker] = []
+        self._bg_callbacks: dict[_JiraCallWorker, object] = {}
         # Debounce timer for config persistence (300ms)
         self._persist_timer = QTimer(self)
         self._persist_timer.setSingleShot(True)
@@ -374,15 +376,16 @@ class ConfigPanel(QWidget):
             "Combined (Estimates × Issues)",
             "combined",
         )
-        self._progress_method_combo.addItem("Estimates Only", "story_points_only")
+        self._progress_method_combo.addItem("Issues Only", "issues_only")
         self._progress_method_combo.currentIndexChanged.connect(
             lambda _: self._persist_values()
         )
         est.addWidget(self._progress_method_combo)
         est.addWidget(
             self._hint(
-                "Combined multiplies the estimate ratio by the issue-count ratio. "
-                "Estimates Only uses the estimate ratio alone."
+                "Combined uses estimate-weighted averages multiplied by the "
+                "issue-count ratio. Issues Only counts open vs done items "
+                "with equal weight."
             )
         )
 
@@ -688,8 +691,10 @@ class ConfigPanel(QWidget):
             self._estimation_combo.setCurrentIndex(idx)
         self._on_estimation_method_changed()
 
-        # Restore progress method
+        # Restore progress method (backward compat: story_points_only → issues_only)
         progress_method = self._config.get("progress_method", "combined")
+        if progress_method == "story_points_only":
+            progress_method = "issues_only"
         pidx = self._progress_method_combo.findData(progress_method)
         if pidx >= 0:
             self._progress_method_combo.setCurrentIndex(pidx)
@@ -996,18 +1001,35 @@ class ConfigPanel(QWidget):
         worker = _JiraCallWorker(fn)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.finished.connect(callback)  # type: ignore[arg-type]
+        self._bg_callbacks[worker] = callback
+        worker.finished.connect(self._on_bg_result)
         worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
         self._bg_threads.append(thread)
+        self._bg_workers.append(worker)
 
-        def _on_finished(t: QThread = thread) -> None:
+        def _on_thread_done(t: QThread = thread, w: _JiraCallWorker = worker) -> None:
+            self._bg_callbacks.pop(w, None)
+            if w in self._bg_workers:
+                self._bg_workers.remove(w)
+            w.deleteLater()
             if t in self._bg_threads:
                 self._bg_threads.remove(t)
 
-        thread.finished.connect(_on_finished)
+        thread.finished.connect(_on_thread_done)
         thread.finished.connect(thread.deleteLater)
         thread.start()
+
+    def _on_bg_result(self, result: object) -> None:
+        """Dispatch a background-worker result to the registered callback.
+
+        Because this is a method on *self* (a QWidget), Qt uses
+        AutoConnection when the emitting worker lives on a different
+        thread, guaranteeing the callback executes on the main thread.
+        """
+        worker = self.sender()
+        callback = self._bg_callbacks.get(worker)  # type: ignore[arg-type]
+        if callback is not None:
+            callback(result)  # type: ignore[operator]
 
     def shutdown(self) -> None:
         """Wait for all background threads to finish."""
@@ -1015,6 +1037,8 @@ class ConfigPanel(QWidget):
             thread.quit()
             thread.wait()
         self._bg_threads.clear()
+        self._bg_workers.clear()
+        self._bg_callbacks.clear()
 
     # -- helpers --------------------------------------------------------------
 
