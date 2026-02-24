@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
@@ -20,7 +19,7 @@ from PySide6.QtWidgets import (
 
 from epic_report_generator.services.auth_manager import AuthManager
 from epic_report_generator.services.config_manager import ConfigManager
-from epic_report_generator.ui.widgets import LabelledField
+from epic_report_generator.ui.widgets import LabelledField, no_scroll_wheel
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +88,7 @@ class SettingsPanel(QWidget):
         theme_lbl.setProperty("subheading", "true")
         theme_layout.addWidget(theme_lbl)
         self._theme_combo = QComboBox()
+        no_scroll_wheel(self._theme_combo)
         self._theme_combo.addItems(["Light", "Dark"])
         self._theme_combo.currentTextChanged.connect(self._on_theme_changed)
         theme_layout.addWidget(self._theme_combo)
@@ -141,6 +141,7 @@ class SettingsPanel(QWidget):
         port_lbl.setProperty("subheading", "true")
         oauth_layout.addWidget(port_lbl)
         self._port_spin = QSpinBox()
+        no_scroll_wheel(self._port_spin)
         self._port_spin.setRange(1024, 65535)
         self._port_spin.setValue(18492)
         self._port_spin.setToolTip("Local port for the OAuth callback server")
@@ -173,7 +174,9 @@ class SettingsPanel(QWidget):
 
     def _load_values(self) -> None:
         self._load_connection_values()
-        self._default_title.text = self._config.get("default_title", "Epic Progress Report")
+        self._default_title.text = self._config.get(
+            "default_title", "Epic Progress Report"
+        )
         self._default_author.text = self._config.get("default_author", "")
         self._default_company.text = self._config.get("default_company", "")
         theme = self._config.get("theme", "light")
@@ -181,18 +184,20 @@ class SettingsPanel(QWidget):
 
     def _save(self) -> None:
         logger.info("Saving settings")
-        values: dict[str, Any] = {
+        values: dict = {
             "default_title": self._default_title.text.strip(),
             "default_author": self._default_author.text.strip(),
             "default_company": self._default_company.text.strip(),
         }
         # Only persist OAuth fields when using OAuth auth method
         if self._auth.auth_method == "oauth":
-            values.update({
-                "client_id": self._client_id.text.strip(),
-                "client_secret": self._client_secret.text.strip(),
-                "callback_port": self._port_spin.value(),
-            })
+            values.update(
+                {
+                    "client_id": self._client_id.text.strip(),
+                    "client_secret": self._client_secret.text.strip(),
+                    "callback_port": self._port_spin.value(),
+                }
+            )
         self._config.update(values)
         logger.info("Settings saved successfully")
         QMessageBox.information(self, "Saved", "Settings saved successfully.")

@@ -59,6 +59,7 @@ def _install_signal_handlers(app: QApplication) -> None:
     the Qt event loop blocks in C.  A periodic zero-length timer forces
     Python to regain control so the signal handler can fire.
     """
+
     def _shutdown(signum: int, _frame: object) -> None:
         sig_name = signal.Signals(signum).name
         logger.info("Received %s, shutting down…", sig_name)

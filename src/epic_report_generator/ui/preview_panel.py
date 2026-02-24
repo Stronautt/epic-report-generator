@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
 
-from PySide6.QtCore import QObject, QThread, Signal, Qt
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtCore import QObject, Qt, QThread, Signal
+from PySide6.QtGui import QPixmap, QResizeEvent
 from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
@@ -20,9 +19,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from epic_report_generator.core.data_models import EpicData, EpicMetrics, ReportConfig, ReportData
+from epic_report_generator.core.data_models import (
+    EpicData,
+    EpicMetrics,
+    ReportConfig,
+    ReportData,
+    ReportItem,
+)
 from epic_report_generator.core.jira_client import JiraClient
-from epic_report_generator.core.metrics import calculate_metrics
+from epic_report_generator.core.metrics import calculate_metrics, merge_metrics
 from epic_report_generator.core.pdf_generator import generate_pdf
 
 logger = logging.getLogger(__name__)
@@ -42,30 +47,113 @@ class _GenerateWorker(QObject):
     def run(self) -> None:
         """Execute the data fetch and PDF generation."""
         report = ReportData(config=self._config)
-        total = len(self._config.epic_keys)
-        logger.info("Worker started: fetching %d epic(s)", total)
+        items = self._config.items
+        # Fall back to epic_keys if no items provided (backward compat)
+        if not items and self._config.epic_keys:
+            items = [ReportItem(kind="epic", key=k) for k in self._config.epic_keys]
 
-        for i, key in enumerate(self._config.epic_keys, 1):
-            self.progress.emit(f"Fetching {key}\u2026", int(i / total * 70))
-            logger.debug("Fetching epic %d/%d: %s", i, total, key)
-            epic = self._jira.fetch_epic(
-                key,
-                sp_field=self._config.story_points_field,
-                epic_link_field=self._config.epic_link_field,
-            )
-            if epic is None:
-                logger.warning("Epic %s not found or inaccessible", key)
-                report.errors.append(f"Epic {key} not found. Check the key and try again.")
-                continue
-            metrics = calculate_metrics(epic)
-            report.epics.append(epic)
-            report.metrics.append(metrics)
-            logger.debug("Epic %s: %d children, progress=%.1f%%", key, metrics.total_issues, metrics.progress)
+        total = len(items) or 1
+        logger.info("Worker started: fetching %d item(s)", len(items))
+
+        project_keys: set[str] = set()
+
+        for i, item in enumerate(items, 1):
+            self.progress.emit(f"Fetching {item.key}…", int(i / total * 70))
+
+            if item.kind == "epic":
+                logger.debug("Fetching epic %d/%d: %s", i, total, item.key)
+                epic = self._jira.fetch_epic(
+                    item.key,
+                    sp_field=self._config.story_points_field,
+                    epic_link_field=self._config.epic_link_field,
+                    start_date_field=self._config.start_date_field,
+                    due_date_field=self._config.due_date_field,
+                    include_subtasks=self._config.include_subtasks,
+                )
+                if epic is None:
+                    logger.warning("Epic %s not found or inaccessible", item.key)
+                    report.errors.append(f"Epic {item.key} not found.")
+                    continue
+                metrics = calculate_metrics(
+                    epic,
+                    estimation_method=self._config.estimation_method,
+                    progress_method=self._config.progress_method,
+                )
+                metrics.scope_certainty = item.scope_certainty
+                # Use display_name override if set
+                if item.display_name:
+                    epic.summary = item.display_name
+                report.epics.append(epic)
+                report.metrics.append(metrics)
+                report.resolved_items.append((item, epic, metrics))
+                # Collect project key
+                if "-" in item.key:
+                    project_keys.add(item.key.rsplit("-", 1)[0])
+
+            elif item.kind == "label":
+                logger.debug("Fetching epics by label %d/%d: %s", i, total, item.key)
+                label_epics = self._jira.fetch_epics_by_label(
+                    item.key,
+                    sp_field=self._config.story_points_field,
+                    epic_link_field=self._config.epic_link_field,
+                    start_date_field=self._config.start_date_field,
+                    due_date_field=self._config.due_date_field,
+                    include_subtasks=self._config.include_subtasks,
+                )
+                if not label_epics:
+                    report.errors.append(f"No epics found for label '{item.key}'.")
+                    continue
+                synthetic, metrics = merge_metrics(
+                    label_epics,
+                    estimation_method=self._config.estimation_method,
+                    progress_method=self._config.progress_method,
+                )
+                metrics.scope_certainty = item.scope_certainty
+                # Set display name for label group
+                display = item.display_name or item.key
+                synthetic.summary = display
+                report.epics.append(synthetic)
+                report.metrics.append(metrics)
+                report.resolved_items.append((item, synthetic, metrics))
+                # Store source epics with individual metrics for timeline
+                source_pairs: list[tuple[EpicData, EpicMetrics]] = []
+                for e in label_epics:
+                    em = calculate_metrics(
+                        e,
+                        estimation_method=self._config.estimation_method,
+                        progress_method=self._config.progress_method,
+                    )
+                    source_pairs.append((e, em))
+                    if "-" in e.key:
+                        project_keys.add(e.key.rsplit("-", 1)[0])
+                report.label_source_epics[item.key] = source_pairs
+
+        # Collect unique sprints from all children across all epics
+        seen_sprints: set[str] = set()
+        for epic in report.epics:
+            for child in epic.children:
+                for sp in child.sprints:
+                    if sp.name not in seen_sprints:
+                        seen_sprints.add(sp.name)
+                        report.sprints.append(sp)
+
+        # Fetch fix version dates
+        self.progress.emit("Fetching fix versions…", 75)
+        for pk in project_keys:
+            try:
+                versions = self._jira.fetch_fix_version_dates(pk)
+                report.fix_version_dates.update(versions)
+            except Exception as exc:
+                logger.warning("Failed to fetch versions for %s: %s", pk, exc)
 
         if report.epics:
-            self.progress.emit("Generating PDF\u2026", 85)
+            self.progress.emit("Generating PDF…", 85)
 
-        logger.info("Worker finished: %d epic(s) fetched, %d error(s)", len(report.epics), len(report.errors))
+        logger.info(
+            "Worker finished: %d item(s) fetched, %d error(s)",
+            len(report.epics),
+            len(report.errors),
+        )
         self.finished.emit(report)
 
 
@@ -75,9 +163,7 @@ class PreviewPanel(QWidget):
     Designed to be embedded inside ReportPanel — no heading or generate button.
     """
 
-    def __init__(
-        self, jira: JiraClient, parent: QWidget | None = None
-    ) -> None:
+    def __init__(self, jira: JiraClient, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._jira = jira
         self._pdf_bytes: bytes | None = None
@@ -139,7 +225,8 @@ class PreviewPanel(QWidget):
             QMessageBox.warning(self, "Not Connected", "Connect to Jira first.")
             return
 
-        logger.info("Starting report generation for %d epic(s)", len(config.epic_keys))
+        item_count = len(config.items) or len(config.epic_keys)
+        logger.info("Starting report generation for %d item(s)", item_count)
         self._export_btn.setEnabled(False)
         self._progress_bar.setValue(0)
         self._progress_bar.show()
@@ -185,19 +272,21 @@ class PreviewPanel(QWidget):
             self._status_label.setText("No data to generate a report.")
             if report and report.errors:
                 QMessageBox.warning(
-                    self, "Errors",
+                    self,
+                    "Errors",
                     "\n".join(report.errors),
                 )
             return
 
         if report.errors:
             QMessageBox.warning(
-                self, "Some Epics Failed",
+                self,
+                "Some Epics Failed",
                 "The following errors occurred:\n" + "\n".join(report.errors),
             )
 
         logger.info("Building PDF from %d epic(s)", len(report.epics))
-        self._status_label.setText("Building PDF\u2026")
+        self._status_label.setText("Building PDF…")
         try:
             self._pdf_bytes = generate_pdf(report)
         except Exception as exc:
@@ -208,9 +297,13 @@ class PreviewPanel(QWidget):
             return
 
         self._progress_bar.hide()
-        logger.info("PDF generated: %d epic(s), %s bytes", len(report.epics), f"{len(self._pdf_bytes):,}")
+        logger.info(
+            "PDF generated: %d epic(s), %s bytes",
+            len(report.epics),
+            f"{len(self._pdf_bytes):,}",
+        )
         self._status_label.setText(
-            f"Report ready \u2014 {len(report.epics)} epic(s), "
+            f"Report ready — {len(report.epics)} epic(s), "
             f"{len(self._pdf_bytes):,} bytes"
         )
         self._export_btn.setEnabled(True)
@@ -229,7 +322,7 @@ class PreviewPanel(QWidget):
 
     # -- preview rendering ----------------------------------------------------
 
-    def resizeEvent(self, event: Any) -> None:
+    def resizeEvent(self, event: QResizeEvent) -> None:
         """Re-render preview when panel is resized so pages scale to fit."""
         super().resizeEvent(event)
         # Keep the preview area at least one 16:9 page tall
@@ -242,8 +335,10 @@ class PreviewPanel(QWidget):
     def _clear_preview(self) -> None:
         while self._preview_layout.count():
             item = self._preview_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+            if item is not None:
+                w = item.widget()
+                if w is not None:
+                    w.deleteLater()
 
     def _render_preview(self) -> None:
         """Render PDF pages as QPixmap images scaled to fit the panel width."""

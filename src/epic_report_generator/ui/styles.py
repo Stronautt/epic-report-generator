@@ -69,7 +69,7 @@ QPushButton[danger="true"]:hover {
 }
 
 /* Inputs */
-QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QComboBox {
+QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox {
     border: 1px solid #DFE1E6;
     border-radius: 4px;
     padding: 6px 10px;
@@ -373,7 +373,7 @@ QPushButton[danger="true"] {
     background-color: #DE350B;
 }
 
-QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QComboBox {
+QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox {
     border: 1px solid #2C3E5D;
     border-radius: 4px;
     padding: 6px 10px;

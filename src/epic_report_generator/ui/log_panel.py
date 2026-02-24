@@ -5,8 +5,8 @@ from __future__ import annotations
 import logging
 from collections import deque
 
-from PySide6.QtCore import QObject, Signal, Qt
-from PySide6.QtGui import QTextCharFormat, QColor, QFont
+from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QTextCharFormat
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -30,11 +30,12 @@ class _QtLogHandler(logging.Handler, QObject):
         logging.Handler.__init__(self)
         QObject.__init__(self)
         self.setFormatter(
-            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-                              datefmt="%H:%M:%S")
+            logging.Formatter(
+                "%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S"
+            )
         )
 
-    def emit(self, record: logging.LogRecord) -> None:
+    def emit(self, record: logging.LogRecord) -> None:  # type: ignore[override]
         """Format the record and emit via the Qt signal."""
         try:
             msg = self.format(record)
@@ -79,7 +80,11 @@ class LogPanel(QWidget):
         self._dark = False
         self._buffer: deque[tuple[str, int]] = deque(maxlen=_MAX_BUFFER)
         self._active_levels: set[int] = {
-            logging.DEBUG, logging.INFO, logging.WARNING, logging.ERROR, logging.CRITICAL,
+            logging.DEBUG,
+            logging.INFO,
+            logging.WARNING,
+            logging.ERROR,
+            logging.CRITICAL,
         }
         self._build_ui()
 
@@ -125,7 +130,9 @@ class LogPanel(QWidget):
             btn.setChecked(True)
             btn.setObjectName("logFilterBtn")
             btn.setProperty("level", label.lower())
-            btn.clicked.connect(lambda checked, lvl=level: self._on_filter_toggled(lvl, checked))
+            btn.clicked.connect(
+                lambda checked, lvl=level: self._on_filter_toggled(lvl, checked)
+            )
             self._filter_btns[level] = btn
             filter_row.addWidget(btn)
 
@@ -136,8 +143,11 @@ class LogPanel(QWidget):
         self._log_view = QPlainTextEdit()
         self._log_view.setReadOnly(True)
         self._log_view.setMaximumBlockCount(_MAX_BUFFER)
-        self._log_view.setFont(QFont("Consolas", 10) if __import__("sys").platform == "win32"
-                               else QFont("Monospace", 10))
+        self._log_view.setFont(
+            QFont("Consolas", 10)
+            if __import__("sys").platform == "win32"
+            else QFont("Monospace", 10)
+        )
         self._log_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         root.addWidget(self._log_view)
 

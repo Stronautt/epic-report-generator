@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Epic Report Generator
+Exec=epic-report-generator
+Icon=epic-report-generator
+Type=Application
+Categories=Office;
+Comment=Generate landscape PDF reports from Jira Epic data

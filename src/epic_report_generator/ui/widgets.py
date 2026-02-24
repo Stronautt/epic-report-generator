@@ -4,9 +4,25 @@ from __future__ import annotations
 
 import re
 
-from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
-from PySide6.QtGui import QBrush, QGuiApplication, QPainter, QPainterPath, QPixmap
+from PySide6.QtCore import (
+    QEvent,
+    QObject,
+    QPoint,
+    QRect,
+    QSize,
+    Qt,
+    Signal,
+)
+from PySide6.QtGui import (
+    QGuiApplication,
+    QMouseEvent,
+    QPainter,
+    QPainterPath,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
+    QComboBox,
+    QCompleter,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -15,11 +31,28 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QSizePolicy,
-    QStyle,
     QVBoxLayout,
     QWidget,
     QWidgetItem,
 )
+
+from epic_report_generator.core.data_models import ReportItem
+
+
+class _IgnoreScrollFilter(QObject):
+    """Event filter that swallows wheel events to prevent accidental value changes."""
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802
+        if event.type() == QEvent.Type.Wheel:
+            event.ignore()
+            return True
+        return super().eventFilter(obj, event)
+
+
+def no_scroll_wheel(widget: QWidget) -> None:
+    """Make *widget* ignore mouse-wheel events (useful for combo boxes and date edits)."""
+    widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+    widget.installEventFilter(_IgnoreScrollFilter(widget))
 
 
 class StatusIndicator(QWidget):
@@ -63,6 +96,7 @@ class LabelledField(QWidget):
         *,
         placeholder: str = "",
         tooltip: str = "",
+        description: str = "",
         password: bool = False,
         parent: QWidget | None = None,
     ) -> None:
@@ -85,6 +119,12 @@ class LabelledField(QWidget):
             self.field.setEchoMode(QLineEdit.EchoMode.Password)
         layout.addWidget(self.field)
 
+        if description:
+            desc_lbl = QLabel(description)
+            desc_lbl.setWordWrap(True)
+            desc_lbl.setProperty("subheading", "true")
+            layout.addWidget(desc_lbl)
+
     @property
     def text(self) -> str:
         """Return the current field text."""
@@ -98,9 +138,7 @@ class LabelledField(QWidget):
 class CopyField(QWidget):
     """Read-only text field with a copy-to-clipboard button."""
 
-    def __init__(
-        self, value: str, *, parent: QWidget | None = None
-    ) -> None:
+    def __init__(self, value: str, *, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -123,6 +161,7 @@ class CopyField(QWidget):
             clipboard.setText(self._field.text())
         self._btn.setText("Copied!")
         from PySide6.QtCore import QTimer
+
         QTimer.singleShot(1500, lambda: self._btn.setText("Copy"))
 
 
@@ -183,7 +222,7 @@ class GuideStep(QWidget):
 
     def add_bullet(self, text: str) -> QLabel:
         """Add a bullet-point line to the step body."""
-        lbl = QLabel(f"  \u2022  {text}")
+        lbl = QLabel(f"  •  {text}")
         lbl.setWordWrap(True)
         self._body_layout.addWidget(lbl)
         return lbl
@@ -204,14 +243,15 @@ class GuideStep(QWidget):
     def _update_arrow(self) -> None:
         text = self._header.text()
         # Strip any existing arrow prefix
-        text = text.lstrip(" \u25B6\u25BC")
-        arrow = "\u25BC" if self._expanded else "\u25B6"
+        text = text.lstrip(" ▶▼")
+        arrow = "▼" if self._expanded else "▶"
         self._header.setText(f"{arrow}  {text.strip()}")
 
 
 # ---------------------------------------------------------------------------
 # FlowLayout — wrapping layout for tag chips
 # ---------------------------------------------------------------------------
+
 
 class FlowLayout(QLayout):
     """A flow layout that arranges child widgets left-to-right, wrapping to the next row."""
@@ -296,6 +336,7 @@ class FlowLayout(QLayout):
 # CollapsibleSection — reusable expand/collapse section
 # ---------------------------------------------------------------------------
 
+
 class CollapsibleSection(QWidget):
     """A section with a clickable header that expands/collapses a body area."""
 
@@ -360,12 +401,14 @@ class CollapsibleSection(QWidget):
 
     def _update_size_policy(self) -> None:
         if self._expanded:
-            self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+            self.setSizePolicy(
+                QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred
+            )
         else:
             self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
 
     def _update_arrow(self) -> None:
-        arrow = "\u25BC" if self._expanded else "\u25B6"
+        arrow = "▼" if self._expanded else "▶"
         self._header.setText(f"{arrow}  {self._title}")
 
 
@@ -394,7 +437,7 @@ class _EpicKeyChip(QWidget):
         label.setStyleSheet("background: transparent; border: none; padding: 0;")
         layout.addWidget(label)
 
-        close_btn = QPushButton("\u00d7")
+        close_btn = QPushButton("×")
         close_btn.setFixedSize(18, 18)
         close_btn.setObjectName("epicKeyChipClose")
         close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -430,14 +473,13 @@ class EpicKeyTagInput(QWidget):
         self._line_edit.installEventFilter(self)
         self._flow.addWidget(self._line_edit)
 
-    def mousePressEvent(self, event: object) -> None:
+    def mousePressEvent(self, event: QMouseEvent) -> None:
         """Focus the line edit when clicking anywhere in the container."""
         self._line_edit.setFocus()
         super().mousePressEvent(event)
 
-    def eventFilter(self, obj: object, event: object) -> bool:
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
         """Handle Tab/comma for tag creation and paste for multi-value input."""
-        from PySide6.QtCore import QEvent
         from PySide6.QtGui import QKeyEvent
 
         if obj is self._line_edit and isinstance(event, QKeyEvent):
@@ -499,8 +541,252 @@ class EpicKeyTagInput(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# ReportItemTable — row-based input for epic keys and labels
+# ---------------------------------------------------------------------------
+
+
+class _ReportItemRow(QWidget):
+    """A single row in the ReportItemTable."""
+
+    removed = Signal(object)  # emits self
+    changed = Signal()  # emits on any field change
+
+    def __init__(
+        self,
+        kind: str = "epic",
+        key: str = "",
+        display_name: str = "",
+        scope_certainty: str = "",
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 2, 0, 2)
+        layout.setSpacing(4)
+
+        self.kind_combo = QComboBox()
+        no_scroll_wheel(self.kind_combo)
+        self.kind_combo.addItem("Epic", "epic")
+        self.kind_combo.addItem("Label", "label")
+        idx = self.kind_combo.findData(kind)
+        if idx >= 0:
+            self.kind_combo.setCurrentIndex(idx)
+        self.kind_combo.setFixedWidth(70)
+        self.kind_combo.currentIndexChanged.connect(self._on_kind_changed)
+        self.kind_combo.currentIndexChanged.connect(lambda: self.changed.emit())
+        layout.addWidget(self.kind_combo)
+
+        self.key_edit = QLineEdit(key)
+        self.key_edit.setPlaceholderText("PROJ-123")
+        self.key_edit.setMinimumWidth(90)
+        self.key_edit.textChanged.connect(lambda _: self.changed.emit())
+        layout.addWidget(self.key_edit, 2)
+
+        self.name_edit = QLineEdit(display_name)
+        self.name_edit.setPlaceholderText("Display name")
+        self.name_edit.setMinimumWidth(90)
+        self.name_edit.textChanged.connect(lambda _: self.changed.emit())
+        layout.addWidget(self.name_edit, 2)
+
+        self.certainty_combo = QComboBox()
+        no_scroll_wheel(self.certainty_combo)
+        self.certainty_combo.addItem("--", "")
+        self.certainty_combo.addItem("Low", "Low")
+        self.certainty_combo.addItem("Med", "Medium")
+        self.certainty_combo.addItem("High", "High")
+        cert_idx = self.certainty_combo.findData(scope_certainty or "")
+        if cert_idx >= 0:
+            self.certainty_combo.setCurrentIndex(cert_idx)
+        self.certainty_combo.setFixedWidth(70)
+        self.certainty_combo.currentIndexChanged.connect(lambda: self.changed.emit())
+        layout.addWidget(self.certainty_combo)
+
+        remove_btn = QPushButton("✕")
+        remove_btn.setFixedSize(22, 22)
+        remove_btn.setToolTip("Remove this row")
+        remove_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        remove_btn.setStyleSheet(
+            "QPushButton { background: transparent; border: none; color: #999;"
+            " font-size: 14px; padding: 0; border-radius: 0; }"
+            "QPushButton:hover { background: transparent; color: #DE350B; }"
+            "QPushButton:pressed { background: transparent; color: #BF2600; }"
+        )
+        remove_btn.clicked.connect(lambda: self.removed.emit(self))
+        layout.addWidget(remove_btn)
+
+        self._label_completions: list[str] = []
+
+        # Apply initial kind-based state
+        self._on_kind_changed()
+
+    def set_label_completions(self, labels: list[str]) -> None:
+        """Set autocomplete suggestions for the key field when kind is label."""
+        self._label_completions = labels
+        if self.kind_combo.currentData() == "label" and self._label_completions:
+            self._apply_completer(self._label_completions)
+
+    def _apply_completer(self, labels: list[str]) -> None:
+        """Attach a QCompleter with the given label list to key_edit."""
+        completer = QCompleter(labels, self)
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self.key_edit.setCompleter(completer)
+
+    def _on_kind_changed(self) -> None:
+        """Toggle display name enabled/placeholder based on kind."""
+        is_label = self.kind_combo.currentData() == "label"
+        self.name_edit.setEnabled(True)
+        if is_label:
+            self.name_edit.setPlaceholderText("Display name (required)")
+            self.key_edit.setPlaceholderText("label-name")
+            if self._label_completions:
+                self._apply_completer(self._label_completions)
+        else:
+            self.name_edit.setPlaceholderText("(auto from Jira)")
+            self.name_edit.setEnabled(False)
+            self.name_edit.clear()
+            self.key_edit.setPlaceholderText("PROJ-123")
+            self.key_edit.setCompleter(None)  # type: ignore[arg-type]
+
+    def to_report_item(self) -> ReportItem | None:
+        """Build a ReportItem from the row, or None if key is empty."""
+        kind = self.kind_combo.currentData() or "epic"
+        key = self.key_edit.text().strip()
+        if not key:
+            return None
+        if kind == "epic":
+            key = key.upper()
+        display_name = self.name_edit.text().strip() if kind == "label" else ""
+        certainty = self.certainty_combo.currentData() or None
+        return ReportItem(
+            kind=kind, key=key, display_name=display_name, scope_certainty=certainty
+        )
+
+    def to_dict(self) -> dict:
+        """Serialize to a dict for config persistence."""
+        kind = self.kind_combo.currentData() or "epic"
+        return {
+            "kind": kind,
+            "key": self.key_edit.text().strip(),
+            "display_name": self.name_edit.text().strip() if kind == "label" else "",
+            "scope_certainty": self.certainty_combo.currentData() or "",
+        }
+
+
+class ReportItemTable(QWidget):
+    """Row-based input widget for report items (epics and labels)."""
+
+    items_changed = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._rows: list[_ReportItemRow] = []
+        self._label_completions: list[str] = []
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(4)
+
+        # Header row
+        header = QHBoxLayout()
+        header.setSpacing(4)
+        for text, width in [
+            ("Type", 70),
+            ("Key / Label", 0),
+            ("Display Name", 0),
+            ("Cert.", 70),
+            ("", 22),
+        ]:
+            lbl = QLabel(f"<b>{text}</b>") if text else QLabel("")
+            if width:
+                lbl.setFixedWidth(width)
+            header.addWidget(lbl, 0 if width else 2)
+        root.addLayout(header)
+
+        self._rows_layout = QVBoxLayout()
+        self._rows_layout.setSpacing(2)
+        root.addLayout(self._rows_layout)
+
+        add_btn = QPushButton("+ Add Row")
+        add_btn.setProperty("secondary", "true")
+        add_btn.clicked.connect(lambda: self.add_row())
+        root.addWidget(add_btn)
+
+    def set_label_completions(self, labels: list[str]) -> None:
+        """Set autocomplete suggestions for label rows."""
+        self._label_completions = labels
+        for row in self._rows:
+            row.set_label_completions(labels)
+
+    def add_row(
+        self,
+        kind: str = "epic",
+        key: str = "",
+        display_name: str = "",
+        scope_certainty: str = "",
+    ) -> _ReportItemRow:
+        """Add a new row to the table."""
+        row = _ReportItemRow(kind, key, display_name, scope_certainty)
+        if self._label_completions:
+            row.set_label_completions(self._label_completions)
+        row.removed.connect(self._remove_row)
+        row.changed.connect(self.items_changed.emit)
+        self._rows.append(row)
+        self._rows_layout.addWidget(row)
+        self.items_changed.emit()
+        return row
+
+    def _remove_row(self, row: _ReportItemRow) -> None:
+        if row in self._rows:
+            self._rows.remove(row)
+            self._rows_layout.removeWidget(row)
+            row.deleteLater()
+            self.items_changed.emit()
+
+    def get_items(self) -> list[ReportItem]:
+        """Return all valid ReportItems from the table."""
+        items = []
+        for row in self._rows:
+            item = row.to_report_item()
+            if item:
+                items.append(item)
+        return items
+
+    def get_items_as_dicts(self) -> list[dict]:
+        """Return all rows serialized as dicts for config persistence."""
+        return [row.to_dict() for row in self._rows if row.key_edit.text().strip()]
+
+    def set_items(self, items: list[dict]) -> None:
+        """Restore rows from a list of dicts."""
+        self.clear()
+        for d in items:
+            self.add_row(
+                kind=d.get("kind", "epic"),
+                key=d.get("key", ""),
+                display_name=d.get("display_name", ""),
+                scope_certainty=d.get("scope_certainty", ""),
+            )
+
+    def set_from_epic_keys(self, keys: list[str]) -> None:
+        """Migration helper: convert old epic key list to rows."""
+        self.clear()
+        for key in keys:
+            self.add_row(kind="epic", key=key)
+
+    def clear(self) -> None:
+        """Remove all rows."""
+        for row in list(self._rows):
+            self._remove_row(row)
+
+    def row_count(self) -> int:
+        """Return the number of rows."""
+        return len(self._rows)
+
+
+# ---------------------------------------------------------------------------
 # SidebarUserInfo — compact user info for sidebar
 # ---------------------------------------------------------------------------
+
 
 class SidebarUserInfo(QWidget):
     """Sidebar block showing avatar, user name, site, auth method, and logout."""
@@ -568,7 +854,8 @@ class SidebarUserInfo(QWidget):
     def _circular_pixmap(source: QPixmap, size: int) -> QPixmap:
         """Return *source* cropped and scaled into a circle of *size* px."""
         scaled = source.scaled(
-            size, size,
+            size,
+            size,
             Qt.AspectRatioMode.KeepAspectRatioByExpanding,
             Qt.TransformationMode.SmoothTransformation,
         )

@@ -154,7 +154,8 @@ def _macos_install() -> None:
     # Launcher script
     launcher = macos_dir / APP_ID
     launcher.write_text(
-        _LAUNCHER_SCRIPT.format(bin_path=bin_path), encoding="utf-8",
+        _LAUNCHER_SCRIPT.format(bin_path=bin_path),
+        encoding="utf-8",
     )
     launcher.chmod(launcher.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
@@ -176,27 +177,26 @@ def _macos_uninstall() -> None:
 # Public API
 # ---------------------------------------------------------------------------
 
+
 def install_desktop() -> None:
     """Install a desktop launcher shortcut for the current platform."""
-    platform = sys.platform
-    if platform == "linux":
+    if sys.platform == "linux":
         _linux_install()
-    elif platform == "darwin":
+    elif sys.platform == "darwin":
         _macos_install()
-    elif platform == "win32":
+    elif sys.platform == "win32":
         logger.info("Windows desktop shortcuts are handled by the installer.")
     else:
-        logger.warning("Unsupported platform for desktop integration: %s", platform)
+        logger.warning("Unsupported platform for desktop integration: %s", sys.platform)
 
 
 def uninstall_desktop() -> None:
     """Remove the desktop launcher shortcut for the current platform."""
-    platform = sys.platform
-    if platform == "linux":
+    if sys.platform == "linux":
         _linux_uninstall()
-    elif platform == "darwin":
+    elif sys.platform == "darwin":
         _macos_uninstall()
-    elif platform == "win32":
+    elif sys.platform == "win32":
         logger.info("Windows desktop shortcuts are handled by the installer.")
     else:
-        logger.warning("Unsupported platform for desktop integration: %s", platform)
+        logger.warning("Unsupported platform for desktop integration: %s", sys.platform)

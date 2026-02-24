@@ -15,20 +15,15 @@ Epic Report Generator is a desktop app that connects to Jira Cloud, pulls Epic p
 
 ### Install from a Release
 
-1. Go to the [Releases](../../releases) page and download the latest `.whl` file
-2. Install it:
-   ```bash
-   pip install epic_report_generator-*.whl
-   ```
-3. Launch:
-   ```bash
-   epic-report-generator
-   ```
+Go to the [Releases](../../releases) page and download the installer for your platform:
 
-> **Linux users** — PySide6 needs a few system libraries:
-> ```bash
-> sudo apt-get install libgl1 libegl1 libxkbcommon0 libxcb-cursor0
-> ```
+| Platform | File | How to install |
+|----------|------|----------------|
+| **Windows** | `epic-report-generator-setup.exe` | Run the installer; creates Start Menu and desktop shortcuts |
+| **macOS** | `epic-report-generator.dmg` | Open the DMG, drag the app to Applications |
+| **Linux** | `epic-report-generator.AppImage` | `chmod +x epic-report-generator.AppImage && ./epic-report-generator.AppImage` |
+
+No Python installation required — the app is fully self-contained.
 
 ### Connect to Jira
 
@@ -47,22 +42,6 @@ On first launch the app walks you through whichever method you choose.
 2. Type your Epic keys (e.g. `PROJ-101`, `PROJ-102`) and press Enter
 3. Click **Generate Report** (or `Ctrl+G`)
 4. Preview the pages, then **Export as PDF** (or `Ctrl+E`)
-
-### Desktop shortcut
-
-After installing, you can add a launcher entry to your OS app menu:
-
-```bash
-epic-report-generator --install-desktop
-```
-
-To remove it later:
-
-```bash
-epic-report-generator --uninstall-desktop
-```
-
-On **Linux** this creates a `.desktop` file in `~/.local/share/applications/` and an icon in `~/.local/share/icons/`. On **macOS** it creates a minimal `.app` bundle in `~/Applications/`. Windows shortcuts are handled by the installer.
 
 ## Keyboard shortcuts
 
@@ -92,13 +71,25 @@ pytest
 python -m build --wheel
 ```
 
+## Estimation methods
+
+The app supports two ways to measure issue effort:
+
+| Method | When to use | How it works |
+|--------|-------------|--------------|
+| **Story Points** (default) | Teams that estimate in SP | Reads the Story Points field from each issue |
+| **Time — Days** | Teams using Jira Timeline with start/due dates | Calculates `(due_date - start_date)` in calendar days |
+
+Switch between them in **Report → Custom Field Mapping → Estimation Method**. When "Time — Days" is selected, you can configure which Jira fields hold the start and due dates (defaults: `startdate` / `duedate`).
+
 ## How the progress formula works
 
 ```
-progress = (completed_sp / total_sp) × (closed_issues / total_issues) × 100
+progress = (completed_estimate / total_estimate) × (closed_issues / total_issues) × 100
 ```
 
-- If no story points exist, falls back to issue-count ratio
+- "estimate" is story points or calendar days, depending on the selected estimation method
+- If no estimates exist, falls back to issue-count ratio
 - If there are no issues, progress is 0 %
 - Result is clamped to 0–100 %
 

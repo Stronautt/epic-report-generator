@@ -112,9 +112,9 @@ class MainWindow(QMainWindow):
         self._settings_panel = SettingsPanel(self._config, self._auth)
         self._log_panel = LogPanel()
 
-        self._inner_stack.addWidget(self._report_panel)    # index 0
+        self._inner_stack.addWidget(self._report_panel)  # index 0
         self._inner_stack.addWidget(self._settings_panel)  # index 1
-        self._inner_stack.addWidget(self._log_panel)       # index 2
+        self._inner_stack.addWidget(self._log_panel)  # index 2
 
         self._outer_stack.addWidget(self._inner_stack)  # index 1
 
@@ -164,14 +164,19 @@ class MainWindow(QMainWindow):
             self._set_sidebar_enabled(True)
             self._outer_stack.setCurrentIndex(1)
             self._settings_panel.refresh_connection_section()
+            self._report_panel.config_panel.refresh_label_completions()
             self._go_to_panel(0)  # Report panel
 
-    def _on_login_succeeded(self, display_name: str, site_name: str, avatar_url: str) -> None:
+    def _on_login_succeeded(
+        self, display_name: str, site_name: str, avatar_url: str
+    ) -> None:
         """Populate sidebar user info after successful login."""
         self._user_display_name = display_name
         self._user_site_name = site_name
         self._sidebar_user_info.set_user(
-            display_name, site_name, auth_method=self._auth.auth_method,
+            display_name,
+            site_name,
+            auth_method=self._auth.auth_method,
         )
 
     def _on_avatar_loaded(self, pixmap: QPixmap) -> None:

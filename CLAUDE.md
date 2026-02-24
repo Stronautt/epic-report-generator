@@ -13,6 +13,25 @@ This file provides guidance to Claude Code when working with this repository.
 - `pytest` — run tests
 - `python -m build --wheel` — build pip wheel
 
+## CI / Packaging
+
+The GitHub Actions workflow (`.github/workflows/build.yml`) runs on `v*` tags and `workflow_dispatch`. It builds a wheel and a platform installer for each OS. Installer artifacts are retained for **3 days**; releases are created manually from the downloaded artifacts.
+
+| Platform | Installer | Tool |
+|---|---|---|
+| Windows | `epic-report-generator-setup.exe` | Inno Setup (`packaging/windows/setup.iss`) |
+| macOS | `epic-report-generator.dmg` | `create-dmg` from the Nuitka `.app` bundle |
+| Linux | `epic-report-generator.AppImage` | `appimagetool` + `packaging/linux/AppDir/` |
+
+Key Nuitka flags used across all platforms:
+- `--lto=yes`, `--python-flag=no_docstrings`, `--python-flag=no_asserts`, `--python-flag=isolated`
+- `--noinclude-qt-translations`, `--include-qt-plugins=sensible`
+- `--nofollow-import-to` exclusions for unused stdlib modules and heavy PySide6 modules (WebEngine, 3D, Quick/QML, Multimedia, etc.)
+
+Linux uses `--onedir` (not `--onefile`) because AppImage provides its own single-file SquashFS layer. macOS uses `--macos-create-app-bundle` instead of `--onefile`. Windows uses `--onefile` and embeds a `.ico` converted from `logo.png` at build time via Pillow.
+
+Only installer artifacts are uploaded — plain binaries are not retained. The workflow has no release job; GitHub Releases are created manually.
+
 ## Tech Stack
 
 - **GUI**: PySide6 (Qt 6)
@@ -71,11 +90,26 @@ Two methods are supported — the login panel shows both as tabs:
 
 Session restore on launch: reads auth_method from config, retrieves tokens from keyring, refreshes if expired.
 
+### Estimation Methods
+
+Two estimation methods are supported — selectable in the Config panel under "Custom Field Mapping":
+
+1. **Story Points** (default): uses the `story_points` (or custom) field on each issue. Labels display "SP".
+
+2. **Time — Days**: uses `(due_date - start_date).days` as the estimate for each issue. Issues missing either date are counted as unestimated. Labels display "Days".
+
+The `estimation_method` field on `ReportConfig` (`"story_points"` or `"time_days"`) threads through `calculate_metrics()`, chart generation, and PDF rendering. `EpicMetrics.estimation_unit` (`"SP"` or `"Days"`) drives all display labels.
+
+### Subtask Fetching
+
+When `include_subtasks` is enabled (default `True`), `_fetch_children()` performs a second paginated JQL query (`parent in (CHILD-1, CHILD-2, ...)`) after fetching direct epic children. Subtasks are merged into the children list with key-based deduplication. Child keys are batched in groups of 100 to respect JQL `IN` clause limits. The option is exposed as a checkbox in the Config panel under "Custom Field Mapping" and stored in `ReportConfig.include_subtasks`.
+
 ### Progress Calculation
 
 ```python
-progress = (completed_sp / total_sp) * (closed_issues / total_issues) * 100
-# Fallback to issue-count ratio when total_sp == 0
+progress = (completed_estimate / total_estimate) * (closed_issues / total_issues) * 100
+# "estimate" = story points or calendar days depending on estimation_method
+# Fallback to issue-count ratio when total_estimate == 0
 # Returns 0 when total_issues == 0; clamped to [0, 100]
 ```
 

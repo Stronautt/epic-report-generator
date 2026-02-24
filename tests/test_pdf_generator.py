@@ -22,19 +22,29 @@ def _make_issue(
 ) -> JiraIssue:
     now = datetime.now(tz=timezone.utc)
     return JiraIssue(
-        key=key, summary=f"Issue {key}",
+        key=key,
+        summary=f"Issue {key}",
         status="Done" if status_category == "Done" else "Open",
-        status_category=status_category, resolution=None,
-        issue_type="Story", story_points=sp,
-        created=now - timedelta(days=10), resolved=now if status_category == "Done" else None,
+        status_category=status_category,
+        resolution=None,
+        issue_type="Story",
+        story_points=sp,
+        created=now - timedelta(days=10),
+        resolved=now if status_category == "Done" else None,
         assignee="Tester",
     )
 
 
-def _make_epic(key: str = "PROJ-1", children: list[JiraIssue] | None = None) -> EpicData:
+def _make_epic(
+    key: str = "PROJ-1", children: list[JiraIssue] | None = None
+) -> EpicData:
     return EpicData(
-        key=key, summary="Test Epic for " + key, status="In Progress",
-        priority="High", assignee="Owner", reporter="Reporter",
+        key=key,
+        summary="Test Epic for " + key,
+        status="In Progress",
+        priority="High",
+        assignee="Owner",
+        reporter="Reporter",
         created=datetime.now(tz=timezone.utc) - timedelta(days=30),
         updated=datetime.now(tz=timezone.utc),
         children=children or [],

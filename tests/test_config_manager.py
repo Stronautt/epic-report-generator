@@ -101,5 +101,5 @@ class TestPersistence:
         mgr = _make_manager(tmp_path)
         mgr.set("last_epic_keys", ["PROJ-1", "PROJ-2"])
 
-        raw = json.loads((tmp_path / "config.json").read_text())
+        raw = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
         assert raw["last_epic_keys"] == ["PROJ-1", "PROJ-2"]

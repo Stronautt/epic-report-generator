@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 
-from epic_report_generator.core.data_models import EpicMetrics
 from epic_report_generator.core.chart_generator import generate_epic_chart
+from epic_report_generator.core.data_models import EpicMetrics
 
 
 def _make_metrics(days: int = 10) -> EpicMetrics:

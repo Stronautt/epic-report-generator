@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -13,7 +13,6 @@ from jira import JIRAError
 from epic_report_generator.core.jira_client import JiraClient
 from epic_report_generator.services.auth_manager import AuthManager
 from epic_report_generator.services.config_manager import ConfigManager
-
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -63,6 +62,8 @@ def _make_raw_issue(
         story_points=sp,
         customfield_10014=None,
         customfield_10016=None,
+        startdate="2024-01-10",
+        duedate="2024-01-20",
     )
     return SimpleNamespace(key=key, fields=fields)
 
@@ -86,7 +87,9 @@ class TestConnected:
 class TestConnectOAuth:
     @patch("epic_report_generator.services.auth_manager.keyring")
     def test_connect_fails_without_token(
-        self, mock_keyring: MagicMock, tmp_path: Path,
+        self,
+        mock_keyring: MagicMock,
+        tmp_path: Path,
     ) -> None:
         mock_keyring.get_password.return_value = None
         auth = _make_auth(tmp_path, cloud_id="cid")
@@ -95,7 +98,9 @@ class TestConnectOAuth:
 
     @patch("epic_report_generator.services.auth_manager.keyring")
     def test_connect_fails_without_cloud_id(
-        self, mock_keyring: MagicMock, tmp_path: Path,
+        self,
+        mock_keyring: MagicMock,
+        tmp_path: Path,
     ) -> None:
         mock_keyring.get_password.return_value = None
         auth = _make_auth(tmp_path)
@@ -133,6 +138,16 @@ class TestStaticHelpers:
 
     def test_parse_dt_invalid(self) -> None:
         assert JiraClient._parse_dt("not-a-date") is None
+
+    def test_parse_date_valid(self) -> None:
+        result = JiraClient._parse_date("2024-01-15")
+        assert result == date(2024, 1, 15)
+
+    def test_parse_date_none(self) -> None:
+        assert JiraClient._parse_date(None) is None
+
+    def test_parse_date_invalid(self) -> None:
+        assert JiraClient._parse_date("not-a-date") is None
 
     def test_status_category_none_fields(self) -> None:
         fields = SimpleNamespace()
@@ -188,14 +203,30 @@ class TestFetchEpic:
         raw_epic = _make_raw_issue("PROJ-1", "My Epic")
         raw_child = _make_raw_issue("PROJ-2", "Child Issue", sp=3.0)
 
-        # First call returns the epic, second returns one child, third returns empty
-        client._jira.search_issues.side_effect = [[raw_epic], [raw_child], []]
+        # Call 1: epic lookup; Call 2: epic-link children; Call 3: parent children;
+        # Call 4: subtasks
+        client._jira.search_issues.side_effect = [[raw_epic], [raw_child], [], []]
 
         epic = client.fetch_epic("PROJ-1")
         assert epic is not None
         assert epic.key == "PROJ-1"
         assert len(epic.children) == 1
         assert epic.children[0].key == "PROJ-2"
+
+    def test_fetch_epic_populates_date_fields(self, tmp_path: Path) -> None:
+        client = JiraClient(_make_auth(tmp_path))
+        client._jira = MagicMock()
+
+        raw_epic = _make_raw_issue("PROJ-1", "My Epic")
+        raw_child = _make_raw_issue("PROJ-2", "Child Issue", sp=3.0)
+
+        client._jira.search_issues.side_effect = [[raw_epic], [raw_child], [], []]
+
+        epic = client.fetch_epic("PROJ-1")
+        assert epic is not None
+        assert len(epic.children) == 1
+        assert epic.children[0].start_date == date(2024, 1, 10)
+        assert epic.children[0].due_date == date(2024, 1, 20)
 
     def test_fetch_epic_returns_none_for_missing_key(self, tmp_path: Path) -> None:
         client = JiraClient(_make_auth(tmp_path))
@@ -282,6 +313,129 @@ class TestFetchFields:
         assert fields[1]["id"] == "customfield_10016"
 
 
+class TestFetchSubtasks:
+    """Test subtask fetching in _fetch_children."""
+
+    def test_subtasks_included_by_default(self, tmp_path: Path) -> None:
+        """When include_subtasks=True, subtasks of children are fetched."""
+        client = JiraClient(_make_auth(tmp_path))
+        client._jira = MagicMock()
+
+        raw_epic = _make_raw_issue("PROJ-1", "My Epic")
+        raw_child = _make_raw_issue("PROJ-2", "Child Story", sp=3.0)
+        raw_subtask = _make_raw_issue("PROJ-3", "Subtask", sp=1.0)
+
+        # Call 1: epic lookup; Call 2: epic-link children;
+        # Call 3: parent children (empty); Call 4: subtasks
+        client._jira.search_issues.side_effect = [
+            [raw_epic],
+            [raw_child],
+            [],
+            [raw_subtask],
+        ]
+
+        epic = client.fetch_epic("PROJ-1")
+        assert epic is not None
+        assert len(epic.children) == 2
+        keys = {c.key for c in epic.children}
+        assert keys == {"PROJ-2", "PROJ-3"}
+
+    def test_subtasks_skipped_when_disabled(self, tmp_path: Path) -> None:
+        """When include_subtasks=False, only direct children are returned."""
+        client = JiraClient(_make_auth(tmp_path))
+        client._jira = MagicMock()
+
+        raw_epic = _make_raw_issue("PROJ-1", "My Epic")
+        raw_child = _make_raw_issue("PROJ-2", "Child Story", sp=3.0)
+
+        # Call 1: epic lookup; Call 2: epic-link children;
+        # Call 3: parent children (empty)
+        client._jira.search_issues.side_effect = [
+            [raw_epic],
+            [raw_child],
+            [],
+        ]
+
+        epic = client.fetch_epic("PROJ-1", include_subtasks=False)
+        assert epic is not None
+        assert len(epic.children) == 1
+        assert epic.children[0].key == "PROJ-2"
+        # Should have 3 calls: epic, epic-link children, parent children (no subtask query)
+        assert client._jira.search_issues.call_count == 3
+
+    def test_subtasks_deduplicated(self, tmp_path: Path) -> None:
+        """Subtasks already in children list are not duplicated."""
+        client = JiraClient(_make_auth(tmp_path))
+        client._jira = MagicMock()
+
+        raw_epic = _make_raw_issue("PROJ-1", "My Epic")
+        raw_child = _make_raw_issue("PROJ-2", "Child Story", sp=3.0)
+        # Subtask query returns the same child (edge case)
+        raw_dup = _make_raw_issue("PROJ-2", "Child Story", sp=3.0)
+
+        client._jira.search_issues.side_effect = [
+            [raw_epic],
+            [raw_child],
+            [],
+            [raw_dup],
+        ]
+
+        epic = client.fetch_epic("PROJ-1")
+        assert epic is not None
+        assert len(epic.children) == 1
+
+
+class TestParentHierarchyChildren:
+    """Test that children linked via parent field (Tasks, Defects) are fetched."""
+
+    def test_parent_linked_children_included(self, tmp_path: Path) -> None:
+        """Issues linked via parent = epic (e.g. Tasks) are fetched."""
+        client = JiraClient(_make_auth(tmp_path))
+        client._jira = MagicMock()
+
+        raw_epic = _make_raw_issue("PROJ-1", "My Epic")
+        raw_story = _make_raw_issue("PROJ-2", "A Story", sp=3.0)
+        raw_task = _make_raw_issue("PROJ-3", "A Task", sp=2.0)
+
+        # Call 1: epic lookup; Call 2: epic-link children (Story);
+        # Call 3: parent children (Task); Call 4: subtasks (empty)
+        client._jira.search_issues.side_effect = [
+            [raw_epic],
+            [raw_story],
+            [raw_task],
+            [],
+        ]
+
+        epic = client.fetch_epic("PROJ-1")
+        assert epic is not None
+        assert len(epic.children) == 2
+        keys = {c.key for c in epic.children}
+        assert keys == {"PROJ-2", "PROJ-3"}
+
+    def test_parent_linked_children_deduplicated(self, tmp_path: Path) -> None:
+        """Issues returned by both epic-link and parent queries are not duplicated."""
+        client = JiraClient(_make_auth(tmp_path))
+        client._jira = MagicMock()
+
+        raw_epic = _make_raw_issue("PROJ-1", "My Epic")
+        raw_child = _make_raw_issue("PROJ-2", "Linked Both Ways", sp=3.0)
+        raw_child_dup = _make_raw_issue("PROJ-2", "Linked Both Ways", sp=3.0)
+
+        # Call 1: epic lookup; Call 2: epic-link children;
+        # Call 3: parent children (same issue); Call 4: subtasks (empty)
+        client._jira.search_issues.side_effect = [
+            [raw_epic],
+            [raw_child],
+            [raw_child_dup],
+            [],
+        ]
+
+        epic = client.fetch_epic("PROJ-1")
+        assert epic is not None
+        assert len(epic.children) == 1
+        assert epic.children[0].key == "PROJ-2"
+
+
 class TestGetProjectName:
     def test_returns_none_when_disconnected(self, tmp_path: Path) -> None:
         client = JiraClient(_make_auth(tmp_path))
@@ -292,3 +446,134 @@ class TestGetProjectName:
         client._jira = MagicMock()
         client._jira.project.return_value = SimpleNamespace(name="My Project")
         assert client.get_project_name("PROJ") == "My Project"
+
+
+# ---------------------------------------------------------------------------
+# fetch_epics_by_label
+# ---------------------------------------------------------------------------
+
+
+class TestFetchEpicsByLabel:
+    def test_returns_empty_when_disconnected(self, tmp_path: Path) -> None:
+        client = JiraClient(_make_auth(tmp_path))
+        assert client.fetch_epics_by_label("backend") == []
+
+    def test_fetches_epics_by_label(self, tmp_path: Path) -> None:
+        client = JiraClient(_make_auth(tmp_path))
+        client._jira = MagicMock()
+
+        raw_epic = _make_raw_issue("PROJ-10", "Labelled Epic")
+        raw_child = _make_raw_issue("PROJ-11", "Child", sp=3.0)
+
+        # Call 1: label search returns one epic
+        # Call 2: epic-link children of PROJ-10
+        # Call 3: parent children (empty)
+        # Call 4: subtasks (empty)
+        client._jira.search_issues.side_effect = [
+            [raw_epic],
+            [raw_child],
+            [],
+            [],
+        ]
+
+        epics = client.fetch_epics_by_label("backend")
+        assert len(epics) == 1
+        assert epics[0].key == "PROJ-10"
+        assert len(epics[0].children) == 1
+
+    def test_returns_empty_for_no_matches(self, tmp_path: Path) -> None:
+        client = JiraClient(_make_auth(tmp_path))
+        client._jira = MagicMock()
+        client._jira.search_issues.return_value = []
+
+        epics = client.fetch_epics_by_label("nonexistent")
+        assert epics == []
+
+
+# ---------------------------------------------------------------------------
+# fetch_fix_version_dates
+# ---------------------------------------------------------------------------
+
+
+class TestFetchFixVersionDates:
+    def test_returns_empty_when_disconnected(self, tmp_path: Path) -> None:
+        client = JiraClient(_make_auth(tmp_path))
+        assert client.fetch_fix_version_dates("PROJ") == {}
+
+    def test_returns_version_dates(self, tmp_path: Path) -> None:
+        client = JiraClient(_make_auth(tmp_path))
+        client._jira = MagicMock()
+
+        client._jira.project_versions.return_value = [
+            SimpleNamespace(name="v1.0", releaseDate="2024-03-15"),
+            SimpleNamespace(name="v2.0", releaseDate=None),
+        ]
+
+        result = client.fetch_fix_version_dates("PROJ")
+        assert len(result) == 2
+        assert result["v1.0"] == date(2024, 3, 15)
+        assert result["v2.0"] is None
+
+    def test_handles_jira_error(self, tmp_path: Path) -> None:
+        client = JiraClient(_make_auth(tmp_path))
+        client._jira = MagicMock()
+        client._jira.project_versions.side_effect = JIRAError(
+            status_code=404, text="Not found"
+        )
+
+        result = client.fetch_fix_version_dates("PROJ")
+        assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# fetch_epic — epic-level dates
+# ---------------------------------------------------------------------------
+
+
+class TestFetchEpicDates:
+    def test_epic_gets_own_dates(self, tmp_path: Path) -> None:
+        """Epic's own start/due dates are populated."""
+        client = JiraClient(_make_auth(tmp_path))
+        client._jira = MagicMock()
+
+        raw_epic = _make_raw_issue("PROJ-1", "Dated Epic")
+        # Set dates on the epic itself
+        raw_epic.fields.startdate = "2024-01-01"
+        raw_epic.fields.duedate = "2024-06-30"
+
+        # Call 1: epic lookup; Call 2: epic-link children; Call 3: parent children
+        client._jira.search_issues.side_effect = [[raw_epic], [], []]
+
+        epic = client.fetch_epic("PROJ-1", include_subtasks=False)
+        assert epic is not None
+        assert epic.start_date == date(2024, 1, 1)
+        assert epic.due_date == date(2024, 6, 30)
+
+    def test_epic_derives_dates_from_children(self, tmp_path: Path) -> None:
+        """When epic has no dates, they are derived from children."""
+        client = JiraClient(_make_auth(tmp_path))
+        client._jira = MagicMock()
+
+        raw_epic = _make_raw_issue("PROJ-1", "No-dates Epic")
+        raw_epic.fields.startdate = None
+        raw_epic.fields.duedate = None
+
+        raw_child1 = _make_raw_issue("PROJ-2", "Child 1")
+        raw_child1.fields.startdate = "2024-02-01"
+        raw_child1.fields.duedate = "2024-03-15"
+
+        raw_child2 = _make_raw_issue("PROJ-3", "Child 2")
+        raw_child2.fields.startdate = "2024-01-15"
+        raw_child2.fields.duedate = "2024-04-30"
+
+        client._jira.search_issues.side_effect = [
+            [raw_epic],
+            [raw_child1, raw_child2],
+            [],  # parent children
+            [],  # subtasks
+        ]
+
+        epic = client.fetch_epic("PROJ-1")
+        assert epic is not None
+        assert epic.start_date == date(2024, 1, 15)  # min of children
+        assert epic.due_date == date(2024, 4, 30)  # max of children

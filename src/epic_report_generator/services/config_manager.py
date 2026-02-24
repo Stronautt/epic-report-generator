@@ -15,9 +15,9 @@ APP_NAME = "epic-report-generator"
 CONFIG_FILENAME = "config.json"
 
 _DEFAULTS: dict[str, Any] = {
-    "auth_method": "",        # "api_token" or "oauth" — empty = not logged in yet
-    "jira_url": "",           # e.g. "https://company.atlassian.net"
-    "jira_email": "",         # user's Jira email for basic auth
+    "auth_method": "",  # "api_token" or "oauth" — empty = not logged in yet
+    "jira_url": "",  # e.g. "https://company.atlassian.net"
+    "jira_email": "",  # user's Jira email for basic auth
     "client_id": "",
     "client_secret": "",
     "callback_port": 18492,
@@ -28,8 +28,21 @@ _DEFAULTS: dict[str, Any] = {
     "default_author": "",
     "default_company": "",
     "last_epic_keys": [],
+    "last_report_items": [],
+    "estimation_method": "story_points",
+    "progress_method": "combined",
     "story_points_field": "story_points",
     "epic_link_field": "customfield_10014",
+    "start_date_field": "startdate",
+    "due_date_field": "duedate",
+    "include_subtasks": True,
+    "timeline_start_field": "",
+    "timeline_end_field": "",
+    "timeline_hard_start": "",
+    "timeline_hard_end": "",
+    "show_children_on_timeline": False,
+    "expand_label_details": True,
+    "show_additional_metrics": True,
 }
 
 

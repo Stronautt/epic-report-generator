@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 import keyring
+import keyring.errors
 import requests
 
 from epic_report_generator.services.config_manager import ConfigManager
@@ -89,12 +90,14 @@ class AuthManager:
         site_name = url.rstrip("/").removeprefix("https://").removeprefix("http://")
         site_name = site_name.removesuffix(".atlassian.net")
 
-        self._config.update({
-            "auth_method": "api_token",
-            "jira_url": url.rstrip("/"),
-            "jira_email": email,
-            "site_name": site_name,
-        })
+        self._config.update(
+            {
+                "auth_method": "api_token",
+                "jira_url": url.rstrip("/"),
+                "jira_email": email,
+                "site_name": site_name,
+            }
+        )
         logger.info("API-token credentials stored (site=%s)", site_name)
 
     def get_api_token(self) -> str | None:
@@ -106,7 +109,10 @@ class AuthManager:
     def get_access_token(self) -> str | None:
         """Return a valid access token, refreshing if necessary."""
         if self._access_token and time.time() < self._token_expiry:
-            logger.debug("Using cached access token (expires in %.0fs)", self._token_expiry - time.time())
+            logger.debug(
+                "Using cached access token (expires in %.0fs)",
+                self._token_expiry - time.time(),
+            )
             return self._access_token
 
         # Try to restore from keyring
@@ -119,7 +125,10 @@ class AuthManager:
         expiry = stored.get("expiry", 0.0)
 
         if access and time.time() < expiry:
-            logger.info("Restored access token from keyring (expires in %.0fs)", expiry - time.time())
+            logger.info(
+                "Restored access token from keyring (expires in %.0fs)",
+                expiry - time.time(),
+            )
             self._access_token = access
             self._token_expiry = expiry
             return access
@@ -209,13 +218,15 @@ class AuthManager:
                 pass
         self._access_token = None
         self._token_expiry = 0.0
-        self._config.update({
-            "auth_method": "",
-            "jira_url": "",
-            "jira_email": "",
-            "cloud_id": "",
-            "site_name": "",
-        })
+        self._config.update(
+            {
+                "auth_method": "",
+                "jira_url": "",
+                "jira_email": "",
+                "cloud_id": "",
+                "site_name": "",
+            }
+        )
 
     # -- internals ------------------------------------------------------------
 
@@ -238,7 +249,10 @@ class AuthManager:
             data["expiry"] = time.time() + data.get("expires_in", 3600)
             self._access_token = data["access_token"]
             self._token_expiry = data["expiry"]
-            logger.info("Token exchange successful (expires_in=%ds)", data.get("expires_in", 3600))
+            logger.info(
+                "Token exchange successful (expires_in=%ds)",
+                data.get("expires_in", 3600),
+            )
             return data
         except requests.RequestException as exc:
             logger.error("Token exchange failed: %s", exc)
@@ -265,7 +279,10 @@ class AuthManager:
             self._store_tokens(data)
             self._access_token = data["access_token"]
             self._token_expiry = data["expiry"]
-            logger.info("Token refreshed successfully (expires_in=%ds)", data.get("expires_in", 3600))
+            logger.info(
+                "Token refreshed successfully (expires_in=%ds)",
+                data.get("expires_in", 3600),
+            )
             return data["access_token"]
         except requests.RequestException as exc:
             logger.error("Token refresh failed: %s", exc)
@@ -285,7 +302,11 @@ class AuthManager:
             resp.raise_for_status()
             sites = resp.json()
             return [
-                {"cloud_id": s["id"], "name": s.get("name", s["id"]), "url": s.get("url", "")}
+                {
+                    "cloud_id": s["id"],
+                    "name": s.get("name", s["id"]),
+                    "url": s.get("url", ""),
+                }
                 for s in sites
             ]
         except requests.RequestException as exc:
@@ -293,7 +314,11 @@ class AuthManager:
             return None
 
     def _select_site(self, site: dict[str, str]) -> None:
-        logger.info("Selected Jira site: %s (cloud_id=%s)", site.get("name", ""), site["cloud_id"])
+        logger.info(
+            "Selected Jira site: %s (cloud_id=%s)",
+            site.get("name", ""),
+            site["cloud_id"],
+        )
         self._config.update(
             {"cloud_id": site["cloud_id"], "site_name": site.get("name", "")}
         )
