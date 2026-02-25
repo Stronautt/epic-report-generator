@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
-from epic_report_generator.services.config_manager import ConfigManager
+from epic_report_generator.services.config_manager import (
+    _LEGACY_TIMESTAMP,
+    ConfigManager,
+    DEFAULT_PROFILE_NAME,
+)
 
 
 def _make_manager(tmp_path: Path) -> ConfigManager:
@@ -104,3 +109,60 @@ class TestPersistence:
 
         raw = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
         assert raw["last_epic_keys"] == ["PROJ-1", "PROJ-2"]
+
+
+class TestProfileTimestamps:
+    """Profile _created_at timestamps and sort order."""
+
+    def test_create_profile_stamps_created_at(self, tmp_path: Path) -> None:
+        mgr = _make_manager(tmp_path)
+        mgr.create_profile("Alpha")
+        profiles = mgr._data["profiles"]
+        assert "_created_at" in profiles["Alpha"]
+
+    def test_clone_gets_own_timestamp(self, tmp_path: Path) -> None:
+        mgr = _make_manager(tmp_path)
+        mgr.create_profile("Source")
+        source_ts = mgr._data["profiles"]["Source"]["_created_at"]
+        time.sleep(0.01)
+        mgr.create_profile("Clone", clone_from="Source")
+        clone_ts = mgr._data["profiles"]["Clone"]["_created_at"]
+        assert clone_ts >= source_ts  # clone is same or newer
+
+    def test_rename_preserves_timestamp(self, tmp_path: Path) -> None:
+        mgr = _make_manager(tmp_path)
+        mgr.create_profile("OldName")
+        ts = mgr._data["profiles"]["OldName"]["_created_at"]
+        mgr.rename_profile("OldName", "NewName")
+        assert mgr._data["profiles"]["NewName"]["_created_at"] == ts
+
+    def test_profile_names_default_first_then_newest(self, tmp_path: Path) -> None:
+        mgr = _make_manager(tmp_path)
+        # Trigger Default profile creation
+        mgr.get("estimation_method")
+        # Create profiles with increasing timestamps
+        mgr.create_profile("First")
+        time.sleep(0.01)
+        mgr.create_profile("Second")
+        time.sleep(0.01)
+        mgr.create_profile("Third")
+        names = mgr.profile_names
+        assert names[0] == DEFAULT_PROFILE_NAME
+        # Remaining should be newest first
+        assert names[1] == "Third"
+        assert names[2] == "Second"
+        assert names[3] == "First"
+
+    def test_migration_adds_legacy_timestamp(self, tmp_path: Path) -> None:
+        mgr = _make_manager(tmp_path)
+        # Manually add a profile without _created_at
+        mgr._data.setdefault("profiles", {})["Legacy"] = {"estimation_method": "story_points"}
+        mgr._migrate_profile_timestamps()
+        assert mgr._data["profiles"]["Legacy"]["_created_at"] == _LEGACY_TIMESTAMP
+
+    def test_reset_preserves_timestamp(self, tmp_path: Path) -> None:
+        mgr = _make_manager(tmp_path)
+        mgr.create_profile("Resettable")
+        ts = mgr._data["profiles"]["Resettable"]["_created_at"]
+        mgr.reset()
+        assert mgr._data["profiles"]["Resettable"]["_created_at"] == ts

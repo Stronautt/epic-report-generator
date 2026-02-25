@@ -531,19 +531,30 @@ def generate_timeline_chart(
             sprint_annotations.append(ann)
             all_dates.extend([draw_left, draw_right])
 
-    # -- Milestones (dashed line + pill label at y=1.07) -----------------------
+    # -- Milestones (dashed line + pill label at y=1.14) -----------------------
     for ms in milestones:
         ms_x = _d2n(ms.release_date)
-        ax.axvline(
-            ms_x,
-            color=pal["milestone_pill_edge"],
-            linestyle="--",
-            linewidth=1.0,
-            zorder=2,
+        # Draw dashed line from axis bottom up to the pill label.  Uses an
+        # annotation arrow so it extends above the axes area (axvline clips
+        # at y=1.0).  zorder=1 keeps it behind sprint pills and boundary lines.
+        ax.annotate(
+            "",
+            xy=(ms_x, 1.14),
+            xytext=(ms_x, 0),
+            xycoords=("data", "axes fraction"),
+            textcoords=("data", "axes fraction"),
+            arrowprops=dict(
+                arrowstyle="-",
+                color=pal["milestone_pill_edge"],
+                lw=1.0,
+                linestyle="--",
+            ),
+            annotation_clip=False,
+            zorder=1,
         )
         ax.annotate(
             f"  {ms.name}",
-            xy=(ms_x, 1.07),
+            xy=(ms_x, 1.14),
             xycoords=("data", "axes fraction"),
             fontsize=6,
             fontweight="bold",
@@ -628,7 +639,7 @@ def generate_timeline_chart(
     # milestone pills, major date labels).  Save with fixed figure dimensions
     # instead of bbox_inches="tight" which produces unpredictable sizes when
     # annotations or data limits extend beyond the axes view.
-    fig.tight_layout(rect=(0, 0, 1, 0.85))
+    fig.tight_layout(rect=(0, 0, 1, 0.82))
 
     buf = io.BytesIO()
     fig.savefig(
@@ -688,10 +699,10 @@ def _draw_major_date_labels(
 ) -> None:
     """Draw the topmost tier of bold date labels (months/quarters/years).
 
-    Positioned at axes-fraction y=1.21 so they sit clearly above the milestone
-    pills at y=1.07 and sprint pills at y=1.0.
+    Positioned at axes-fraction y=1.28 so they sit clearly above the milestone
+    pills at y=1.14 and sprint pills at y=1.0.
     """
-    y_top = 1.21
+    y_top = 1.28
     color = pal["major_date_color"]
 
     def _emit(

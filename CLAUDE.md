@@ -151,7 +151,9 @@ For **label-group merges** (`merge_metrics`), progress is the weighted average o
 
 ### PDF Layout
 
-Landscape 16:9 pages (406mm x 228.4mm). Page 1: title page. Page 2: summary table with progress bars (label-group header rows show aggregated statistics) and optional scope-certainty legend. Page 3: Gantt-style timeline chart with optional scope-certainty legend. Pages 4+: per-epic detail with trend chart + metrics sidebar.
+Landscape 16:9 pages (406mm x 228.4mm). Page 1: title page. Page 2: summary table with progress bars (label-group header rows show aggregated statistics) and optional scope-certainty legend. Page 3 (optional): Gantt-style timeline chart with optional scope-certainty legend — included by default but can be excluded via `ReportConfig.show_timeline_chart`. Remaining pages: per-epic detail with trend chart + metrics sidebar.
+
+Progress bars in the summary table use a 10-character bar where each character represents 10%. Filled squares (`■`) are coloured by threshold (green >= 75%, yellow >= 25%, red < 25%) and empty squares (`□`) render in a muted/grey colour. The label uses a space before the percent sign. Example: `■■■■■■□□□□ 60 %`.
 
 When `confidential` is enabled and `company_name` is set, a repeating footer appears on all pages except the title page: "CONFIDENTIAL — {company_name}" on the left, report date and author on the right.
 

@@ -59,6 +59,13 @@ QLabel[heading="true"] {
 QLabel[subheading="true"] {
     font-size: 11px;
 }
+QLabel[sectionTitle="true"] {
+    font-size: 13px;
+    font-weight: 600;
+}
+QLabel[hint="true"] {
+    font-size: 10px;
+}
 
 /* ── Status indicator ───────────────────────────────────────────── */
 QLabel[status="connected"] {
@@ -209,6 +216,12 @@ QLabel[heading="true"] {
 QLabel[subheading="true"] {
     color: #757575;
 }
+QLabel[sectionTitle="true"] {
+    color: #424242;
+}
+QLabel[hint="true"] {
+    color: #9e9e9e;
+}
 
 /* ── Status indicator ───────────────────────────────────────────── */
 QLabel[status="connected"] {
@@ -355,6 +368,12 @@ QPushButton[secondary="true"]:disabled {
 /* ── Labels — heading / subheading ──────────────────────────────── */
 QLabel[subheading="true"] {
     color: #9e9e9e;
+}
+QLabel[sectionTitle="true"] {
+    color: #e0e0e0;
+}
+QLabel[hint="true"] {
+    color: #757575;
 }
 
 /* ── Status indicator ───────────────────────────────────────────── */

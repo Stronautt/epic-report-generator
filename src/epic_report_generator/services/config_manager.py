@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,14 @@ PROFILE_KEYS: frozenset[str] = frozenset(
         "confidential",
     }
 )
+
+_LEGACY_TIMESTAMP = "2000-01-01T00:00:00+00:00"
+
+
+def _now_iso() -> str:
+    """Return the current UTC time as an ISO 8601 string."""
+    return datetime.now(timezone.utc).isoformat()
+
 
 _DEFAULTS: dict[str, Any] = {
     # Global keys
@@ -136,7 +145,10 @@ class ConfigManager:
         logger.info("Resetting active profile to defaults")
         name = self._data.get("active_profile", DEFAULT_PROFILE_NAME)
         profiles = self._data.setdefault("profiles", {})
+        old_created = profiles.get(name, {}).get("_created_at")
         profiles[name] = dict(self._default_profile_values())
+        if old_created:
+            profiles[name]["_created_at"] = old_created
         self._save()
 
     @property
@@ -161,7 +173,11 @@ class ConfigManager:
     def profile_names(self) -> list[str]:
         """Return profile names in sorted order, with Default always first."""
         profiles: dict = self._data.get("profiles", {})
-        names = sorted(profiles.keys())
+        names = sorted(
+            profiles.keys(),
+            key=lambda n: profiles[n].get("_created_at", ""),
+            reverse=True,
+        )
         if DEFAULT_PROFILE_NAME in names:
             names.remove(DEFAULT_PROFILE_NAME)
             names.insert(0, DEFAULT_PROFILE_NAME)
@@ -176,6 +192,7 @@ class ConfigManager:
         profiles = self._data.setdefault("profiles", {})
         if name not in profiles:
             profiles[name] = dict(self._default_profile_values())
+            profiles[name]["_created_at"] = _now_iso()
         self._data["active_profile"] = name
         self._save()
         logger.info("Switched to profile %r", name)
@@ -187,6 +204,7 @@ class ConfigManager:
             profiles[name] = copy.deepcopy(profiles[clone_from])
         else:
             profiles[name] = dict(self._default_profile_values())
+        profiles[name]["_created_at"] = _now_iso()
         self._data["active_profile"] = name
         self._save()
         logger.info("Created profile %r (cloned from %r)", name, clone_from)
@@ -227,6 +245,7 @@ class ConfigManager:
         name = self._data.get("active_profile", DEFAULT_PROFILE_NAME)
         if name not in profiles:
             profiles[name] = dict(self._default_profile_values())
+            profiles[name]["_created_at"] = _now_iso()
         return profiles[name]
 
     def _migrate_to_profiles(self) -> None:
@@ -243,6 +262,17 @@ class ConfigManager:
             self._save()
             logger.info("Migrated existing config into Default profile")
 
+    def _migrate_profile_timestamps(self) -> None:
+        """Ensure every profile has a ``_created_at`` timestamp."""
+        profiles: dict = self._data.get("profiles", {})
+        changed = False
+        for prof in profiles.values():
+            if "_created_at" not in prof:
+                prof["_created_at"] = _LEGACY_TIMESTAMP
+                changed = True
+        if changed:
+            self._save()
+
     def _load(self) -> None:
         if not self._path.exists():
             return
@@ -254,6 +284,7 @@ class ConfigManager:
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("Failed to load config from %s: %s", self._path, exc)
         self._migrate_to_profiles()
+        self._migrate_profile_timestamps()
 
     def _save(self) -> None:
         try:

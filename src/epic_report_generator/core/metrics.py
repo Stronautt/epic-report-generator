@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 PROGRESS_COMBINED = "combined"
 PROGRESS_ISSUES_ONLY = "issues_only"
+PROGRESS_ESTIMATES_ONLY = "estimates_only"
 
 STATUS_DONE = "Done"
 
@@ -53,6 +54,9 @@ def calculate_metrics(
     * ``"combined"`` — bottom-up weighted average × (done_issues/total_issues).
     * ``"issues_only"`` — bottom-up weighted average with weight = 1.0 for all
       items (purely counts open vs done).
+    * ``"estimates_only"`` — bottom-up weighted average using estimates as
+      weights (like combined) but without the issue-count ratio multiplier.
+      Unestimated items are excluded (weight = 0.0).
 
     Progress is computed **bottom-up**: leaf issues get 100% if Done else 0%.
     Parents aggregate their subtasks' progress via weighted average.  The epic
@@ -84,8 +88,9 @@ def calculate_metrics(
             subtask_keys.add(c.key)
 
     # Compute bottom-up progress for every issue and set .progress / .effective_weight
+    omit_unestimated = progress_method == PROGRESS_ESTIMATES_ONLY
     _compute_all_issue_progress(
-        children, direct_estimates, parent_to_subs, use_estimates
+        children, direct_estimates, parent_to_subs, use_estimates, omit_unestimated
     )
 
     # Direct children of the epic (not subtasks of other children)
@@ -345,6 +350,7 @@ def _compute_all_issue_progress(
     direct_estimates: dict[str, float | None],
     parent_to_subs: dict[str, list[JiraIssue]],
     use_estimates: bool,
+    omit_unestimated: bool = False,
 ) -> None:
     """Compute bottom-up progress for every issue.
 
@@ -355,6 +361,8 @@ def _compute_all_issue_progress(
         direct_estimates: Pre-computed estimate per issue key.
         parent_to_subs: Mapping of parent key → list of subtask issues.
         use_estimates: If True, weight = estimate (SP/days); if False, weight = 1.0.
+        omit_unestimated: If True, unestimated items get weight = 0.0
+            instead of the default fallback.  Used by ``estimates_only``.
 
     Side effects:
         Sets ``issue.progress`` and ``issue.effective_weight`` on every issue
@@ -379,11 +387,15 @@ def _compute_all_issue_progress(
             progress = (
                 PROGRESS_DONE if issue.status_category == STATUS_DONE else PROGRESS_MIN
             )
-            weight = (
-                (est if est is not None else DEFAULT_WEIGHT)
-                if use_estimates
-                else DEFAULT_WEIGHT
-            )
+            if use_estimates:
+                if est is not None:
+                    weight = est
+                elif omit_unestimated:
+                    weight = 0.0
+                else:
+                    weight = DEFAULT_WEIGHT
+            else:
+                weight = DEFAULT_WEIGHT
             issue.progress = progress
             issue.effective_weight = weight
             computed.add(issue.key)
@@ -400,7 +412,12 @@ def _compute_all_issue_progress(
         progress = weighted_sum / weight_total if weight_total > 0 else PROGRESS_MIN
         # Parent weight: own estimate if available, else sum of subtask weights
         if use_estimates:
-            weight = est if est is not None else weight_total
+            if est is not None:
+                weight = est
+            elif omit_unestimated:
+                weight = weight_total if weight_total > 0 else 0.0
+            else:
+                weight = weight_total
         else:
             weight = DEFAULT_WEIGHT
         issue.progress = progress

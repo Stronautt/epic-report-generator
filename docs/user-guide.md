@@ -299,8 +299,9 @@ Progress is computed **bottom-up** through the issue hierarchy. Leaf issues get 
 |--------|---------|
 | **Combined (Estimates x Issues)** | Bottom-up weighted average × (done issues / total issues). Weights = estimates (SP or days). |
 | **Issues Only** | Bottom-up weighted average with weight = 1.0 for every item (counts open vs done equally). |
+| **Estimates Only** | Bottom-up weighted average using estimates as weights, without the issue-count ratio multiplier. Unestimated items are excluded entirely. |
 
-Falls back to weight = 1.0 for unestimated items in Combined mode.
+Falls back to weight = 1.0 for unestimated items in Combined and Issues Only modes. Estimates Only mode excludes unestimated items from the calculation.
 
 #### Custom Fields
 
@@ -331,6 +332,7 @@ Configure the Gantt-style timeline that appears in the report. Timeline dates ar
 
 | Option | Default | Description |
 |--------|---------|-------------|
+| **Include timeline chart** | On | Include the Gantt-style timeline page in the generated PDF. Uncheck to exclude it entirely. |
 | **Show child issues on timeline** | Off | Display each child issue as a bar alongside epics |
 | **Start Date Field** | `startdate` | Jira field for epic timeline start |
 | **End Date Field** | `duedate` | Jira field for epic timeline end |

@@ -135,7 +135,7 @@ class LabelledField(QWidget):
         if description:
             desc_lbl = QLabel(description)
             desc_lbl.setWordWrap(True)
-            desc_lbl.setProperty("subheading", "true")
+            desc_lbl.setProperty("hint", "true")
             layout.addWidget(desc_lbl)
 
     @property
@@ -950,19 +950,32 @@ class ProfileBar(QWidget):
         self.setObjectName("profileBar")
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 8)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
 
         lbl = QLabel("Profile:")
         layout.addWidget(lbl)
 
         self._combo = QComboBox()
+        self._combo.setEditable(True)
+        self._combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         no_scroll_wheel(self._combo)
         self._combo.setMinimumWidth(140)
-        self._combo.currentTextChanged.connect(self._on_combo_changed)
+
+        completer = QCompleter(self)
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        self._combo.setCompleter(completer)
+        completer.setModel(self._combo.model())
+
+        self._combo.activated.connect(self._on_combo_activated)
+        self._combo.lineEdit().editingFinished.connect(  # type: ignore[union-attr]
+            self._on_editing_finished
+        )
         layout.addWidget(self._combo, 1)
 
-        self._save_as_btn = QPushButton("Save As...")
+        self._save_as_btn = QPushButton("Clone as...")
         self._save_as_btn.setProperty("secondary", "true")
         self._save_as_btn.setToolTip("Clone current settings into a new named profile")
         self._save_as_btn.clicked.connect(self._save_as)
@@ -1001,18 +1014,29 @@ class ProfileBar(QWidget):
         self._rename_btn.setEnabled(not is_default)
         self._delete_btn.setEnabled(not is_default)
 
-    def _on_combo_changed(self, name: str) -> None:
+    def _on_combo_activated(self, index: int) -> None:
+        name = self._combo.itemText(index)
         if not name:
             return
         self._config.switch_profile(name)
         self._update_button_state()
         self.profile_changed.emit(name)
 
+    def _on_editing_finished(self) -> None:
+        """Revert to the active profile if the user typed an invalid name."""
+        text = self._combo.currentText()
+        if text not in self._config.profile_names:
+            idx = self._combo.findText(self._config.active_profile_name)
+            if idx >= 0:
+                self._combo.setCurrentIndex(idx)
+
     def _save_as(self) -> None:
+        current = self._config.active_profile_name
         name, ok = QInputDialog.getText(
             self,
-            "Save Profile As",
-            "Profile name:",
+            "Clone Profile",
+            f"Enter a name for the new profile.\n"
+            f'The current profile "{current}" will be used as a basis.',
         )
         name = name.strip()
         if not ok or not name:

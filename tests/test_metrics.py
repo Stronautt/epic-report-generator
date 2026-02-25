@@ -9,6 +9,7 @@ import pytest
 from epic_report_generator.core.data_models import EpicData, JiraIssue
 from epic_report_generator.core.metrics import (
     PROGRESS_COMBINED,
+    PROGRESS_ESTIMATES_ONLY,
     PROGRESS_ISSUES_ONLY,
     calculate_metrics,
     merge_metrics,
@@ -513,3 +514,94 @@ class TestMergeMetrics:
         # Epic B weight = 5
         # Label progress = (25*20 + 100*5) / (20+5) = (500+500)/25 = 40.0
         assert m.progress == pytest.approx(40.0)
+
+
+class TestEstimatesOnlyProgress:
+    """Test the estimates_only progress method."""
+
+    def test_all_estimated_mix(self) -> None:
+        """Weighted average without issue ratio multiplier."""
+        now = datetime.now(tz=timezone.utc)
+        children = [
+            _make_issue("T-1", "Done", 5, resolved=now),
+            _make_issue("T-2", "To Do", 5),
+        ]
+        m = calculate_metrics(
+            _make_epic(children), progress_method=PROGRESS_ESTIMATES_ONLY
+        )
+        # weighted_avg = (100*5 + 0*5) / 10 = 50%
+        # No issue-ratio multiplier → 50.0
+        assert m.progress == pytest.approx(50.0)
+
+    def test_unestimated_items_excluded(self) -> None:
+        """Unestimated items get weight=0 and are excluded from the average."""
+        now = datetime.now(tz=timezone.utc)
+        children = [
+            _make_issue("T-1", "Done", 10, resolved=now),
+            _make_issue("T-2", "To Do", None),  # unestimated → excluded
+        ]
+        m = calculate_metrics(
+            _make_epic(children), progress_method=PROGRESS_ESTIMATES_ONLY
+        )
+        # Only T-1 contributes: (100*10) / 10 = 100%
+        assert m.progress == pytest.approx(100.0)
+
+    def test_all_unestimated_zero_progress(self) -> None:
+        """All unestimated → progress = 0%."""
+        now = datetime.now(tz=timezone.utc)
+        children = [
+            _make_issue("T-1", "Done", None, resolved=now),
+            _make_issue("T-2", "To Do", None),
+        ]
+        m = calculate_metrics(
+            _make_epic(children), progress_method=PROGRESS_ESTIMATES_ONLY
+        )
+        assert m.progress == pytest.approx(0.0)
+
+    def test_all_done(self) -> None:
+        """All estimated and done → 100%."""
+        now = datetime.now(tz=timezone.utc)
+        children = [
+            _make_issue("T-1", "Done", 5, resolved=now),
+            _make_issue("T-2", "Done", 3, resolved=now),
+        ]
+        m = calculate_metrics(
+            _make_epic(children), progress_method=PROGRESS_ESTIMATES_ONLY
+        )
+        assert m.progress == pytest.approx(100.0)
+
+    def test_with_subtask_hierarchy(self) -> None:
+        """Parent with subtasks: unestimated subtask excluded from average."""
+        now = datetime.now(tz=timezone.utc)
+        parent = _make_issue("S-1", "In Progress", None)
+        sub1 = _make_issue("S-1-1", "Done", 3, resolved=now, parent_key="S-1")
+        sub2 = _make_issue("S-1-2", "To Do", None, parent_key="S-1")  # excluded
+
+        children = [parent, sub1, sub2]
+        m = calculate_metrics(
+            _make_epic(children), progress_method=PROGRESS_ESTIMATES_ONLY
+        )
+        # sub1: progress=100, weight=3
+        # sub2: progress=0, weight=0 (excluded)
+        # parent progress = (100*3 + 0*0) / 3 = 100%
+        # parent weight = weight_total = 3 (unestimated parent derives from subs)
+        assert parent.progress == pytest.approx(100.0)
+        assert parent.effective_weight == pytest.approx(3.0)
+
+    def test_differs_from_combined(self) -> None:
+        """Estimates Only gives higher progress than Combined for same data."""
+        now = datetime.now(tz=timezone.utc)
+        children = [
+            _make_issue("T-1", "Done", 5, resolved=now),
+            _make_issue("T-2", "To Do", 5),
+        ]
+        m_combined = calculate_metrics(
+            _make_epic(children), progress_method=PROGRESS_COMBINED
+        )
+        m_estimates = calculate_metrics(
+            _make_epic(children), progress_method=PROGRESS_ESTIMATES_ONLY
+        )
+        # Combined: 50% * (1/2) = 25.0
+        # Estimates Only: 50.0 (no issue ratio)
+        assert m_combined.progress == pytest.approx(25.0)
+        assert m_estimates.progress == pytest.approx(50.0)

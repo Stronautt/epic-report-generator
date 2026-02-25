@@ -8,7 +8,7 @@ Epic Report Generator is a desktop app that connects to Jira Cloud, pulls Epic p
 
 - **Title page** with project name, date, author, and optional confidentiality notice
 - **Summary table** — one row per Epic with progress bars, story points, issue counts, assignees, and optional scope-certainty legend
-- **Timeline page** — Gantt-style chart showing epic and (optionally) child issue date ranges with milestone markers
+- **Timeline page** — optional Gantt-style chart showing epic and (optionally) child issue date ranges with milestone markers (included by default; can be excluded via the "Include timeline chart" option)
 - **Per-Epic detail pages** — trend chart (total vs. completed SP, cumulative issues, weekend bands) plus a metrics sidebar (velocity, cycle time, scope change %, forecast date)
 - **Light & Dark themes** — Material Design base with app-specific overlays; the PDF and the app UI both follow your preference
 
@@ -91,12 +91,13 @@ Progress is computed **bottom-up** through the issue hierarchy:
 - **Parent issues** with subtasks aggregate their subtask progress via weighted average
 - **Epic progress** is the weighted average of its direct children's progress
 
-Two progress methods are available:
+Three progress methods are available:
 
 | Method | Formula |
 |--------|---------|
 | **Combined** (default) | Bottom-up weighted average × (done issues / total issues) |
 | **Issues Only** | Bottom-up weighted average with weight = 1.0 for every item |
+| **Estimates Only** | Bottom-up weighted average using estimates as weights, without issue-count ratio; unestimated items excluded |
 
 - If there are no issues, progress is 0 %
 - Result is clamped to 0–100 %

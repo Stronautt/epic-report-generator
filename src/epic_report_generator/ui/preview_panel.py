@@ -142,6 +142,17 @@ class _GenerateWorker(QObject):
                         seen_sprints.add(sp.name)
                         report.sprints.append(sp)
 
+        # Auto-fill project display name when it wasn't derivable at config
+        # time (e.g. label-only reports where no epic keys are configured).
+        if self._config.project_display_name in ("Report", "") and project_keys:
+            pk_first = sorted(project_keys)[0]
+            resolved = self._jira.get_project_name(pk_first)
+            self._config.project_display_name = resolved or pk_first
+            logger.debug(
+                "Auto-filled project_display_name from fetched data: %s",
+                self._config.project_display_name,
+            )
+
         # Fetch fix version dates
         self.progress.emit("Fetching fix versions…", 75)
         for pk in project_keys:

@@ -141,9 +141,10 @@ def generate_pdf(report: ReportData) -> bytes:
     _add_summary_table(story, report, styles, pal, footer_h=footer_h)
 
     # Timeline page (after summary, before epic details)
-    logger.debug("Building timeline page")
-    story.append(PageBreak())
-    _add_timeline_page(story, report, styles, dark, pal, footer_h=footer_h)
+    if config.show_timeline_chart:
+        logger.debug("Building timeline page")
+        story.append(PageBreak())
+        _add_timeline_page(story, report, styles, dark, pal, footer_h=footer_h)
 
     # Pages 3+ — Individual Epic pages
     show_additional = report.config.show_additional_metrics
@@ -613,11 +614,16 @@ def _progress_bar_para(
     else:
         colour = pal["red"]
     hex_colour = colour.hexval() if hasattr(colour, "hexval") else str(colour)
-    bar_len = max(1, int(pct / 5))
-    bar = "█" * bar_len + "░" * (20 - bar_len)
+    muted = pal["muted"]
+    hex_muted = muted.hexval() if hasattr(muted, "hexval") else str(muted)
+    filled = min(10, max(0, round(pct / 10)))
+    empty = 10 - filled
+    bar = (
+        f'<font color="{hex_colour}" size="9">{"■" * filled}</font>'
+        f'<font color="{hex_muted}" size="9">{"□" * empty}</font>'
+    )
     return Paragraph(
-        f'<font color="{hex_colour}" size="8">{bar}</font> '
-        f'<font size="9"><b>{pct:.0f}%</b></font>',
+        f'{bar} <font size="9"><b>{pct:.0f} %</b></font>',
         styles["cell"],
     )
 

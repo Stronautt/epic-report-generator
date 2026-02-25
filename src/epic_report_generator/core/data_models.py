@@ -135,7 +135,7 @@ class ReportConfig:
     confidential: bool = False
     company_name: str = ""
     estimation_method: str = "story_points"  # "story_points" or "time_days"
-    progress_method: str = "combined"  # "combined" or "issues_only"
+    progress_method: str = "combined"  # "combined", "issues_only", or "estimates_only"
     story_points_field: str = "story_points"
     epic_link_field: str = "customfield_10014"
     start_date_field: str = "startdate"
@@ -148,6 +148,7 @@ class ReportConfig:
     show_children_on_timeline: bool = False
     expand_label_details: bool = True
     show_additional_metrics: bool = True
+    show_timeline_chart: bool = True  # include/exclude the Gantt timeline page
     dark_mode: bool = False
 
 

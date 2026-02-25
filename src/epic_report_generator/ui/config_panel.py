@@ -262,10 +262,17 @@ class ConfigPanel(QWidget):
         self._profile_bar = ProfileBar(self._config)
         self._profile_bar.profile_changed.connect(self._on_profile_switched)
         root.addWidget(self._profile_bar)
+        root.addWidget(
+            self._hint(
+                "Profiles store report settings separately \u2014 use them for "
+                "different projects, audiences (customer-facing vs. internal), "
+                "or project phases."
+            )
+        )
 
         # ── Report Items (always visible, not collapsible) ──────────────
         lbl = QLabel("Report Items")
-        lbl.setProperty("subheading", "true")
+        lbl.setProperty("sectionTitle", "true")
         root.addWidget(lbl)
         root.addWidget(
             self._hint(
@@ -377,6 +384,10 @@ class ConfigPanel(QWidget):
             "combined",
         )
         self._progress_method_combo.addItem("Issues Only", "issues_only")
+        self._progress_method_combo.addItem(
+            "Estimates Only",
+            "estimates_only",
+        )
         self._progress_method_combo.currentIndexChanged.connect(
             lambda _: self._persist_values()
         )
@@ -385,7 +396,8 @@ class ConfigPanel(QWidget):
             self._hint(
                 "Combined uses estimate-weighted averages multiplied by the "
                 "issue-count ratio. Issues Only counts open vs done items "
-                "with equal weight."
+                "with equal weight. Estimates Only uses estimate weights "
+                "without the issue-count ratio and excludes unestimated items."
             )
         )
 
@@ -462,6 +474,18 @@ class ConfigPanel(QWidget):
         # ── Timeline Chart (collapsible, collapsed) ─────────────────────
         self._timeline_section = CollapsibleSection("Timeline Chart", expanded=False)
         tl = self._timeline_section.body_layout
+
+        self._show_timeline_check = QCheckBox("Include timeline chart")
+        self._show_timeline_check.setChecked(True)
+        self._show_timeline_check.stateChanged.connect(
+            lambda _: self._persist_values()
+        )
+        tl.addWidget(self._show_timeline_check)
+        tl.addWidget(
+            self._hint(
+                "Include a Gantt-style timeline page in the generated PDF report"
+            )
+        )
 
         self._show_children_timeline_check = QCheckBox("Show child issues on timeline")
         self._show_children_timeline_check.setChecked(False)
@@ -631,8 +655,8 @@ class ConfigPanel(QWidget):
         """Create a small descriptive hint label."""
         lbl = QLabel(text)
         lbl.setWordWrap(True)
-        lbl.setProperty("subheading", "true")
-        lbl.setContentsMargins(0, 0, 0, 4)
+        lbl.setProperty("hint", "true")
+        lbl.setContentsMargins(0, 0, 0, 8)
         return lbl
 
     # -- estimation method toggling -------------------------------------------
@@ -720,6 +744,11 @@ class ConfigPanel(QWidget):
         # Restore show additional metrics
         self._show_additional_metrics_check.setChecked(
             self._config.get("show_additional_metrics", True)
+        )
+
+        # Restore show timeline chart
+        self._show_timeline_check.setChecked(
+            self._config.get("show_timeline_chart", True)
         )
 
     _MIN_HARD_DATE_GAP_DAYS = 5
@@ -821,6 +850,7 @@ class ConfigPanel(QWidget):
                 "show_additional_metrics": (
                     self._show_additional_metrics_check.isChecked()
                 ),
+                "show_timeline_chart": self._show_timeline_check.isChecked(),
             }
         )
 
@@ -864,6 +894,15 @@ class ConfigPanel(QWidget):
         project_name = self._project_name_field.text.strip()
         if not project_name and project_key and self._jira.connected:
             project_name = self._jira.get_project_name(project_key) or project_key
+        logger.debug(
+            "Project name resolution: field=%r, key=%r, resolved=%r, "
+            "epic_keys=%r, connected=%s",
+            self._project_name_field.text.strip(),
+            project_key,
+            project_name,
+            epic_keys,
+            self._jira.connected,
+        )
 
         # Timeline field overrides (fall back to the date fields used for estimation)
         tl_start_raw = self._timeline_start_field.text.strip()
@@ -922,6 +961,7 @@ class ConfigPanel(QWidget):
             show_children_on_timeline=self._show_children_timeline_check.isChecked(),
             expand_label_details=self._expand_label_details_check.isChecked(),
             show_additional_metrics=self._show_additional_metrics_check.isChecked(),
+            show_timeline_chart=self._show_timeline_check.isChecked(),
         )
 
         self._persist_values()
@@ -956,6 +996,7 @@ class ConfigPanel(QWidget):
         self._hard_start_edit.setDate(self._hard_start_edit.minimumDate())
         self._hard_end_edit.setDate(self._hard_end_edit.minimumDate())
         self._include_subtasks_check.setChecked(True)
+        self._show_timeline_check.setChecked(True)
         self._show_children_timeline_check.setChecked(False)
         self._expand_label_details_check.setChecked(True)
         self._show_additional_metrics_check.setChecked(True)
