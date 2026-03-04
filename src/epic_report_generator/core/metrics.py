@@ -5,7 +5,12 @@ from __future__ import annotations
 import logging
 from datetime import date, timedelta
 
-from epic_report_generator.core.data_models import EpicData, EpicMetrics, JiraIssue
+from epic_report_generator.core.data_models import (
+    EpicData,
+    EpicMetrics,
+    JiraIssue,
+    collect_child_timeline_dates,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +26,9 @@ DEFAULT_WEIGHT = 1.0
 PROGRESS_MIN = 0.0
 PROGRESS_MAX = 100.0
 PROGRESS_DONE = 100.0
+
+_SECONDS_PER_DAY = 86400
+_SCOPE_CHANGE_THRESHOLD_DAYS = 7
 
 
 def _normalise_progress_method(method: str) -> str:
@@ -73,13 +81,13 @@ def calculate_metrics(
 
     use_estimates = progress_method != PROGRESS_ISSUES_ONLY
 
-    # Pre-compute direct estimates once per child
-    direct_estimates: dict[str, float | None] = {
-        c.key: _get_estimate(c, estimation_method) for c in children
-    }
+    # Single pass: build estimates, key set, and parent→subtask mapping
+    direct_estimates: dict[str, float | None] = {}
+    child_key_set: set[str] = set()
+    for c in children:
+        direct_estimates[c.key] = _get_estimate(c, estimation_method)
+        child_key_set.add(c.key)
 
-    # Build parent→subtasks mapping (only among this epic's children)
-    child_key_set = {c.key for c in children}
     parent_to_subs: dict[str, list[JiraIssue]] = {}
     subtask_keys: set[str] = set()
     for c in children:
@@ -93,17 +101,21 @@ def calculate_metrics(
         children, direct_estimates, parent_to_subs, use_estimates, omit_unestimated
     )
 
-    # Direct children of the epic (not subtasks of other children)
-    direct_children = [c for c in children if c.key not in subtask_keys]
-
-    # Epic progress = weighted average of direct children's progress
-    weighted_sum = sum(c.progress * c.effective_weight for c in direct_children)
-    weight_total = sum(c.effective_weight for c in direct_children)
+    # Single pass: compute epic progress (direct children only) and count done issues
+    weighted_sum = 0.0
+    weight_total = 0.0
+    completed_issues = 0
+    for c in children:
+        if c.status_category == STATUS_DONE:
+            completed_issues += 1
+        if c.key not in subtask_keys:
+            weighted_sum += c.progress * c.effective_weight
+            weight_total += c.effective_weight
     raw_progress = weighted_sum / weight_total if weight_total > 0 else PROGRESS_MIN
 
     # Apply progress method
     m.total_issues = len(children)
-    m.completed_issues = sum(1 for c in children if c.status_category == STATUS_DONE)
+    m.completed_issues = completed_issues
     m.open_issues = m.total_issues - m.completed_issues
 
     if progress_method == PROGRESS_COMBINED and m.total_issues > 0:
@@ -148,21 +160,23 @@ def calculate_metrics(
             )
         accounted_keys.update(s.key for s in subs)
 
-    non_accounted = [c for c in children if c.key not in accounted_keys]
-    m.unestimated_issues = sum(
-        1 for c in non_accounted if effective_est.get(c.key) is None
-    )
-    m.total_sp = sum(
-        float(effective_est[c.key])  # type: ignore[arg-type]
-        for c in non_accounted
-        if effective_est.get(c.key) is not None
-    )
-    m.completed_sp = sum(
-        effective_done.get(c.key, 0.0)
-        for c in non_accounted
-        if effective_est.get(c.key) is not None
-    )
-    m.remaining_sp = m.total_sp - m.completed_sp
+    # Single pass over non-accounted children for SP totals
+    unestimated = 0
+    total_sp = 0.0
+    completed_sp = 0.0
+    for c in children:
+        if c.key in accounted_keys:
+            continue
+        est = effective_est.get(c.key)
+        if est is None:
+            unestimated += 1
+        else:
+            total_sp += est
+            completed_sp += effective_done.get(c.key, 0.0)
+    m.unestimated_issues = unestimated
+    m.total_sp = total_sp
+    m.completed_sp = completed_sp
+    m.remaining_sp = total_sp - completed_sp
 
     m.avg_cycle_time_days = _avg_cycle_time(children)
     m.velocity_sp_per_week = _velocity(children, estimation_method, weeks=4)
@@ -194,6 +208,9 @@ def merge_metrics(
     epics: list[EpicData],
     estimation_method: str = "story_points",
     progress_method: str = PROGRESS_COMBINED,
+    *,
+    include_subtask_timeline: bool = True,
+    source_metrics_out: list[EpicMetrics] | None = None,
 ) -> tuple[EpicData, EpicMetrics]:
     """Merge multiple epics into a single synthetic epic and compute metrics.
 
@@ -201,6 +218,10 @@ def merge_metrics(
     is computed as the weighted average of per-epic progress values (each
     weighted by the sum of its direct children's effective weights), rather than
     flattening all children and re-computing.
+
+    If *source_metrics_out* is provided (an empty list), it will be populated
+    with the per-epic metrics computed during merging — one entry per epic in
+    the same order as *epics*.  This avoids callers needing to recompute them.
     """
     progress_method = _normalise_progress_method(progress_method)
     seen: set[str] = set()
@@ -229,12 +250,9 @@ def merge_metrics(
                 merged_children.append(child)
 
     keys = [e.key for e in epics]
-    # Always include child dates so the synthetic epic spans the full range
-    # of all source epics and their children.
-    # Per-child: prefer start_date/due_date, fall back to created/resolved
-    # so every child contributes to the range.
-    # Timeline: cascade timeline fields → sprint dates → start_date/due_date
-    # (matches Jira Cloud Timeline behaviour).
+    # Expand date ranges to cover all merged children.  For estimation dates
+    # prefer start_date/due_date and fall back to created/resolved so every
+    # child contributes.  Timeline dates use collect_child_timeline_dates.
     for c in merged_children:
         if c.start_date:
             start_dates.append(c.start_date)
@@ -244,24 +262,10 @@ def merge_metrics(
             due_dates.append(c.due_date)
         elif c.resolved and c.status_category == STATUS_DONE:
             due_dates.append(c.resolved.date())
-        # Timeline start cascade
-        if c.timeline_start:
-            tl_starts.append(c.timeline_start)
-        else:
-            for sp in c.sprints:
-                if sp.start_date:
-                    tl_starts.append(sp.start_date)
-            if c.start_date:
-                tl_starts.append(c.start_date)
-        # Timeline end cascade
-        if c.timeline_end:
-            tl_ends.append(c.timeline_end)
-        else:
-            for sp in c.sprints:
-                if sp.end_date:
-                    tl_ends.append(sp.end_date)
-            if c.due_date:
-                tl_ends.append(c.due_date)
+        # Skip subtasks for timeline dates when not included
+        if c.is_subtask and not include_subtask_timeline:
+            continue
+        collect_child_timeline_dates(c, tl_starts, tl_ends)
     if not due_dates and start_dates:
         due_dates = [date.today()]
 
@@ -290,6 +294,8 @@ def merge_metrics(
         epic_metrics_list.append(
             calculate_metrics(epic, estimation_method, progress_method)
         )
+    if source_metrics_out is not None:
+        source_metrics_out.extend(epic_metrics_list)
 
     # Compute the label-group metrics from the merged synthetic epic
     m = calculate_metrics(synthetic, estimation_method, progress_method)
@@ -434,7 +440,7 @@ def _avg_cycle_time(children: list[JiraIssue]) -> float | None:
     for c in children:
         if c.status_category == STATUS_DONE and c.created and c.resolved:
             delta = c.resolved - c.created
-            durations.append(delta.total_seconds() / 86400)
+            durations.append(delta.total_seconds() / _SECONDS_PER_DAY)
     return sum(durations) / len(durations) if durations else None
 
 
@@ -465,7 +471,7 @@ def _scope_change(children: list[JiraIssue]) -> float | None:
     if len(dated) < 2:
         return None
     first_created = dated[0][1]
-    threshold = first_created + timedelta(days=7)
+    threshold = first_created + timedelta(days=_SCOPE_CHANGE_THRESHOLD_DAYS)
     added_later = sum(1 for _, dt in dated if dt > threshold)
     return (added_later / len(children)) * 100
 

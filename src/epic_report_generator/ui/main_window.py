@@ -110,7 +110,7 @@ class MainWindow(QMainWindow):
         # Inner content
         self._inner_stack = QStackedWidget()
         self._report_panel = ReportPanel(self._config, self._jira)
-        self._settings_panel = SettingsPanel(self._config, self._auth)
+        self._settings_panel = SettingsPanel(self._config, self._auth, self._jira)
         self._log_panel = LogPanel()
 
         self._inner_stack.addWidget(self._report_panel)  # index 0

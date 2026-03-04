@@ -27,6 +27,9 @@ logger = logging.getLogger(__name__)
 # Widget types that should show a pointing-hand cursor
 _POINTER_TYPES = (QAbstractButton, QComboBox, QAbstractSpinBox, QTabBar, QGroupBox)
 
+# Interval for the signal-wakeup timer that lets Python process SIGINT/SIGTERM
+_SIGNAL_WAKEUP_INTERVAL_MS = 200
+
 
 class _JsonCursorFilter(QObject):
     """Application-wide event filter that sets PointingHandCursor on controls."""
@@ -95,8 +98,7 @@ def _install_signal_handlers(app: QApplication) -> None:
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
-    # Wake up the Python interpreter periodically so signals are processed
     timer = QTimer(app)
-    timer.setInterval(200)
+    timer.setInterval(_SIGNAL_WAKEUP_INTERVAL_MS)
     timer.timeout.connect(lambda: None)
     timer.start()

@@ -578,8 +578,9 @@ class TestEstimatesOnlyProgress:
         sub2 = _make_issue("S-1-2", "To Do", None, parent_key="S-1")  # excluded
 
         children = [parent, sub1, sub2]
-        m = calculate_metrics(
-            _make_epic(children), progress_method=PROGRESS_ESTIMATES_ONLY
+        calculate_metrics(
+            _make_epic(children),
+            progress_method=PROGRESS_ESTIMATES_ONLY,
         )
         # sub1: progress=100, weight=3
         # sub2: progress=0, weight=0 (excluded)

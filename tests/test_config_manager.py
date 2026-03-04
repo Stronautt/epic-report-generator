@@ -8,8 +8,8 @@ from pathlib import Path
 
 from epic_report_generator.services.config_manager import (
     _LEGACY_TIMESTAMP,
-    ConfigManager,
     DEFAULT_PROFILE_NAME,
+    ConfigManager,
 )
 
 
@@ -156,7 +156,9 @@ class TestProfileTimestamps:
     def test_migration_adds_legacy_timestamp(self, tmp_path: Path) -> None:
         mgr = _make_manager(tmp_path)
         # Manually add a profile without _created_at
-        mgr._data.setdefault("profiles", {})["Legacy"] = {"estimation_method": "story_points"}
+        mgr._data.setdefault("profiles", {})["Legacy"] = {
+            "estimation_method": "story_points"
+        }
         mgr._migrate_profile_timestamps()
         assert mgr._data["profiles"]["Legacy"]["_created_at"] == _LEGACY_TIMESTAMP
 

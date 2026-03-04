@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import re
+from collections import OrderedDict
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
@@ -31,6 +33,19 @@ from epic_report_generator.core.metrics import calculate_metrics, merge_metrics
 from epic_report_generator.core.pdf_generator import generate_pdf
 
 logger = logging.getLogger(__name__)
+
+# 16:9 landscape aspect ratio (height / width)
+_PAGE_ASPECT_RATIO = 9 / 16
+
+_PREVIEW_BG_DARK = "#121212"
+_PREVIEW_BG_LIGHT = "#E0E0E0"
+_PREVIEW_BORDER_DARK = "#333"
+_PREVIEW_BORDER_LIGHT = "#ccc"
+
+# Maximum number of viewport-width entries to keep in the pixmap cache.
+# Prevents memory bloat when resizing, while avoiding re-renders on
+# common back-and-forth resize patterns.
+_PIXMAP_CACHE_MAX_ENTRIES = 2
 
 
 class _GenerateWorker(QObject):
@@ -69,6 +84,9 @@ class _GenerateWorker(QObject):
                     start_date_field=self._config.start_date_field,
                     due_date_field=self._config.due_date_field,
                     include_subtasks=self._config.include_subtasks,
+                    include_subtasks_in_timeline=(
+                        self._config.include_subtasks_in_timeline
+                    ),
                     timeline_start_field=self._config.timeline_start_field,
                     timeline_end_field=self._config.timeline_end_field,
                 )
@@ -101,16 +119,23 @@ class _GenerateWorker(QObject):
                     start_date_field=self._config.start_date_field,
                     due_date_field=self._config.due_date_field,
                     include_subtasks=self._config.include_subtasks,
+                    include_subtasks_in_timeline=(
+                        self._config.include_subtasks_in_timeline
+                    ),
                     timeline_start_field=self._config.timeline_start_field,
                     timeline_end_field=self._config.timeline_end_field,
                 )
                 if not label_epics:
                     report.errors.append(f"No epics found for label '{item.key}'.")
                     continue
+                # Collect per-epic metrics during merge to avoid recomputing
+                per_epic_metrics: list[EpicMetrics] = []
                 synthetic, metrics = merge_metrics(
                     label_epics,
                     estimation_method=self._config.estimation_method,
                     progress_method=self._config.progress_method,
+                    include_subtask_timeline=self._config.include_subtasks_in_timeline,
+                    source_metrics_out=per_epic_metrics,
                 )
                 metrics.scope_certainty = item.scope_certainty
                 # Set display name for label group
@@ -119,14 +144,9 @@ class _GenerateWorker(QObject):
                 report.epics.append(synthetic)
                 report.metrics.append(metrics)
                 report.resolved_items.append((item, synthetic, metrics))
-                # Store source epics with individual metrics for timeline
+                # Store source epics with pre-computed metrics for timeline
                 source_pairs: list[tuple[EpicData, EpicMetrics]] = []
-                for e in label_epics:
-                    em = calculate_metrics(
-                        e,
-                        estimation_method=self._config.estimation_method,
-                        progress_method=self._config.progress_method,
-                    )
+                for e, em in zip(label_epics, per_epic_metrics):
                     em.scope_certainty = item.scope_certainty
                     source_pairs.append((e, em))
                     if "-" in e.key:
@@ -190,11 +210,14 @@ class PreviewPanel(QWidget):
         super().__init__(parent)
         self._jira = jira
         self._pdf_bytes: bytes | None = None
+        self._config: ReportConfig | None = None
         self._thread: QThread | None = None
         self._worker: _GenerateWorker | None = None
         self._dark = False
-        # Pixmap cache: (pdf_id, width, dpr) -> list[QPixmap]
-        self._pixmap_cache: tuple[int, int, float, list[QPixmap]] | None = None
+        # LRU pixmap cache: (pdf_id, width, dpr) -> list[QPixmap]
+        self._pixmap_cache: OrderedDict[tuple[int, int, float], list[QPixmap]] = (
+            OrderedDict()
+        )
         # Debounce timer for resize events
         self._resize_timer = QTimer(self)
         self._resize_timer.setSingleShot(True)
@@ -266,6 +289,7 @@ class PreviewPanel(QWidget):
             return
 
         item_count = len(config.items) or len(config.epic_keys)
+        self._config = config
         logger.info("Starting report generation for %d item(s)", item_count)
         self.clear_preview()
         self._progress_bar.setValue(0)
@@ -286,7 +310,7 @@ class PreviewPanel(QWidget):
         """Public method to clear the preview and reset state."""
         self._clear_preview()
         self._pdf_bytes = None
-        self._pixmap_cache = None
+        self._pixmap_cache.clear()
         self._export_btn.setEnabled(False)
         self._status_label.clear()
         self._progress_bar.hide()
@@ -348,7 +372,7 @@ class PreviewPanel(QWidget):
             return
 
         self._pdf_bytes = pdf_bytes
-        self._pixmap_cache = None
+        self._pixmap_cache.clear()
         self._progress_bar.hide()
         logger.info(
             "PDF generated: %d epic(s), %s bytes",
@@ -364,8 +388,16 @@ class PreviewPanel(QWidget):
     def _export_pdf(self) -> None:
         if not self._pdf_bytes:
             return
+        default_name = "epic_report.pdf"
+        if self._config is not None:
+            # Strip non-alphanumeric chars (keep hyphens), collapse runs of hyphens
+            title_slug = re.sub(r"[^\w-]", "-", self._config.title.strip())
+            title_slug = re.sub(r"-{2,}", "-", title_slug).strip("-") or "epic-report"
+            rd = self._config.report_date
+            date_str = f"{rd.day}-{rd.strftime('%b')}-{rd.strftime('%y')}"
+            default_name = f"{title_slug}-{date_str}.pdf"
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export Report", "epic_report.pdf", "PDF Files (*.pdf)"
+            self, "Export Report", default_name, "PDF Files (*.pdf)"
         )
         if path:
             Path(path).write_bytes(self._pdf_bytes)
@@ -384,7 +416,7 @@ class PreviewPanel(QWidget):
         # Keep the preview area at least one 16:9 page tall
         w = self._scroll.viewport().width()
         if w > 0:
-            self._scroll.setMinimumHeight(int(w * 9 / 16))
+            self._scroll.setMinimumHeight(int(w * _PAGE_ASPECT_RATIO))
         if self._pdf_bytes:
             self._resize_timer.start()
 
@@ -412,26 +444,20 @@ class PreviewPanel(QWidget):
             return
 
         # Set preview container background based on theme
-        if self._dark:
-            self._preview_container.setStyleSheet("background: #121212;")
-        else:
-            self._preview_container.setStyleSheet("background: #E0E0E0;")
+        bg = _PREVIEW_BG_DARK if self._dark else _PREVIEW_BG_LIGHT
+        self._preview_container.setStyleSheet(f"background: {bg};")
 
         available_width = self._scroll.viewport().width() - 16
         dpr = self.devicePixelRatio() or 1.0
         pdf_id = id(self._pdf_bytes)
+        cache_key = (pdf_id, available_width, dpr)
 
-        # Check pixmap cache
-        cached_pixmaps: list[QPixmap] | None = None
-        if (
-            self._pixmap_cache is not None
-            and self._pixmap_cache[0] == pdf_id
-            and self._pixmap_cache[1] == available_width
-            and self._pixmap_cache[2] == dpr
-        ):
-            cached_pixmaps = self._pixmap_cache[3]
-
-        if cached_pixmaps is None:
+        # Check LRU pixmap cache
+        cached_pixmaps: list[QPixmap] | None = self._pixmap_cache.get(cache_key)
+        if cached_pixmaps is not None:
+            # Move to end (most recently used)
+            self._pixmap_cache.move_to_end(cache_key)
+        else:
             # Render from PDF
             try:
                 from PySide6.QtCore import QBuffer, QIODevice, QSize
@@ -464,8 +490,10 @@ class PreviewPanel(QWidget):
                 doc.close()
                 buf.close()
 
-                # Store in cache
-                self._pixmap_cache = (pdf_id, available_width, dpr, cached_pixmaps)
+                # Store in LRU cache, evict oldest if at capacity
+                self._pixmap_cache[cache_key] = cached_pixmaps
+                while len(self._pixmap_cache) > _PIXMAP_CACHE_MAX_ENTRIES:
+                    self._pixmap_cache.popitem(last=False)
 
             except ImportError:
                 lbl = QLabel(
@@ -477,10 +505,9 @@ class PreviewPanel(QWidget):
                 return
 
         # Build QLabels from pixmaps
+        border_color = _PREVIEW_BORDER_DARK if self._dark else _PREVIEW_BORDER_LIGHT
         border_style = (
-            "border: 1px solid #333; background: transparent; padding: 2px;"
-            if self._dark
-            else "border: 1px solid #ccc; background: transparent; padding: 2px;"
+            f"border: 1px solid {border_color}; background: transparent; padding: 2px;"
         )
         for pixmap in cached_pixmaps:
             label = QLabel()

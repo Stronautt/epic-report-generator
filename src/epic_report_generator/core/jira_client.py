@@ -11,7 +11,12 @@ import requests as _requests
 from dateutil.parser import parse as _dt_parse
 from jira import JIRA, JIRAError
 
-from epic_report_generator.core.data_models import EpicData, JiraIssue, SprintInfo
+from epic_report_generator.core.data_models import (
+    EpicData,
+    JiraIssue,
+    SprintInfo,
+    collect_child_timeline_dates,
+)
 from epic_report_generator.services.auth_manager import AuthManager
 
 logger = logging.getLogger(__name__)
@@ -19,14 +24,33 @@ logger = logging.getLogger(__name__)
 _MAX_RESULTS = 100
 _MAX_RETRIES = 4
 _BACKOFF_BASE = 1.0  # seconds
+# Maximum number of keys in a single JQL IN clause for subtask batching.
+# JQL supports much larger IN clauses than the pagination page size.
+_JQL_IN_BATCH_SIZE = 500
+
+
+def _drop_subtasks(children: list[JiraIssue]) -> list[JiraIssue]:
+    """Return a copy of *children* with is_subtask=True items removed."""
+    return [c for c in children if not c.is_subtask]
 
 
 class JiraClient:
     """High-level wrapper around the ``jira`` library for Epic data."""
 
+    # TTL for cached Jira field metadata (seconds)
+    _FIELDS_CACHE_TTL = 3600  # 1 hour
+
     def __init__(self, auth: AuthManager) -> None:
         self._auth = auth
         self._jira: JIRA | None = None
+        self._fields_cache: list[dict[str, str]] | None = None
+        self._fields_cache_time: float = 0.0
+
+    def invalidate_caches(self) -> None:
+        """Clear all cached data (e.g. field metadata)."""
+        self._fields_cache = None
+        self._fields_cache_time = 0.0
+        logger.info("Jira client caches invalidated")
 
     # -- connection -----------------------------------------------------------
 
@@ -180,6 +204,7 @@ class JiraClient:
         start_date_field: str = "startdate",
         due_date_field: str = "duedate",
         include_subtasks: bool = True,
+        include_subtasks_in_timeline: bool = True,
         sprint_field: str = "customfield_10020",
         timeline_start_field: str = "",
         timeline_end_field: str = "",
@@ -225,13 +250,21 @@ class JiraClient:
             start_date_field,
             due_date_field,
             include_subtasks=include_subtasks,
+            include_subtasks_in_timeline=include_subtasks_in_timeline,
             sprint_field=sprint_field,
             timeline_start_field=timeline_start_field,
             timeline_end_field=timeline_end_field,
         )
 
         # Expand epic dates to cover the full range of children
-        self._fill_epic_dates_from_children(epic)
+        self._fill_epic_dates_from_children(
+            epic, include_subtask_timeline=include_subtasks_in_timeline
+        )
+
+        # If subtasks were fetched only for timeline but not for progress,
+        # remove them so calculate_metrics treats their parents as leaf nodes.
+        if not include_subtasks and include_subtasks_in_timeline:
+            epic.children = _drop_subtasks(epic.children)
 
         logger.info(
             "Fetched epic %s: %d children, status=%s",
@@ -256,9 +289,19 @@ class JiraClient:
             return False
 
     def fetch_fields(self) -> list[dict[str, str]]:
-        """Return all Jira fields (for custom field mapping UI)."""
+        """Return all Jira fields (for custom field mapping UI).
+
+        Results are cached for up to 1 hour to avoid redundant API calls
+        when the field picker dialog is reopened.
+        """
         if not self._jira:
             return []
+        if (
+            self._fields_cache is not None
+            and (time.monotonic() - self._fields_cache_time) < self._FIELDS_CACHE_TTL
+        ):
+            logger.debug("Returning %d cached Jira fields", len(self._fields_cache))
+            return self._fields_cache
         logger.debug("Fetching Jira fields")
         try:
             result = [
@@ -266,6 +309,8 @@ class JiraClient:
                 for f in self._jira.fields()
             ]
             logger.info("Fetched %d Jira fields", len(result))
+            self._fields_cache = result
+            self._fields_cache_time = time.monotonic()
             return result
         except JIRAError as exc:
             logger.error("Failed to fetch fields: %s", exc)
@@ -294,6 +339,7 @@ class JiraClient:
         start_date_field: str = "startdate",
         due_date_field: str = "duedate",
         include_subtasks: bool = True,
+        include_subtasks_in_timeline: bool = True,
         sprint_field: str = "customfield_10020",
         timeline_start_field: str = "",
         timeline_end_field: str = "",
@@ -332,13 +378,20 @@ class JiraClient:
                     start_date_field,
                     due_date_field,
                     include_subtasks=include_subtasks,
+                    include_subtasks_in_timeline=include_subtasks_in_timeline,
                     sprint_field=sprint_field,
                     timeline_start_field=timeline_start_field,
                     timeline_end_field=timeline_end_field,
                 )
 
                 # Expand epic dates to cover the full range of children
-                self._fill_epic_dates_from_children(epic)
+                self._fill_epic_dates_from_children(
+                    epic, include_subtask_timeline=include_subtasks_in_timeline
+                )
+
+                # If subtasks fetched only for timeline, remove for progress
+                if not include_subtasks and include_subtasks_in_timeline:
+                    epic.children = _drop_subtasks(epic.children)
 
                 epics.append(epic)
             if len(results) < _MAX_RESULTS:
@@ -416,7 +469,11 @@ class JiraClient:
             return []
 
     @staticmethod
-    def _fill_epic_dates_from_children(epic: EpicData) -> None:
+    def _fill_epic_dates_from_children(
+        epic: EpicData,
+        *,
+        include_subtask_timeline: bool = True,
+    ) -> None:
         """Expand epic-level dates to cover the full range of child issues.
 
         The epic's start_date becomes the earliest date and due_date the
@@ -428,6 +485,10 @@ class JiraClient:
         cascade: timeline field values → sprint dates → start_date/due_date.
         This matches Jira Cloud Timeline behaviour, which derives epic ranges
         from child sprint assignments when no explicit dates are set.
+
+        When *include_subtask_timeline* is False, children marked as subtasks
+        are excluded from the timeline date collection (estimation dates still
+        include all children).
 
         All four date categories are collected in a single pass over children.
         """
@@ -461,25 +522,11 @@ class JiraClient:
             elif c.resolved and c.status_category == "Done":
                 candidate_ends.append(c.resolved.date())
 
-            # Timeline start: cascade timeline → sprint → start_date
-            if c.timeline_start:
-                tl_starts.append(c.timeline_start)
-            else:
-                for sp in c.sprints:
-                    if sp.start_date:
-                        tl_starts.append(sp.start_date)
-                if c.start_date:
-                    tl_starts.append(c.start_date)
+            # Skip subtasks for timeline dates when not included
+            if c.is_subtask and not include_subtask_timeline:
+                continue
 
-            # Timeline end: cascade timeline → sprint → due_date
-            if c.timeline_end:
-                tl_ends.append(c.timeline_end)
-            else:
-                for sp in c.sprints:
-                    if sp.end_date:
-                        tl_ends.append(sp.end_date)
-                if c.due_date:
-                    tl_ends.append(c.due_date)
+            collect_child_timeline_dates(c, tl_starts, tl_ends)
 
         if candidate_starts:
             epic.start_date = min(candidate_starts)
@@ -581,6 +628,7 @@ class JiraClient:
         start_date_field: str = "startdate",
         due_date_field: str = "duedate",
         include_subtasks: bool = True,
+        include_subtasks_in_timeline: bool = True,
         sprint_field: str = "customfield_10020",
         timeline_start_field: str = "",
         timeline_end_field: str = "",
@@ -619,11 +667,13 @@ class JiraClient:
             children,
         )
 
-        # Fetch subtasks of direct children
-        if include_subtasks and children:
+        # Fetch subtasks of direct children when needed for progress or timeline
+        need_subtasks = include_subtasks or include_subtasks_in_timeline
+        if need_subtasks and children:
+            direct_child_count = len(children)
             child_keys = [c.key for c in children]
-            for batch_start in range(0, len(child_keys), _MAX_RESULTS):
-                batch = child_keys[batch_start : batch_start + _MAX_RESULTS]
+            for batch_start in range(0, len(child_keys), _JQL_IN_BATCH_SIZE):
+                batch = child_keys[batch_start : batch_start + _JQL_IN_BATCH_SIZE]
                 subtask_jql = f"parent in ({', '.join(batch)}) ORDER BY created ASC"
                 logger.debug("Fetching subtasks for %d parent(s)", len(batch))
                 self._paginated_search(
@@ -637,6 +687,9 @@ class JiraClient:
                     seen,
                     children,
                 )
+            # Mark newly added issues as subtasks
+            for c in children[direct_child_count:]:
+                c.is_subtask = True
             logger.debug(
                 "Total children + subtasks for %s: %d", epic_key, len(children)
             )
@@ -657,7 +710,8 @@ class JiraClient:
         fields: Any = raw.fields
         sp_val = self._get_raw_field(raw, sp_field)
         if sp_val is None:
-            # Try common custom field names
+            # Fallback: customfield_10016 is the default SP field
+            # in Jira Cloud
             sp_val = self._get_raw_field(raw, "customfield_10016")
 
         raw_sprints = self._get_raw_field(raw, sprint_field)

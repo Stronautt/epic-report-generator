@@ -356,7 +356,9 @@ class TestFetchSubtasks:
             [],
         ]
 
-        epic = client.fetch_epic("PROJ-1", include_subtasks=False)
+        epic = client.fetch_epic(
+            "PROJ-1", include_subtasks=False, include_subtasks_in_timeline=False
+        )
         assert epic is not None
         assert len(epic.children) == 1
         assert epic.children[0].key == "PROJ-2"

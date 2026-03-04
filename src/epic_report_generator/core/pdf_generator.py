@@ -24,21 +24,37 @@ from reportlab.platypus import (
 )
 
 from epic_report_generator.core.chart_generator import (
-    _MONTHS_ABBR,
     generate_epic_chart,
     generate_timeline_chart,
 )
 from epic_report_generator.core.data_models import (
     EpicData,
     EpicMetrics,
+    JiraIssue,
     MilestoneItem,
     ReportConfig,
     ReportData,
     ReportItem,
     TimelineItem,
+    collect_child_timeline_dates,
 )
 
 logger = logging.getLogger(__name__)
+
+_MONTHS_ABBR = [
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+]
 
 _MONTHS_FULL = [
     "January",
@@ -71,6 +87,18 @@ def _fmt_date(d: date, fmt: str) -> str:
 PAGE_W = 406 * mm  # ~1152 pt
 PAGE_H = 228.4 * mm  # ~648 pt
 MARGIN = 18 * mm
+_FOOTER_H = 10 * mm  # height reserved for the confidential footer line
+
+# Progress bar display thresholds (percent)
+_PROGRESS_HIGH = 75
+_PROGRESS_LOW = 25
+_PROGRESS_BAR_CHARS = 10  # total characters in the progress bar
+
+
+def _confidential_footer_height(config: ReportConfig | None) -> float:
+    """Return the footer height when confidential mode is active, else 0."""
+    return _FOOTER_H if (config and config.confidential and config.company_name) else 0
+
 
 # ---------------------------------------------------------------------------
 # Colour palettes
@@ -125,7 +153,7 @@ def generate_pdf(report: ReportData) -> bytes:
 
     buf = io.BytesIO()
     config = report.config
-    footer_h = 10 * mm if (config.confidential and config.company_name) else 0
+    footer_h = _confidential_footer_height(config)
     doc = _create_doc(buf, pal, config)
     styles = _build_styles(pal)
 
@@ -135,10 +163,10 @@ def generate_pdf(report: ReportData) -> bytes:
     logger.debug("Building title page")
     _add_title_page(story, config, styles)
 
-    # Page 2+ — Summary table
+    # Page 2 — Summary table
     logger.debug("Building summary table for %d epic(s)", len(report.epics))
     story.append(PageBreak())
-    _add_summary_table(story, report, styles, pal, footer_h=footer_h)
+    _add_summary_table(story, report, styles, pal)
 
     # Timeline page (after summary, before epic details)
     if config.show_timeline_chart:
@@ -146,7 +174,7 @@ def generate_pdf(report: ReportData) -> bytes:
         story.append(PageBreak())
         _add_timeline_page(story, report, styles, dark, pal, footer_h=footer_h)
 
-    # Pages 3+ — Individual Epic pages
+    # Individual Epic detail pages (after summary and optional timeline)
     show_additional = report.config.show_additional_metrics
     if report.resolved_items:
         for i, (item, epic, metrics) in enumerate(report.resolved_items, 1):
@@ -209,9 +237,7 @@ def generate_pdf(report: ReportData) -> bytes:
 def _create_doc(
     buf: io.BytesIO, pal: dict[str, Any], config: ReportConfig | None = None
 ) -> BaseDocTemplate:
-    footer_margin = (
-        10 * mm if (config and config.confidential and config.company_name) else 0
-    )
+    footer_margin = _confidential_footer_height(config)
     doc = BaseDocTemplate(
         buf,
         pagesize=(PAGE_W, PAGE_H),
@@ -419,7 +445,6 @@ def _add_summary_table(
     report: ReportData,
     styles: dict[str, ParagraphStyle],
     pal: dict[str, Any],
-    footer_h: float = 0,
 ) -> None:
     story.append(Paragraph("Epic Progress Summary", styles["heading"]))
     story.append(Spacer(1, 4 * mm))
@@ -607,17 +632,17 @@ def _progress_bar_para(
     pal: dict[str, Any],
 ) -> Paragraph:
     """Return a coloured text representation of the progress bar."""
-    if pct >= 75:
+    if pct >= _PROGRESS_HIGH:
         colour = pal["green"]
-    elif pct >= 25:
+    elif pct >= _PROGRESS_LOW:
         colour = pal["yellow"]
     else:
         colour = pal["red"]
     hex_colour = colour.hexval() if hasattr(colour, "hexval") else str(colour)
     muted = pal["muted"]
     hex_muted = muted.hexval() if hasattr(muted, "hexval") else str(muted)
-    filled = min(10, max(0, round(pct / 10)))
-    empty = 10 - filled
+    filled = min(_PROGRESS_BAR_CHARS, max(0, round(pct / _PROGRESS_BAR_CHARS)))
+    empty = _PROGRESS_BAR_CHARS - filled
     bar = (
         f'<font color="{hex_colour}" size="9">{"■" * filled}</font>'
         f'<font color="{hex_muted}" size="9">{"□" * empty}</font>'
@@ -647,6 +672,21 @@ def _certainty_para(
 # -- Timeline page ------------------------------------------------------------
 
 
+def _resolve_child_timeline_dates(
+    child: JiraIssue,
+) -> tuple[date | None, date | None]:
+    """Resolve timeline dates for a child issue.
+
+    Uses ``collect_child_timeline_dates`` (timeline → sprint → start_date/due_date
+    cascade) and returns the earliest candidate start and latest candidate end,
+    mirroring the min/max aggregation used at the epic level.
+    """
+    tl_starts: list[date] = []
+    tl_ends: list[date] = []
+    collect_child_timeline_dates(child, tl_starts, tl_ends)
+    return (min(tl_starts) if tl_starts else None, max(tl_ends) if tl_ends else None)
+
+
 def _add_timeline_page(
     story: list[Any],
     report: ReportData,
@@ -661,7 +701,8 @@ def _add_timeline_page(
 
     # Build timeline items from resolved_items or epics/metrics
     timeline_items: list[TimelineItem] = []
-    show_children = report.config.show_children_on_timeline
+    show_children = report.config.show_epic_stories_on_timeline
+    show_subtasks = report.config.show_subtasks_on_timeline
 
     def _add_epic_timeline(
         epic: EpicData,
@@ -691,8 +732,9 @@ def _add_timeline_page(
         )
         if show_children and epic.children:
             for child in epic.children:
-                c_start = child.timeline_start or child.start_date
-                c_end = child.timeline_end or child.due_date
+                if child.is_subtask and not show_subtasks:
+                    continue
+                c_start, c_end = _resolve_child_timeline_dates(child)
                 if c_start and c_end:
                     timeline_items.append(
                         TimelineItem(

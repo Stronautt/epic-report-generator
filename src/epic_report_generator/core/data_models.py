@@ -39,6 +39,7 @@ class JiraIssue:
     sprints: list[SprintInfo] = field(default_factory=list)
     progress: float = 0.0
     effective_weight: float = 1.0
+    is_subtask: bool = False
 
 
 @dataclass
@@ -145,11 +146,49 @@ class ReportConfig:
     timeline_hard_start: date | None = None
     timeline_hard_end: date | None = None
     include_subtasks: bool = True
-    show_children_on_timeline: bool = False
+    include_subtasks_in_timeline: bool = False
+    show_epic_stories_on_timeline: bool = False
+    show_subtasks_on_timeline: bool = False
     expand_label_details: bool = True
     show_additional_metrics: bool = True
     show_timeline_chart: bool = True  # include/exclude the Gantt timeline page
     dark_mode: bool = False
+
+
+def collect_child_timeline_dates(
+    child: JiraIssue,
+    tl_starts: list[date],
+    tl_ends: list[date],
+) -> None:
+    """Append timeline date candidates from a child issue into *tl_starts* / *tl_ends*.
+
+    Cascade order: explicit timeline field → sprint dates → start_date/due_date.
+    All eligible sprint dates are appended so callers can take min/max across
+    the full set.  This mirrors the Jira Cloud Timeline behaviour which derives
+    epic ranges from child sprint assignments when no explicit date fields are set.
+
+    Args:
+        child: The child issue whose timeline dates to collect.
+        tl_starts: Accumulator list for timeline start date candidates.
+        tl_ends: Accumulator list for timeline end date candidates.
+    """
+    if child.timeline_start:
+        tl_starts.append(child.timeline_start)
+    else:
+        for sp in child.sprints:
+            if sp.start_date:
+                tl_starts.append(sp.start_date)
+        if child.start_date:
+            tl_starts.append(child.start_date)
+
+    if child.timeline_end:
+        tl_ends.append(child.timeline_end)
+    else:
+        for sp in child.sprints:
+            if sp.end_date:
+                tl_ends.append(sp.end_date)
+        if child.due_date:
+            tl_ends.append(child.due_date)
 
 
 @dataclass

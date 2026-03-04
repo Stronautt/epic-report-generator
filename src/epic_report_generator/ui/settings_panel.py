@@ -17,8 +17,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from epic_report_generator.core.jira_client import JiraClient
 from epic_report_generator.services.auth_manager import AuthManager
-from epic_report_generator.services.config_manager import ConfigManager
+from epic_report_generator.services.config_manager import _DEFAULTS, ConfigManager
 from epic_report_generator.ui.widgets import LabelledField, no_scroll_wheel
 
 logger = logging.getLogger(__name__)
@@ -34,11 +35,13 @@ class SettingsPanel(QWidget):
         self,
         config: ConfigManager,
         auth: AuthManager,
+        jira: JiraClient | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._config = config
         self._auth = auth
+        self._jira = jira
         self._build_ui()
         self._load_values()
 
@@ -94,10 +97,18 @@ class SettingsPanel(QWidget):
         theme_layout.addWidget(self._theme_combo)
         self._root.addWidget(theme_group)
 
-        # Save + Logout
+        # Save + Cache + Logout
         save_btn = QPushButton("Save Settings")
         save_btn.clicked.connect(self._save)
         self._root.addWidget(save_btn)
+
+        cache_btn = QPushButton("Invalidate Cache")
+        cache_btn.setProperty("secondary", "true")
+        cache_btn.setToolTip(
+            "Clear cached Jira field metadata so it is" " re-fetched on next use"
+        )
+        cache_btn.clicked.connect(self._invalidate_cache)
+        self._root.addWidget(cache_btn)
 
         logout_btn = QPushButton("Logout")
         logout_btn.setProperty("danger", "true")
@@ -141,7 +152,7 @@ class SettingsPanel(QWidget):
         self._port_spin = QSpinBox()
         no_scroll_wheel(self._port_spin)
         self._port_spin.setRange(1024, 65535)
-        self._port_spin.setValue(18492)
+        self._port_spin.setValue(int(_DEFAULTS["callback_port"]))
         self._port_spin.setToolTip("Local port for the OAuth callback server")
         oauth_layout.addWidget(self._port_spin)
         self._root.addWidget(self._oauth_group)
@@ -168,15 +179,21 @@ class SettingsPanel(QWidget):
         self._info_email.text = self._config.get("jira_email", "")
         self._client_id.text = self._config.get("client_id", "")
         self._client_secret.text = self._config.get("client_secret", "")
-        self._port_spin.setValue(int(self._config.get("callback_port", 18492)))
+        self._port_spin.setValue(
+            int(self._config.get("callback_port", _DEFAULTS["callback_port"]))
+        )
 
     def _load_values(self) -> None:
         self._load_connection_values()
         self._default_title.text = self._config.get(
-            "default_title", "Epic Progress Report"
+            "default_title", _DEFAULTS["default_title"]
         )
-        self._default_author.text = self._config.get("default_author", "")
-        self._default_company.text = self._config.get("default_company", "")
+        self._default_author.text = self._config.get(
+            "default_author", _DEFAULTS["default_author"]
+        )
+        self._default_company.text = self._config.get(
+            "default_company", _DEFAULTS["default_company"]
+        )
         theme = self._config.get("theme", "light")
         self._theme_combo.setCurrentText(theme.capitalize())
 
@@ -205,6 +222,13 @@ class SettingsPanel(QWidget):
         logger.info("Theme changed to %s", theme)
         self._config.set("theme", theme)
         self.theme_changed.emit(theme)
+
+    def _invalidate_cache(self) -> None:
+        """Clear all Jira client caches."""
+        if self._jira is not None:
+            self._jira.invalidate_caches()
+        logger.info("Caches invalidated")
+        QMessageBox.information(self, "Cache Cleared", "Jira caches have been cleared.")
 
     def _logout(self) -> None:
         reply = QMessageBox.question(

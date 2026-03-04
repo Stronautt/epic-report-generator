@@ -24,6 +24,10 @@ import matplotlib.ticker as mticker  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
+# Minimum pixel gap required between adjacent tick labels / annotation pills
+# before the overlapping one is hidden.
+_LABEL_OVERLAP_GAP_PX = 4
+
 
 def _d2n(d: date) -> float:
     """Convert a single date to a matplotlib float ordinal."""
@@ -295,7 +299,7 @@ def generate_timeline_chart(
     n = len(items)
     natural_height = max(2.5, n * 0.4)
     fig_height = min(natural_height, max_height_inches)
-    epic_bar_height = min(0.85, (fig_height / max(n, 1)) * 1.1)
+    epic_bar_height = min(0.55, (fig_height / max(n, 1)) * 1.1)
     child_bar_height = epic_bar_height * 0.55
     epic_font = max(5.5, min(7.5, epic_bar_height * 12))
     child_font = max(4.5, min(6.0, child_bar_height * 12))
@@ -665,7 +669,7 @@ def _prune_overlapping_tick_labels(ax: Any) -> None:
         if not lbl.get_text():
             continue
         bb = lbl.get_window_extent(renderer)
-        if prev_bb is not None and bb.x0 < prev_bb.x1 + 4:
+        if prev_bb is not None and bb.x0 < prev_bb.x1 + _LABEL_OVERLAP_GAP_PX:
             lbl.set_visible(False)
         else:
             lbl.set_visible(True)
@@ -683,7 +687,7 @@ def _prune_overlapping_annotations(fig: Any, annotations: list[Any]) -> None:
             bb = ann.get_window_extent(renderer)
         except Exception:
             continue
-        if prev_bb is not None and bb.x0 < prev_bb.x1 + 4:
+        if prev_bb is not None and bb.x0 < prev_bb.x1 + _LABEL_OVERLAP_GAP_PX:
             ann.set_visible(False)
         else:
             ann.set_visible(True)

@@ -61,39 +61,23 @@ _LEVEL_COLORS_DARK: dict[int, str] = {
     logging.CRITICAL: "#FF5630",
 }
 
-# Filter button accent colours (used for the checked state)
-_FILTER_ACCENTS: dict[int, str] = {
-    logging.DEBUG: "#8C9CB8",
-    logging.INFO: "#0052CC",
-    logging.WARNING: "#FF8B00",
-    logging.ERROR: "#DE350B",
-}
-
 _MAX_BUFFER = 5000
 
 
-def _build_format_caches() -> (
-    tuple[dict[int, QTextCharFormat], dict[int, QTextCharFormat]]
-):
-    """Pre-build QTextCharFormat objects for each log level and theme."""
-    light: dict[int, QTextCharFormat] = {}
-    dark: dict[int, QTextCharFormat] = {}
-    for level, color in _LEVEL_COLORS.items():
+def _make_fmt_cache(colors: dict[int, str]) -> dict[int, QTextCharFormat]:
+    """Build a mapping of log level → QTextCharFormat from a color palette."""
+    cache: dict[int, QTextCharFormat] = {}
+    for level, color in colors.items():
         fmt = QTextCharFormat()
         fmt.setForeground(QColor(color))
         if level >= logging.WARNING:
             fmt.setFontWeight(QFont.Weight.Bold)
-        light[level] = fmt
-    for level, color in _LEVEL_COLORS_DARK.items():
-        fmt = QTextCharFormat()
-        fmt.setForeground(QColor(color))
-        if level >= logging.WARNING:
-            fmt.setFontWeight(QFont.Weight.Bold)
-        dark[level] = fmt
-    return light, dark
+        cache[level] = fmt
+    return cache
 
 
-_FMT_LIGHT, _FMT_DARK = _build_format_caches()
+_FMT_LIGHT = _make_fmt_cache(_LEVEL_COLORS)
+_FMT_DARK = _make_fmt_cache(_LEVEL_COLORS_DARK)
 
 
 class LogPanel(QWidget):
