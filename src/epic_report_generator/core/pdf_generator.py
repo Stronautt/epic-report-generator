@@ -37,50 +37,10 @@ from epic_report_generator.core.data_models import (
     ReportItem,
     TimelineItem,
     collect_child_timeline_dates,
+    fmt_date_en,
 )
 
 logger = logging.getLogger(__name__)
-
-_MONTHS_ABBR = [
-    "Jan",
-    "Feb",
-    "Mar",
-    "Apr",
-    "May",
-    "Jun",
-    "Jul",
-    "Aug",
-    "Sep",
-    "Oct",
-    "Nov",
-    "Dec",
-]
-
-_MONTHS_FULL = [
-    "January",
-    "February",
-    "March",
-    "April",
-    "May",
-    "June",
-    "July",
-    "August",
-    "September",
-    "October",
-    "November",
-    "December",
-]
-
-
-def _fmt_date(d: date, fmt: str) -> str:
-    """Format a date using English month names regardless of system locale.
-
-    Supports ``%B`` (full month) and ``%b`` (abbreviated month); all other
-    format codes are delegated to :py:meth:`date.strftime`.
-    """
-    result = fmt.replace("%B", _MONTHS_FULL[d.month - 1])
-    result = result.replace("%b", _MONTHS_ABBR[d.month - 1])
-    return d.strftime(result)
 
 
 # Page dimensions: landscape 16:9
@@ -278,7 +238,7 @@ def _create_doc(
             canvas.setFillColor(pal["red"])
             canvas.drawString(MARGIN, y, f"CONFIDENTIAL — {config.company_name}")
             # Right: date and author
-            right_parts = [_fmt_date(config.report_date, "%B %d, %Y")]
+            right_parts = [fmt_date_en(config.report_date, "%B %d, %Y")]
             if config.author:
                 right_parts.append(config.author)
             right_text = "  |  ".join(right_parts)
@@ -420,7 +380,7 @@ def _add_title_page(
         story.append(Spacer(1, 4 * mm))
 
     story.append(
-        Paragraph(_fmt_date(config.report_date, "%B %d, %Y"), styles["subtitle"])
+        Paragraph(fmt_date_en(config.report_date, "%B %d, %Y"), styles["subtitle"])
     )
 
     if config.author:
@@ -1006,7 +966,7 @@ def _build_summary_box(
                     Paragraph("Forecast", styles["metric_label"]),
                     Paragraph(
                         (
-                            _fmt_date(metrics.forecast_date, "%b %d, %Y")
+                            fmt_date_en(metrics.forecast_date, "%b %d, %Y")
                             if metrics.forecast_date
                             else "N/A"
                         ),

@@ -8,6 +8,7 @@ from datetime import date, timedelta
 from typing import Any
 
 from epic_report_generator.core.data_models import (
+    MONTHS_ABBR,
     EpicMetrics,
     MilestoneItem,
     SprintInfo,
@@ -35,22 +36,6 @@ def _d2n(d: date) -> float:
     return float(val)
 
 
-_MONTHS_ABBR = [
-    "Jan",
-    "Feb",
-    "Mar",
-    "Apr",
-    "May",
-    "Jun",
-    "Jul",
-    "Aug",
-    "Sep",
-    "Oct",
-    "Nov",
-    "Dec",
-]
-
-
 class _EnglishDateFormatter(mticker.Formatter):
     """Date formatter that always uses English abbreviated month names.
 
@@ -61,7 +46,7 @@ class _EnglishDateFormatter(mticker.Formatter):
 
     def __call__(self, x: float, pos: int | None = None) -> str:
         dt = mdates.num2date(x)
-        return f"{_MONTHS_ABBR[dt.month - 1]} {dt.day:02d}"
+        return f"{MONTHS_ABBR[dt.month - 1]} {dt.day:02d}"
 
 
 # -- Light theme colour palette ------------------------------------------------
@@ -250,7 +235,7 @@ class _MonthFormatter(mticker.Formatter):
 
     def __call__(self, x: float, pos: int | None = None) -> str:
         dt = mdates.num2date(x)
-        return _MONTHS_ABBR[dt.month - 1]
+        return MONTHS_ABBR[dt.month - 1]
 
 
 class _QuarterFormatter(mticker.Formatter):
@@ -509,8 +494,8 @@ def generate_timeline_chart(
             pill_left = _d2n(sp.start_date)
             pill_right = _d2n(sp.end_date)
             mid_x = pill_left + (pill_right - pill_left) / 2
-            s_lbl = f"{_MONTHS_ABBR[sp.start_date.month - 1]}{sp.start_date.day:02d}"
-            e_lbl = f"{_MONTHS_ABBR[sp.end_date.month - 1]}{sp.end_date.day:02d}"
+            s_lbl = f"{MONTHS_ABBR[sp.start_date.month - 1]}{sp.start_date.day:02d}"
+            e_lbl = f"{MONTHS_ABBR[sp.end_date.month - 1]}{sp.end_date.day:02d}"
             pill_text = f"{s_lbl}-\n{e_lbl}"
             ann = ax.annotate(
                 pill_text,
@@ -752,7 +737,7 @@ def _draw_major_date_labels(
             _emit(
                 _d2n(max(d, min_d)),
                 _d2n(min(nxt, max_d)),
-                f"{_MONTHS_ABBR[d.month - 1]} {d.year}",
+                f"{MONTHS_ABBR[d.month - 1]} {d.year}",
                 draw_sep=not first,
             )
             first = False

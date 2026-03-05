@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from epic_report_generator.core.data_models import (
+    MONTHS_ABBR,
     EpicData,
     EpicMetrics,
     ReportConfig,
@@ -394,7 +395,7 @@ class PreviewPanel(QWidget):
             title_slug = re.sub(r"[^\w-]", "-", self._config.title.strip())
             title_slug = re.sub(r"-{2,}", "-", title_slug).strip("-") or "epic-report"
             rd = self._config.report_date
-            date_str = f"{rd.day}-{rd.strftime('%b')}-{rd.strftime('%y')}"
+            date_str = f"{rd.day}-{MONTHS_ABBR[rd.month - 1]}-{rd.strftime('%y')}"
             default_name = f"{title_slug}-{date_str}.pdf"
         path, _ = QFileDialog.getSaveFileName(
             self, "Export Report", default_name, "PDF Files (*.pdf)"

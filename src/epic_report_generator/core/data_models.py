@@ -6,6 +6,48 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Literal
 
+# Locale-independent English month names — shared across PDF, chart, and UI code.
+MONTHS_ABBR = [
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+]
+
+MONTHS_FULL = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+]
+
+
+def fmt_date_en(d: date, fmt: str) -> str:
+    """Format a date using English month names regardless of system locale.
+
+    Supports ``%B`` (full month) and ``%b`` (abbreviated month); all other
+    format codes are delegated to :py:meth:`date.strftime`.
+    """
+    result = fmt.replace("%B", MONTHS_FULL[d.month - 1])
+    result = result.replace("%b", MONTHS_ABBR[d.month - 1])
+    return d.strftime(result)
+
 
 @dataclass
 class SprintInfo:
