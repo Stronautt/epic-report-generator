@@ -24,6 +24,7 @@ Epic Report Generator is a desktop app that connects to Jira Cloud, pulls Epic p
 - **FR-09. Scope Change Tracking:** The app must calculate and report the percentage of Scope Change to indicate how much an Epic's requirements have grown since its inception.
 - **FR-10. Predictive Forecasting:** Based on current velocity and remaining story points, the system must generate a Forecast Completion Date for each Epic.
 - **FR-11. PDF Report Generation:** The app must compile all tables and charts into a multi-page PDF document.
+- **FR-12. Jira Label Aggregation:** The system must aggregate child issue data (Stories/Tasks) into a high-level "Label Progress Summary" table, including completion percentages. There should be the ability to add a custom display name to each label that will appear in the report.
 
 ## Non-Functional Requirements
 
