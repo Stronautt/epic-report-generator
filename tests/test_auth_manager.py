@@ -7,18 +7,21 @@ import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from epic_report_generator.services.auth_manager import KEYRING_SERVICE, AuthManager
 from epic_report_generator.services.config_manager import ConfigManager
 
 
 def _make_config(tmp_path: Path) -> ConfigManager:
     """Isolated ConfigManager backed by *tmp_path*."""
-    mgr = ConfigManager()
+    import copy
+
+    from epic_report_generator.services.config_manager import _DEFAULTS
+
+    mgr = ConfigManager.__new__(ConfigManager)
     mgr._dir = tmp_path
     mgr._path = tmp_path / "config.json"
-    mgr.reset()
+    mgr._dir_created = False
+    mgr._data = copy.deepcopy(_DEFAULTS)
     return mgr
 
 
@@ -63,14 +66,18 @@ class TestApiTokenAuth:
 
     @patch("epic_report_generator.services.auth_manager.keyring")
     def test_login_api_token_stores_credentials(
-        self, mock_keyring: MagicMock, tmp_path: Path,
+        self,
+        mock_keyring: MagicMock,
+        tmp_path: Path,
     ) -> None:
         cfg = _make_config(tmp_path)
         auth = AuthManager(cfg)
         auth.login_api_token("https://company.atlassian.net", "a@b.com", "tok123")
 
         mock_keyring.set_password.assert_called_once_with(
-            KEYRING_SERVICE, "api_token", "tok123",
+            KEYRING_SERVICE,
+            "api_token",
+            "tok123",
         )
         assert cfg.get("auth_method") == "api_token"
         assert cfg.get("jira_url") == "https://company.atlassian.net"
@@ -80,7 +87,9 @@ class TestApiTokenAuth:
 
     @patch("epic_report_generator.services.auth_manager.keyring")
     def test_get_api_token_delegates_to_keyring(
-        self, mock_keyring: MagicMock, tmp_path: Path,
+        self,
+        mock_keyring: MagicMock,
+        tmp_path: Path,
     ) -> None:
         mock_keyring.get_password.return_value = "secret-tok"
         auth = AuthManager(_make_config(tmp_path))
@@ -104,7 +113,9 @@ class TestGetAccessToken:
 
     @patch("epic_report_generator.services.auth_manager.keyring")
     def test_returns_none_when_no_tokens(
-        self, mock_keyring: MagicMock, tmp_path: Path,
+        self,
+        mock_keyring: MagicMock,
+        tmp_path: Path,
     ) -> None:
         mock_keyring.get_password.return_value = None
         auth = AuthManager(_make_config(tmp_path))
@@ -112,7 +123,9 @@ class TestGetAccessToken:
 
     @patch("epic_report_generator.services.auth_manager.keyring")
     def test_restores_valid_token_from_keyring(
-        self, mock_keyring: MagicMock, tmp_path: Path,
+        self,
+        mock_keyring: MagicMock,
+        tmp_path: Path,
     ) -> None:
         stored = {
             "access_token": "restored",
@@ -167,7 +180,9 @@ class TestLogout:
 
     @patch("epic_report_generator.services.auth_manager.keyring")
     def test_logout_clears_state(
-        self, mock_keyring: MagicMock, tmp_path: Path,
+        self,
+        mock_keyring: MagicMock,
+        tmp_path: Path,
     ) -> None:
         cfg = _make_config(tmp_path)
         cfg.update({"auth_method": "oauth", "cloud_id": "cid", "site_name": "x"})

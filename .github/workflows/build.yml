@@ -8,6 +8,37 @@ on:
 permissions:
   contents: write
 
+env:
+  # Shared Nuitka flags applied on every platform
+  NUITKA_COMMON: >-
+    --standalone
+    --assume-yes-for-downloads
+    --enable-plugin=pyside6
+    --lto=yes
+    --python-flag=no_docstrings
+    --python-flag=no_asserts
+    --python-flag=-m
+    --python-flag=isolated
+    --jobs=4
+    --noinclude-qt-translations
+    --include-qt-plugins=sensible
+    --include-package-data=epic_report_generator.resources
+    --include-package-data=qt_material
+  # Modules to exclude — space-separated, expanded into --nofollow-import-to= flags at build time
+  NUITKA_NOFOLLOW: >-
+    tkinter unittest test distutils
+    ftplib imaplib poplib smtplib telnetlib nntplib
+    sunau wave aifc pydoc doctest lib2to3
+    PySide6.QtWebEngineWidgets PySide6.QtWebEngineCore PySide6.QtWebEngineQuick
+    PySide6.QtMultimedia PySide6.QtMultimediaWidgets
+    PySide6.Qt3DCore PySide6.Qt3DRender PySide6.Qt3DInput PySide6.Qt3DLogic
+    PySide6.Qt3DAnimation PySide6.Qt3DExtras
+    PySide6.QtQuick PySide6.QtQuickWidgets PySide6.QtQml
+    PySide6.QtDataVisualization PySide6.QtCharts PySide6.QtDesigner
+    PySide6.QtHelp PySide6.QtBluetooth PySide6.QtNfc
+    PySide6.QtPositioning PySide6.QtSensors PySide6.QtSerialPort
+    PySide6.QtRemoteObjects PySide6.QtSpatialAudio PySide6.QtTextToSpeech
+
 jobs:
   build:
     strategy:
@@ -15,11 +46,13 @@ jobs:
       matrix:
         include:
           - os: ubuntu-22.04
-            nuitka_ext: ""
-          - os: macos-14
-            nuitka_ext: ""
+            installer_path: "epic-report-generator.AppImage"
+          - os: macos-15
+            installer_path: "epic-report-generator-arm64.dmg"
+          - os: macos-15-intel
+            installer_path: "epic-report-generator-intel.dmg"
           - os: windows-2022
-            nuitka_ext: ".exe"
+            installer_path: "packaging/windows/Output/epic-report-generator-setup.exe"
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -35,13 +68,12 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends \
-            libgl1 libegl1 patchelf libxkbcommon0 libxcb-cursor0
+            libgl1 libegl1 patchelf libxkbcommon0 libxcb-cursor0 fuse libfuse2
 
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
-          pip install build nuitka
+          pip install -e ".[dev]" build "nuitka[onefile]" imageio
 
       - name: Run tests
         run: pytest --tb=short
@@ -49,34 +81,159 @@ jobs:
       - name: Build wheel
         run: python -m build --wheel
 
-      - name: Build Nuitka binary
-        run: >
-          python -m nuitka
-          --standalone
-          --onefile
-          --assume-yes-for-downloads
-          --enable-plugin=pyside6
-          --output-filename=epic-report-generator${{ matrix.nuitka_ext }}
-          src/epic_report_generator/__main__.py
+      - name: Read version from pyproject.toml
+        id: meta
+        shell: bash
+        run: |
+          VERSION=$(python -c "
+          import tomllib, pathlib
+          data = tomllib.loads(pathlib.Path('pyproject.toml').read_text())
+          print(data['project']['version'])
+          ")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Upload wheel
+      - name: Convert PNG to ICO (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          python -c "
+          from PIL import Image
+          img = Image.open('src/epic_report_generator/resources/logo.png')
+          img.save('src/epic_report_generator/resources/logo.ico', sizes=[(16,16),(32,32),(48,48),(256,256)])
+          "
+
+      # Homebrew on Intel places an openssl@3 symlink at /usr/local/lib/libcrypto.dylib
+      # pointing to /usr/local/opt/openssl@3/lib/libcrypto.3.dylib. Nuitka's dependency
+      # scanner cannot reconcile the two paths and aborts with a FATAL error. Unlinking
+      # removes the symlink so the scanner never encounters it. The setup-python Python
+      # ships its own OpenSSL, so nothing else is affected.
+      - name: Unlink Homebrew OpenSSL (macOS Intel)
+        if: matrix.os == 'macos-15-intel'
+        run: brew unlink openssl@3 || true
+
+      - name: Build Nuitka binary
+        shell: bash
+        run: |
+          # Expand nofollow list into individual flags
+          NOFOLLOW_FLAGS=()
+          for mod in $NUITKA_NOFOLLOW; do
+            NOFOLLOW_FLAGS+=("--nofollow-import-to=$mod")
+          done
+
+          # Platform-specific flags
+          case "$RUNNER_OS" in
+            Windows)
+              PLATFORM_FLAGS=(
+                --onefile
+                --windows-console-mode=disable
+                "--windows-icon-from-ico=src/epic_report_generator/resources/logo.ico"
+                "--windows-company-name=Epic Report Generator"
+                "--windows-product-name=Epic Report Generator"
+                "--windows-file-version=${{ steps.meta.outputs.version }}.0"
+                "--windows-product-version=${{ steps.meta.outputs.version }}.0"
+                "--output-filename=epic-report-generator.exe"
+              )
+              ;;
+            macOS)
+              PLATFORM_FLAGS=(
+                --macos-create-app-bundle
+                "--macos-app-name=Epic Report Generator"
+                "--macos-app-icon=src/epic_report_generator/resources/logo.png"
+                "--macos-app-version=${{ steps.meta.outputs.version }}"
+                "--output-filename=epic-report-generator"
+                "--output-dir=."
+              )
+              ;;
+            Linux)
+              PLATFORM_FLAGS=(
+                "--output-filename=epic-report-generator"
+                "--output-dir=."
+              )
+              ;;
+          esac
+
+          # shellcheck disable=SC2086
+          python -m nuitka $NUITKA_COMMON \
+            "${NOFOLLOW_FLAGS[@]}" \
+            "${PLATFORM_FLAGS[@]}" \
+            src/epic_report_generator
+
+          # Nuitka names output dirs after the package name;
+          # rename to the expected names.
+          case "$RUNNER_OS" in
+            Linux)  mv epic_report_generator.dist epic-report-generator.dist ;;
+            macOS)  mv epic_report_generator.app  "Epic Report Generator.app"  ;;
+          esac
+
+      # ── Windows installer ──────────────────────────────────────────
+      - name: Install Inno Setup (Windows)
+        if: runner.os == 'Windows'
+        run: choco install innosetup -y
+
+      - name: Patch Inno Setup version
+        if: runner.os == 'Windows'
+        shell: bash
+        run: sed -i "s/@@VERSION@@/${{ steps.meta.outputs.version }}/g" packaging/windows/setup.iss
+
+      - name: Build Windows installer
+        if: runner.os == 'Windows'
+        run: iscc packaging\windows\setup.iss
+
+      # ── macOS DMG ──────────────────────────────────────────────────
+      - name: Install create-dmg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install create-dmg
+
+      - name: Build macOS DMG
+        if: runner.os == 'macOS'
+        run: |
+          create-dmg \
+            --volname "Epic Report Generator" \
+            --window-size 600 400 \
+            --icon-size 100 \
+            --app-drop-link 450 200 \
+            "${{ matrix.installer_path }}" \
+            "Epic Report Generator.app"
+
+      # ── Linux AppImage ─────────────────────────────────────────────
+      - name: Build Linux AppImage
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p packaging/linux/AppDir/usr/bin
+          cp -r epic-report-generator.dist \
+            packaging/linux/AppDir/usr/bin/epic-report-generator
+          cp src/epic_report_generator/resources/logo.png \
+            packaging/linux/AppDir/epic-report-generator.png
+          wget -q \
+            "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage" \
+            -O appimagetool
+          chmod +x appimagetool
+          ARCH=x86_64 ./appimagetool packaging/linux/AppDir epic-report-generator.AppImage
+
+      - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
-          name: wheel-${{ matrix.os }}
-          path: dist/*.whl
+          name: installer-${{ matrix.os }}
+          path: ${{ matrix.installer_path }}
+          retention-days: 3
 
   release:
-    needs: build
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-22.04
+    needs: build
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download all installer artifacts
+        uses: actions/download-artifact@v4
         with:
-          merge-multiple: true
           path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: find artifacts -type f | sort
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*
           generate_release_notes: true
+          files: |
+            artifacts/**/*

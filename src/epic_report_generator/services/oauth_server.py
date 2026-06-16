@@ -9,6 +9,8 @@ from urllib.parse import parse_qs, urlparse
 
 logger = logging.getLogger(__name__)
 
+_CALLBACK_TIMEOUT_S = 300  # 5 minutes max wait for the browser OAuth flow
+
 _SUCCESS_HTML = """<!DOCTYPE html>
 <html><head><title>Epic Report Generator</title>
 <style>body{font-family:system-ui,sans-serif;display:flex;justify-content:center;
@@ -91,7 +93,7 @@ class OAuthCallbackServer(HTTPServer):
         super().__init__(("127.0.0.1", port), OAuthCallbackHandler)
         self.expected_state = expected_state
         self.result: dict[str, str] | None = None
-        self.timeout = 300  # 5 minutes max wait
+        self.timeout = _CALLBACK_TIMEOUT_S
 
 
 def wait_for_callback(port: int, expected_state: str) -> dict[str, str] | None:
@@ -101,7 +103,11 @@ def wait_for_callback(port: int, expected_state: str) -> dict[str, str] | None:
     The server is started in a daemon thread so callers can cancel
     by shutting it down from another thread.
     """
-    logger.info("Starting OAuth callback server on port %d (timeout=%ds)", port, 300)
+    logger.info(
+        "Starting OAuth callback server on port %d (timeout=%ds)",
+        port,
+        _CALLBACK_TIMEOUT_S,
+    )
     server = OAuthCallbackServer(port, expected_state)
 
     def _serve() -> None:

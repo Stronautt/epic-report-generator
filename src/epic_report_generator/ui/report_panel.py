@@ -1,4 +1,4 @@
-"""Combined Report panel — config (Step 1) + preview (Step 2) in collapsible sections."""
+"""Report panel — config (Step 1) + preview (Step 2) in collapsible sections."""
 
 from __future__ import annotations
 
@@ -91,7 +91,7 @@ class ReportPanel(QWidget):
         root.addStretch(1)
         self._step2.toggled.connect(self._on_step2_toggled)
         # Apply initial stretch state
-        self._on_step2_toggled(self._step2._expanded)
+        self._on_step2_toggled(self._step2.is_expanded())
 
     # -- public API -----------------------------------------------------------
 
@@ -131,7 +131,8 @@ class ReportPanel(QWidget):
         cfg.dark_mode = self._config_mgr.get("theme", "light") == "dark"
         logger.info(
             "Starting report generation: %d epic(s), dark_mode=%s",
-            len(cfg.epic_keys), cfg.dark_mode,
+            len(cfg.epic_keys),
+            cfg.dark_mode,
         )
 
         # Collapse config, expand preview

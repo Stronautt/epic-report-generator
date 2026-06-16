@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "epic-report-generator"
-version = "0.9"
+version = "0.9.5"
 description = "PySide6 desktop app that generates PDF Epic progress reports from Jira Cloud"
 readme = "README.md"
 license = "MIT"
@@ -30,6 +30,7 @@ dependencies = [
     "keyring>=24.0,<26",
     "platformdirs>=3.0,<5",
     "python-dateutil>=2.8,<3",
+    "qt-material>=2.14",
 ]
 
 [project.optional-dependencies]
@@ -46,6 +47,16 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 epic_report_generator = ["resources/**/*"]
+
+[tool.black]
+line-length = 88
+
+[tool.isort]
+profile = "black"
+
+[tool.pyright]
+pythonVersion = "3.10"
+typeCheckingMode = "standard"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

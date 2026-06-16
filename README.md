@@ -7,9 +7,10 @@ Epic Report Generator is a desktop app that connects to Jira Cloud, pulls Epic p
 ## What you get
 
 - **Title page** with project name, date, author, and optional confidentiality notice
-- **Summary table** — one row per Epic with progress bars, story points, issue counts, and assignees
+- **Summary table** — one row per Epic with progress bars, story points, issue counts, assignees, and optional scope-certainty legend
+- **Timeline page** — optional Gantt-style chart showing epic and (optionally) child issue date ranges with milestone markers (included by default; can be excluded via the "Include timeline chart" option)
 - **Per-Epic detail pages** — trend chart (total vs. completed SP, cumulative issues, weekend bands) plus a metrics sidebar (velocity, cycle time, scope change %, forecast date)
-- **Light & Dark themes** — the PDF and the app UI both follow your preference
+- **Light & Dark themes** — Material Design base with app-specific overlays; the PDF and the app UI both follow your preference
 
 ## Functional Requirements
 
@@ -37,20 +38,15 @@ Epic Report Generator is a desktop app that connects to Jira Cloud, pulls Epic p
 
 ### Install from a Release
 
-1. Go to the [Releases](../../releases) page and download the latest `.whl` file
-2. Install it:
-   ```bash
-   pip install epic_report_generator-*.whl
-   ```
-3. Launch:
-   ```bash
-   epic-report-generator
-   ```
+Go to the [Releases](../../releases) page and download the installer for your platform:
 
-> **Linux users** — PySide6 needs a few system libraries:
-> ```bash
-> sudo apt-get install libgl1 libegl1 libxkbcommon0 libxcb-cursor0
-> ```
+| Platform | File | How to install |
+|----------|------|----------------|
+| **Windows** | `epic-report-generator-setup.exe` | Run the installer; creates Start Menu and desktop shortcuts |
+| **macOS** | `epic-report-generator.dmg` | Open the DMG, drag the app to Applications |
+| **Linux** | `epic-report-generator.AppImage` | `chmod +x epic-report-generator.AppImage && ./epic-report-generator.AppImage` |
+
+No Python installation required — the app is fully self-contained.
 
 ### Connect to Jira
 
@@ -69,22 +65,6 @@ On first launch the app walks you through whichever method you choose.
 2. Type your Epic keys (e.g. `PROJ-101`, `PROJ-102`) and press Enter
 3. Click **Generate Report** (or `Ctrl+G`)
 4. Preview the pages, then **Export as PDF** (or `Ctrl+E`)
-
-### Desktop shortcut
-
-After installing, you can add a launcher entry to your OS app menu:
-
-```bash
-epic-report-generator --install-desktop
-```
-
-To remove it later:
-
-```bash
-epic-report-generator --uninstall-desktop
-```
-
-On **Linux** this creates a `.desktop` file in `~/.local/share/applications/` and an icon in `~/.local/share/icons/`. On **macOS** it creates a minimal `.app` bundle in `~/Applications/`. Windows shortcuts are handled by the installer.
 
 ## Keyboard shortcuts
 
@@ -114,19 +94,39 @@ pytest
 python -m build --wheel
 ```
 
-## How the progress formula works
+## Estimation methods
 
-```
-progress = (completed_sp / total_sp) × (closed_issues / total_issues) × 100
-```
+The app supports two ways to measure issue effort:
 
-- If no story points exist, falls back to issue-count ratio
+| Method | When to use | How it works |
+|--------|-------------|--------------|
+| **Story Points** (default) | Teams that estimate in SP | Reads the Story Points field from each issue |
+| **Time — Days** | Teams using Jira Timeline with start/due dates | Calculates `(due_date - start_date)` in calendar days |
+
+Switch between them in **Report → Custom Field Mapping → Estimation Method**. When "Time — Days" is selected, you can configure which Jira fields hold the start and due dates (defaults: `startdate` / `duedate`).
+
+## How progress works
+
+Progress is computed **bottom-up** through the issue hierarchy:
+
+- **Leaf issues** get 100 % if Done, 0 % otherwise, weighted by their estimate (SP or days)
+- **Parent issues** with subtasks aggregate their subtask progress via weighted average
+- **Epic progress** is the weighted average of its direct children's progress
+
+Three progress methods are available:
+
+| Method | Formula |
+|--------|---------|
+| **Combined** (default) | Bottom-up weighted average × (done issues / total issues) |
+| **Issues Only** | Bottom-up weighted average with weight = 1.0 for every item |
+| **Estimates Only** | Bottom-up weighted average using estimates as weights, without issue-count ratio; unestimated items excluded |
+
 - If there are no issues, progress is 0 %
 - Result is clamped to 0–100 %
 
 ## Tech stack
 
-PySide6 · ReportLab · matplotlib · jira · keyring · platformdirs · pandas
+PySide6 · qt-material · ReportLab · matplotlib · jira · keyring · platformdirs · pandas
 
 ## License
 

@@ -1,174 +1,78 @@
-"""QSS stylesheets for light and dark themes."""
+"""App-specific QSS overlays applied on top of the qt-material base theme.
+
+The base Material Design theme (light_blue / dark_blue) is applied via
+``qt_material.apply_stylesheet`` in the main window.  These stylesheets
+contain only app-specific overrides (object-name and property selectors)
+that complement the material base.
+
+Usage:  apply COMMON_THEME first, then the appropriate LIGHT_THEME or
+DARK_THEME on top.  All three are applied at the window level.
+"""
 
 from __future__ import annotations
 
-LIGHT_THEME = """
-QMainWindow, QWidget {
-    background-color: #FFFFFF;
-    color: #172B4D;
-    font-family: "Segoe UI", "SF Pro Display", "Helvetica Neue", sans-serif;
-    font-size: 13px;
-}
+# ---------------------------------------------------------------------------
+# Shared structural rules — theme-independent (no color values)
+# ---------------------------------------------------------------------------
 
-/* Sidebar */
-#sidebar {
-    background-color: #F4F5F7;
-    border-right: 1px solid #DFE1E6;
-}
+COMMON_THEME = """
+/* ── Sidebar nav buttons — layout/sizing ────────────────────────── */
 #sidebar QPushButton {
     background: transparent;
     border: none;
     border-radius: 6px;
     padding: 10px 16px;
     text-align: left;
-    color: #505F79;
-    font-size: 13px;
-}
-#sidebar QPushButton:hover {
-    background-color: #EBECF0;
-}
-#sidebar QPushButton:checked {
-    background-color: #DEEBFF;
-    color: #0052CC;
-    font-weight: 600;
-}
-
-/* Buttons */
-QPushButton {
-    background-color: #0052CC;
-    color: white;
-    border: none;
-    border-radius: 4px;
-    padding: 8px 16px;
     font-size: 13px;
     font-weight: 500;
 }
-QPushButton:hover {
-    background-color: #0065FF;
+#sidebar QPushButton:checked {
+    font-weight: 600;
 }
-QPushButton:pressed {
-    background-color: #0747A6;
+#sidebar QPushButton:disabled {
+    background: transparent;
 }
-QPushButton:disabled {
-    background-color: #F4F5F7;
-    color: #A5ADBA;
-}
-QPushButton[secondary="true"] {
-    background-color: transparent;
-    color: #0052CC;
-    border: 1px solid #0052CC;
-}
-QPushButton[secondary="true"]:hover {
-    background-color: #DEEBFF;
-}
+
+/* ── Danger button — identical in both themes ────────────────────── */
 QPushButton[danger="true"] {
-    background-color: #DE350B;
+    background-color: #e53935;
+    color: white;
+    border: none;
 }
 QPushButton[danger="true"]:hover {
-    background-color: #FF5630;
+    background-color: #ef5350;
 }
 
-/* Inputs */
-QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QComboBox {
-    border: 1px solid #DFE1E6;
-    border-radius: 4px;
-    padding: 6px 10px;
-    background: #FAFBFC;
-    color: #172B4D;
-    font-size: 13px;
+/* ── Secondary button — layout ──────────────────────────────────── */
+QPushButton[secondary="true"] {
+    background-color: transparent;
 }
-QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus {
-    border-color: #4C9AFF;
-    background: #FFFFFF;
+QPushButton[secondary="true"]:disabled {
+    background: transparent;
 }
 
-/* Labels */
-QLabel {
-    color: #172B4D;
-}
+/* ── Labels — heading / subheading — sizing ─────────────────────── */
 QLabel[heading="true"] {
     font-size: 20px;
     font-weight: 600;
-    color: #172B4D;
 }
 QLabel[subheading="true"] {
     font-size: 11px;
-    color: #6B778C;
 }
-
-/* Checkbox */
-QCheckBox {
-    spacing: 8px;
-    color: #172B4D;
-}
-
-/* Progress bar */
-QProgressBar {
-    border: none;
-    border-radius: 4px;
-    background: #DFE1E6;
-    text-align: center;
-    height: 8px;
-    color: transparent;
-}
-QProgressBar::chunk {
-    background: #0052CC;
-    border-radius: 4px;
-}
-
-/* Scroll area */
-QScrollArea {
-    border: none;
-}
-
-/* Tab widget */
-QTabWidget::pane {
-    border: none;
-    background: transparent;
-}
-QTabBar::tab {
-    background: transparent;
-    border: none;
-    border-bottom: 2px solid transparent;
-    padding: 8px 20px;
-    color: #505F79;
+QLabel[sectionTitle="true"] {
     font-size: 13px;
-    font-weight: 500;
+    font-weight: 600;
 }
-QTabBar::tab:hover {
-    color: #172B4D;
-    border-bottom-color: #DFE1E6;
+QLabel[hint="true"] {
+    font-size: 10px;
 }
-QTabBar::tab:selected {
-    color: #0052CC;
-    border-bottom-color: #0052CC;
+
+/* ── Status indicator ───────────────────────────────────────────── */
+QLabel[status="connected"] {
     font-weight: 600;
 }
 
-/* Group box */
-QGroupBox {
-    font-weight: 600;
-    border: 1px solid #DFE1E6;
-    border-radius: 6px;
-    margin-top: 12px;
-    padding-top: 16px;
-}
-QGroupBox::title {
-    subcontrol-origin: margin;
-    left: 12px;
-    padding: 0 6px;
-    color: #172B4D;
-}
-
-/* Date edit */
-QDateEdit {
-    border: 1px solid #DFE1E6;
-    border-radius: 4px;
-    padding: 6px 10px;
-    background: #FAFBFC;
-}
-
-/* Guide step header */
+/* ── Guide step header — layout/sizing ──────────────────────────── */
 #guideStepHeader {
     text-align: left;
     background: transparent;
@@ -177,431 +81,400 @@ QDateEdit {
     padding: 8px 4px;
     font-weight: 600;
     font-size: 13px;
-    color: #172B4D;
 }
-#guideStepHeader:hover {
-    background-color: #EBECF0;
+#guideStepHeader:checked,
+#guideStepHeader:pressed {
+    background: transparent;
 }
 
-/* Log filter buttons */
+/* ── Log filter buttons — layout/sizing ─────────────────────────── */
 #logFilterBtn {
     background: transparent;
-    border: 1px solid #DFE1E6;
     border-radius: 12px;
     padding: 4px 12px;
     font-size: 11px;
     font-weight: 500;
-    color: #6B778C;
     min-width: 56px;
-}
-#logFilterBtn:hover {
-    background: #EBECF0;
 }
 #logFilterBtn:checked {
     border-color: transparent;
-    color: #FFFFFF;
-}
-#logFilterBtn[level="debug"]:checked {
-    background: #8C9CB8;
-}
-#logFilterBtn[level="info"]:checked {
-    background: #0052CC;
-}
-#logFilterBtn[level="warning"]:checked {
-    background: #FF8B00;
-}
-#logFilterBtn[level="error"]:checked {
-    background: #DE350B;
+    color: #ffffff;
 }
 
-/* Status indicator */
-QLabel[status="connected"] {
-    color: #36B37E;
-    font-weight: 600;
-}
-QLabel[status="disconnected"] {
-    color: #DE350B;
-}
-
-/* Collapsible section header */
+/* ── Collapsible section header — layout/sizing ─────────────────── */
 #collapsibleHeader {
     text-align: left;
     background: transparent;
     border: none;
-    border-bottom: 1px solid #DFE1E6;
     border-radius: 0;
     padding: 10px 4px;
     font-weight: 600;
     font-size: 14px;
-    color: #172B4D;
 }
-#collapsibleHeader:hover {
-    background-color: #EBECF0;
+#collapsibleHeader:checked,
+#collapsibleHeader:pressed {
+    background: transparent;
 }
 
-/* Epic key chip */
+/* ── Epic key chips — layout/sizing ─────────────────────────────── */
 #epicKeyChip {
-    background-color: #DEEBFF;
-    border: 1px solid #B3D4FF;
     border-radius: 12px;
     padding: 0;
-    color: #0052CC;
     font-size: 12px;
 }
 #epicKeyChipClose {
     background: transparent;
     border: none;
     border-radius: 9px;
-    color: #0052CC;
     font-size: 14px;
     font-weight: bold;
     padding: 0;
 }
-#epicKeyChipClose:hover {
-    background-color: #B3D4FF;
-}
 
-/* Epic key tag input container */
+/* ── Epic key tag input container — layout/sizing ───────────────── */
 #epicKeyTagInput {
-    border: 1px solid #DFE1E6;
     border-radius: 4px;
-    background: #FAFBFC;
     min-height: 40px;
 }
-#epicKeyTagInput:focus-within {
-    border-color: #4C9AFF;
-    background: #FFFFFF;
+
+/* ── Profile bar — layout ───────────────────────────────────────── */
+#profileBar {
+    padding-bottom: 8px;
 }
 
-/* Sidebar user info */
-#sidebarUserInfo {
-    border-top: 1px solid #DFE1E6;
-}
+/* ── Sidebar user info — layout/sizing ──────────────────────────── */
 #sidebarAvatar {
-    background: #DEEBFF;
     border-radius: 16px;
     font-size: 13px;
     font-weight: 600;
-    color: #0052CC;
 }
 #sidebarUserName {
     font-weight: 600;
     font-size: 12px;
-    color: #172B4D;
     background: transparent;
 }
 #sidebarSiteName {
     font-size: 11px;
-    color: #6B778C;
     background: transparent;
 }
 #sidebarAuthBadge {
     font-size: 10px;
-    color: #6B778C;
     background: transparent;
     border: none;
 }
 #sidebarLogoutBtn {
     background: transparent;
     border: none;
-    color: #6B778C;
     font-size: 11px;
     font-weight: 500;
     padding: 0;
     text-decoration: none;
-}
-#sidebarLogoutBtn:hover {
-    color: #DE350B;
 }
 """
 
-DARK_THEME = """
-QMainWindow, QWidget {
-    background-color: #1B2638;
-    color: #B8C7E0;
-    font-family: "Segoe UI", "SF Pro Display", "Helvetica Neue", sans-serif;
-    font-size: 13px;
-}
+# ---------------------------------------------------------------------------
+# Light theme overlay — color overrides only
+# ---------------------------------------------------------------------------
 
+LIGHT_THEME = """
+/* ── Sidebar ─────────────────────────────────────────────────────── */
 #sidebar {
-    background-color: #0D1424;
-    border-right: 1px solid #1B2638;
+    background-color: #e8eaf0;
+    border-right: 1px solid #d0d4dc;
 }
 #sidebar QPushButton {
-    background: transparent;
-    border: none;
-    border-radius: 6px;
-    padding: 10px 16px;
-    text-align: left;
-    color: #8C9CB8;
-    font-size: 13px;
+    color: #555555;
 }
 #sidebar QPushButton:hover {
-    background-color: #1B2638;
+    background-color: #dcdfe5;
 }
 #sidebar QPushButton:checked {
-    background-color: #0D2137;
-    color: #4C9AFF;
-    font-weight: 600;
+    background-color: #d4e4ff;
+    color: #2979ff;
+}
+#sidebar QPushButton:disabled {
+    color: #aaaaaa;
 }
 
-QPushButton {
-    background-color: #0052CC;
-    color: white;
-    border: none;
-    border-radius: 4px;
-    padding: 8px 16px;
-    font-size: 13px;
-    font-weight: 500;
-}
-QPushButton:hover {
-    background-color: #0065FF;
-}
-QPushButton:pressed {
-    background-color: #0747A6;
-}
-QPushButton:disabled {
-    background-color: #1B2638;
-    color: #505F79;
-}
+/* ── Buttons — property variants ────────────────────────────────── */
 QPushButton[secondary="true"] {
-    background-color: transparent;
-    color: #4C9AFF;
-    border: 1px solid #4C9AFF;
+    color: #2979ff;
+    border: 1px solid #2979ff;
 }
-QPushButton[danger="true"] {
-    background-color: #DE350B;
+QPushButton[secondary="true"]:hover {
+    background-color: #e3f0ff;
 }
-
-QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QComboBox {
-    border: 1px solid #2C3E5D;
-    border-radius: 4px;
-    padding: 6px 10px;
-    background: #0D1424;
-    color: #B8C7E0;
-    font-size: 13px;
-}
-QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus {
-    border-color: #4C9AFF;
+QPushButton[secondary="true"]:disabled {
+    color: #aaaaaa;
+    border-color: #cccccc;
 }
 
-QLabel {
-    color: #B8C7E0;
-}
+/* ── Labels — heading / subheading ──────────────────────────────── */
 QLabel[heading="true"] {
-    font-size: 20px;
-    font-weight: 600;
+    color: #212121;
 }
 QLabel[subheading="true"] {
-    font-size: 11px;
-    color: #8C9CB8;
+    color: #757575;
+}
+QLabel[sectionTitle="true"] {
+    color: #424242;
+}
+QLabel[hint="true"] {
+    color: #9e9e9e;
 }
 
-QCheckBox {
-    spacing: 8px;
-    color: #B8C7E0;
-}
-
-QProgressBar {
-    border: none;
-    border-radius: 4px;
-    background: #2C3E5D;
-    text-align: center;
-    height: 8px;
-    color: transparent;
-}
-QProgressBar::chunk {
-    background: #4C9AFF;
-    border-radius: 4px;
-}
-
-QScrollArea {
-    border: none;
-}
-
-/* Tab widget */
-QTabWidget::pane {
-    border: none;
-    background: transparent;
-}
-QTabBar::tab {
-    background: transparent;
-    border: none;
-    border-bottom: 2px solid transparent;
-    padding: 8px 20px;
-    color: #8C9CB8;
-    font-size: 13px;
-    font-weight: 500;
-}
-QTabBar::tab:hover {
-    color: #B8C7E0;
-    border-bottom-color: #2C3E5D;
-}
-QTabBar::tab:selected {
-    color: #4C9AFF;
-    border-bottom-color: #4C9AFF;
-    font-weight: 600;
-}
-
-QGroupBox {
-    font-weight: 600;
-    border: 1px solid #2C3E5D;
-    border-radius: 6px;
-    margin-top: 12px;
-    padding-top: 16px;
-}
-QGroupBox::title {
-    subcontrol-origin: margin;
-    left: 12px;
-    padding: 0 6px;
-    color: #B8C7E0;
-}
-
-QDateEdit {
-    border: 1px solid #2C3E5D;
-    border-radius: 4px;
-    padding: 6px 10px;
-    background: #0D1424;
-}
-
-#guideStepHeader {
-    text-align: left;
-    background: transparent;
-    border: none;
-    border-radius: 4px;
-    padding: 8px 4px;
-    font-weight: 600;
-    font-size: 13px;
-    color: #B8C7E0;
-}
-#guideStepHeader:hover {
-    background-color: #2C3E5D;
-}
-
-/* Log filter buttons */
-#logFilterBtn {
-    background: transparent;
-    border: 1px solid #2C3E5D;
-    border-radius: 12px;
-    padding: 4px 12px;
-    font-size: 11px;
-    font-weight: 500;
-    color: #8C9CB8;
-    min-width: 56px;
-}
-#logFilterBtn:hover {
-    background: #2C3E5D;
-}
-#logFilterBtn:checked {
-    border-color: transparent;
-    color: #FFFFFF;
-}
-#logFilterBtn[level="debug"]:checked {
-    background: #6B778C;
-}
-#logFilterBtn[level="info"]:checked {
-    background: #0052CC;
-}
-#logFilterBtn[level="warning"]:checked {
-    background: #FFAB00;
-    color: #172B4D;
-}
-#logFilterBtn[level="error"]:checked {
-    background: #FF5630;
-}
-
+/* ── Status indicator ───────────────────────────────────────────── */
 QLabel[status="connected"] {
-    color: #36B37E;
-    font-weight: 600;
+    color: #43a047;
 }
 QLabel[status="disconnected"] {
-    color: #FF5630;
+    color: #e53935;
 }
 
-/* Collapsible section header */
+/* ── Guide step header ──────────────────────────────────────────── */
+#guideStepHeader {
+    color: #212121;
+}
+#guideStepHeader:checked,
+#guideStepHeader:pressed {
+    color: #212121;
+}
+#guideStepHeader:hover {
+    background-color: #e0e0e0;
+    color: #212121;
+}
+
+/* ── Log filter buttons ─────────────────────────────────────────── */
+#logFilterBtn {
+    border: 1px solid #d0d4dc;
+    color: #757575;
+}
+#logFilterBtn:hover {
+    background: #e0e0e0;
+}
+#logFilterBtn[level="debug"]:checked {
+    background: #90a4ae;
+}
+#logFilterBtn[level="info"]:checked {
+    background: #2979ff;
+}
+#logFilterBtn[level="warning"]:checked {
+    background: #ff8f00;
+}
+#logFilterBtn[level="error"]:checked {
+    background: #e53935;
+}
+
+/* ── Collapsible section header ─────────────────────────────────── */
 #collapsibleHeader {
-    text-align: left;
-    background: transparent;
-    border: none;
-    border-bottom: 1px solid #2C3E5D;
-    border-radius: 0;
-    padding: 10px 4px;
-    font-weight: 600;
-    font-size: 14px;
-    color: #B8C7E0;
+    border-bottom: 1px solid #d0d4dc;
+    color: #212121;
+}
+#collapsibleHeader:checked,
+#collapsibleHeader:pressed {
+    color: #212121;
 }
 #collapsibleHeader:hover {
-    background-color: #2C3E5D;
+    background-color: #e0e0e0;
+    color: #212121;
 }
 
-/* Epic key chip */
+/* ── Epic key chips ─────────────────────────────────────────────── */
 #epicKeyChip {
-    background-color: #0D2137;
-    border: 1px solid #0747A6;
-    border-radius: 12px;
-    padding: 0;
-    color: #4C9AFF;
-    font-size: 12px;
+    background-color: #e3f0ff;
+    border: 1px solid #b3d4ff;
+    color: #2979ff;
 }
 #epicKeyChipClose {
-    background: transparent;
-    border: none;
-    border-radius: 9px;
-    color: #4C9AFF;
-    font-size: 14px;
-    font-weight: bold;
-    padding: 0;
+    color: #2979ff;
 }
 #epicKeyChipClose:hover {
-    background-color: #0747A6;
+    background-color: #b3d4ff;
 }
 
-/* Epic key tag input container */
+/* ── Epic key tag input container ───────────────────────────────── */
 #epicKeyTagInput {
-    border: 1px solid #2C3E5D;
-    border-radius: 4px;
-    background: #0D1424;
-    min-height: 40px;
+    border: 1px solid #d0d4dc;
+    background: #fafafa;
 }
 
-/* Sidebar user info */
+/* ── Profile bar ────────────────────────────────────────────────── */
+#profileBar {
+    border-bottom: 1px solid #d0d4dc;
+}
+
+/* ── Sidebar user info ──────────────────────────────────────────── */
 #sidebarUserInfo {
-    border-top: 1px solid #2C3E5D;
+    border-top: 1px solid #d0d4dc;
 }
 #sidebarAvatar {
-    background: #0D2137;
-    border-radius: 16px;
-    font-size: 13px;
-    font-weight: 600;
-    color: #4C9AFF;
+    background: #d4e4ff;
+    color: #2979ff;
 }
 #sidebarUserName {
-    font-weight: 600;
-    font-size: 12px;
-    color: #B8C7E0;
-    background: transparent;
+    color: #212121;
 }
 #sidebarSiteName {
-    font-size: 11px;
-    color: #8C9CB8;
-    background: transparent;
+    color: #757575;
 }
 #sidebarAuthBadge {
-    font-size: 10px;
-    color: #8C9CB8;
-    background: transparent;
-    border: none;
+    color: #757575;
 }
 #sidebarLogoutBtn {
-    background: transparent;
-    border: none;
-    color: #8C9CB8;
-    font-size: 11px;
-    font-weight: 500;
-    padding: 0;
-    text-decoration: none;
+    color: #757575;
 }
 #sidebarLogoutBtn:hover {
-    color: #FF5630;
+    color: #e53935;
+}
+"""
+
+# ---------------------------------------------------------------------------
+# Dark theme overlay — color overrides only
+# ---------------------------------------------------------------------------
+
+DARK_THEME = """
+/* ── Sidebar ─────────────────────────────────────────────────────── */
+#sidebar {
+    background-color: #1a1d21;
+    border-right: 1px solid #2c2f33;
+}
+#sidebar QPushButton {
+    color: #9e9e9e;
+}
+#sidebar QPushButton:hover {
+    background-color: #2c2f33;
+}
+#sidebar QPushButton:checked {
+    background-color: #1a2744;
+    color: #448aff;
+}
+#sidebar QPushButton:disabled {
+    color: #555555;
+}
+
+/* ── Buttons — property variants ────────────────────────────────── */
+QPushButton[secondary="true"] {
+    color: #448aff;
+    border: 1px solid #448aff;
+}
+QPushButton[secondary="true"]:hover {
+    background-color: #1a2744;
+}
+QPushButton[secondary="true"]:disabled {
+    color: #555555;
+    border-color: #444444;
+}
+
+/* ── Labels — heading / subheading ──────────────────────────────── */
+QLabel[subheading="true"] {
+    color: #9e9e9e;
+}
+QLabel[sectionTitle="true"] {
+    color: #e0e0e0;
+}
+QLabel[hint="true"] {
+    color: #757575;
+}
+
+/* ── Status indicator ───────────────────────────────────────────── */
+QLabel[status="connected"] {
+    color: #66bb6a;
+}
+QLabel[status="disconnected"] {
+    color: #ef5350;
+}
+
+/* ── Guide step header ──────────────────────────────────────────── */
+#guideStepHeader {
+    color: #ffffff;
+}
+#guideStepHeader:checked,
+#guideStepHeader:pressed {
+    color: #ffffff;
+}
+#guideStepHeader:hover {
+    background-color: #3a3d41;
+    color: #ffffff;
+}
+
+/* ── Log filter buttons ─────────────────────────────────────────── */
+#logFilterBtn {
+    border: 1px solid #3a3d41;
+    color: #9e9e9e;
+}
+#logFilterBtn:hover {
+    background: #3a3d41;
+}
+#logFilterBtn[level="debug"]:checked {
+    background: #78909c;
+}
+#logFilterBtn[level="info"]:checked {
+    background: #448aff;
+}
+#logFilterBtn[level="warning"]:checked {
+    background: #ffab00;
+    color: #212121;
+}
+#logFilterBtn[level="error"]:checked {
+    background: #ef5350;
+}
+
+/* ── Collapsible section header ─────────────────────────────────── */
+#collapsibleHeader {
+    border-bottom: 1px solid #3a3d41;
+    color: #ffffff;
+}
+#collapsibleHeader:checked,
+#collapsibleHeader:pressed {
+    color: #ffffff;
+}
+#collapsibleHeader:hover {
+    background-color: #3a3d41;
+    color: #ffffff;
+}
+
+/* ── Epic key chips ─────────────────────────────────────────────── */
+#epicKeyChip {
+    background-color: #1a2744;
+    border: 1px solid #1e3a5f;
+    color: #448aff;
+}
+#epicKeyChipClose {
+    color: #448aff;
+}
+#epicKeyChipClose:hover {
+    background-color: #1e3a5f;
+}
+
+/* ── Epic key tag input container ───────────────────────────────── */
+#epicKeyTagInput {
+    border: 1px solid #3a3d41;
+    background: #1a1d21;
+}
+
+/* ── Profile bar ────────────────────────────────────────────────── */
+#profileBar {
+    border-bottom: 1px solid #3a3d41;
+}
+
+/* ── Sidebar user info ──────────────────────────────────────────── */
+#sidebarUserInfo {
+    border-top: 1px solid #3a3d41;
+}
+#sidebarAvatar {
+    background: #1a2744;
+    color: #448aff;
+}
+#sidebarSiteName {
+    color: #9e9e9e;
+}
+#sidebarAuthBadge {
+    color: #9e9e9e;
+}
+#sidebarLogoutBtn {
+    color: #9e9e9e;
+}
+#sidebarLogoutBtn:hover {
+    color: #ef5350;
 }
 """

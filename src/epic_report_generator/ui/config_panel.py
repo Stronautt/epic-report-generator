@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from datetime import date
 
-from PySide6.QtCore import QDate, Signal
+from PySide6.QtCore import QDate, QObject, Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -23,15 +23,36 @@ from PySide6.QtWidgets import (
 
 from epic_report_generator.core.data_models import ReportConfig
 from epic_report_generator.core.jira_client import JiraClient
-from epic_report_generator.services.config_manager import ConfigManager
+from epic_report_generator.services.config_manager import _DEFAULTS, ConfigManager
 from epic_report_generator.ui.widgets import (
-    CollapsibleSection,
-    EpicKeyTagInput,
-    LabelledField,
     RE_EPIC_KEY,
+    CollapsibleSection,
+    LabelledField,
+    ProfileBar,
+    ReportItemTable,
+    no_scroll_wheel,
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _JiraCallWorker(QObject):
+    """Run a callable in a background QThread and emit the result."""
+
+    finished = Signal(object)  # result of the callable
+
+    def __init__(self, fn: object) -> None:
+        super().__init__()
+        self._fn = fn
+
+    def run(self) -> None:
+        """Execute the callable and emit the result."""
+        try:
+            result = self._fn()  # type: ignore[operator]
+        except Exception as exc:
+            logger.warning("Background Jira call failed: %s", exc)
+            result = exc
+        self.finished.emit(result)
 
 
 class FieldPickerDialog(QDialog):
@@ -42,6 +63,13 @@ class FieldPickerDialog(QDialog):
         sp_candidates: list[dict],
         epic_candidates: list[dict],
         parent: QWidget | None = None,
+        *,
+        estimation_method: str = "story_points",
+        start_date_candidates: list[dict] | None = None,
+        due_date_candidates: list[dict] | None = None,
+        timeline_start_candidates: list[dict] | None = None,
+        timeline_end_candidates: list[dict] | None = None,
+        current_values: dict[str, str] | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Select Jira Fields")
@@ -49,28 +77,112 @@ class FieldPickerDialog(QDialog):
 
         layout = QFormLayout(self)
 
+        self._estimation_method = estimation_method
+        cv = current_values or {}
+
+        # Story Points field (only shown for story_points method)
         self._sp_combo = QComboBox()
-        if sp_candidates:
-            for f in sp_candidates:
-                self._sp_combo.addItem(f"{f['name']}  \u2014  {f['id']}", userData=f["id"])
-        else:
-            self._sp_combo.addItem("(No matches found)")
-            self._sp_combo.setEnabled(False)
-        layout.addRow("Story Points Field:", self._sp_combo)
+        no_scroll_wheel(self._sp_combo)
+        if estimation_method == "story_points":
+            if sp_candidates:
+                for f in sp_candidates:
+                    self._sp_combo.addItem(
+                        f"{f['name']}  —  {f['id']}", userData=f["id"]
+                    )
+                self._select_current(self._sp_combo, cv.get("story_points_field"))
+            else:
+                self._sp_combo.addItem("(No matches found)")
+                self._sp_combo.setEnabled(False)
+            layout.addRow("Story Points Field:", self._sp_combo)
+
+        # Date fields (only shown for time_days method)
+        self._start_date_combo = QComboBox()
+        no_scroll_wheel(self._start_date_combo)
+        self._due_date_combo = QComboBox()
+        no_scroll_wheel(self._due_date_combo)
+        if estimation_method == "time_days":
+            start_candidates = start_date_candidates or []
+            due_candidates = due_date_candidates or []
+            if start_candidates:
+                for f in start_candidates:
+                    self._start_date_combo.addItem(
+                        f"{f['name']}  —  {f['id']}", userData=f["id"]
+                    )
+                self._select_current(self._start_date_combo, cv.get("start_date_field"))
+            else:
+                self._start_date_combo.addItem("(No matches found)")
+                self._start_date_combo.setEnabled(False)
+            layout.addRow("Start Date Field:", self._start_date_combo)
+
+            if due_candidates:
+                for f in due_candidates:
+                    self._due_date_combo.addItem(
+                        f"{f['name']}  —  {f['id']}", userData=f["id"]
+                    )
+                self._select_current(self._due_date_combo, cv.get("due_date_field"))
+            else:
+                self._due_date_combo.addItem("(No matches found)")
+                self._due_date_combo.setEnabled(False)
+            layout.addRow("Due Date Field:", self._due_date_combo)
 
         self._epic_combo = QComboBox()
+        no_scroll_wheel(self._epic_combo)
         if epic_candidates:
             for f in epic_candidates:
-                self._epic_combo.addItem(f"{f['name']}  \u2014  {f['id']}", userData=f["id"])
+                self._epic_combo.addItem(f"{f['name']}  —  {f['id']}", userData=f["id"])
+            self._select_current(self._epic_combo, cv.get("epic_link_field"))
         else:
             self._epic_combo.addItem("(No matches found)")
             self._epic_combo.setEnabled(False)
         layout.addRow("Epic Link Field:", self._epic_combo)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        # Timeline fields (always shown)
+        tl_start = timeline_start_candidates or []
+        tl_end = timeline_end_candidates or []
+
+        self._timeline_start_combo = QComboBox()
+        no_scroll_wheel(self._timeline_start_combo)
+        if tl_start:
+            for f in tl_start:
+                self._timeline_start_combo.addItem(
+                    f"{f['name']}  —  {f['id']}", userData=f["id"]
+                )
+            self._select_current(
+                self._timeline_start_combo, cv.get("timeline_start_field")
+            )
+        else:
+            self._timeline_start_combo.addItem("(No matches found)")
+            self._timeline_start_combo.setEnabled(False)
+        layout.addRow("Timeline Start Field:", self._timeline_start_combo)
+
+        self._timeline_end_combo = QComboBox()
+        no_scroll_wheel(self._timeline_end_combo)
+        if tl_end:
+            for f in tl_end:
+                self._timeline_end_combo.addItem(
+                    f"{f['name']}  —  {f['id']}", userData=f["id"]
+                )
+            self._select_current(self._timeline_end_combo, cv.get("timeline_end_field"))
+        else:
+            self._timeline_end_combo.addItem("(No matches found)")
+            self._timeline_end_combo.setEnabled(False)
+        layout.addRow("Timeline End Field:", self._timeline_end_combo)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addRow(buttons)
+
+    @staticmethod
+    def _select_current(combo: QComboBox, value: str | None) -> None:
+        """Pre-select the combo item matching *value* (by userData)."""
+        if not value:
+            return
+        idx = combo.findData(value)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
 
     @property
     def selected_sp_field(self) -> str | None:
@@ -86,6 +198,34 @@ class FieldPickerDialog(QDialog):
             return None
         return self._epic_combo.currentData()
 
+    @property
+    def selected_start_date_field(self) -> str | None:
+        """Return the selected Start Date field ID, or None if unavailable."""
+        if not self._start_date_combo.isEnabled():
+            return None
+        return self._start_date_combo.currentData()
+
+    @property
+    def selected_due_date_field(self) -> str | None:
+        """Return the selected Due Date field ID, or None if unavailable."""
+        if not self._due_date_combo.isEnabled():
+            return None
+        return self._due_date_combo.currentData()
+
+    @property
+    def selected_timeline_start_field(self) -> str | None:
+        """Return the selected Timeline Start field ID, or None if unavailable."""
+        if not self._timeline_start_combo.isEnabled():
+            return None
+        return self._timeline_start_combo.currentData()
+
+    @property
+    def selected_timeline_end_field(self) -> str | None:
+        """Return the selected Timeline End field ID, or None if unavailable."""
+        if not self._timeline_end_combo.isEnabled():
+            return None
+        return self._timeline_end_combo.currentData()
+
 
 class ConfigPanel(QWidget):
     """Report configuration UI with epic key tags, metadata, and field mapping."""
@@ -99,26 +239,52 @@ class ConfigPanel(QWidget):
         super().__init__(parent)
         self._config = config
         self._jira = jira
+        self._persisting = False  # guard against saves during init/restore
+        self._labels_fetched = False
+        self._bg_threads: list[QThread] = []
+        self._bg_workers: list[_JiraCallWorker] = []
+        self._bg_callbacks: dict[_JiraCallWorker, object] = {}
+        # Debounce timer for config persistence (300ms)
+        self._persist_timer = QTimer(self)
+        self._persist_timer.setSingleShot(True)
+        self._persist_timer.setInterval(300)
+        self._persist_timer.timeout.connect(self._do_persist)
         self._build_ui()
         self._restore_values()
+        self._persisting = True
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(12)
 
-        # Epic Keys — tag input
-        lbl = QLabel("Epic Keys")
-        lbl.setProperty("subheading", "true")
-        root.addWidget(lbl)
-        self._epic_tag_input = EpicKeyTagInput()
-        self._epic_tag_input.setToolTip(
-            "Type a Jira Epic key (e.g. PROJ-101) and press Enter to add it"
+        # ── Profile selector ────────────────────────────────────────────
+        self._profile_bar = ProfileBar(self._config)
+        self._profile_bar.profile_changed.connect(self._on_profile_switched)
+        root.addWidget(self._profile_bar)
+        root.addWidget(
+            self._hint(
+                "Profiles store report settings separately \u2014 use them for "
+                "different projects, audiences (customer-facing vs. internal), "
+                "or project phases."
+            )
         )
-        root.addWidget(self._epic_tag_input)
+
+        # ── Report Items (always visible, not collapsible) ──────────────
+        lbl = QLabel("Report Items")
+        lbl.setProperty("sectionTitle", "true")
+        root.addWidget(lbl)
+        root.addWidget(
+            self._hint(
+                "Add Jira Epics or labels to include in the report. "
+                "Labels automatically pull in all epics tagged with that label."
+            )
+        )
+        self._item_table = ReportItemTable()
+        root.addWidget(self._item_table)
 
         btn_row = QHBoxLayout()
-        validate_btn = QPushButton("Validate All")
+        validate_btn = QPushButton("Validate Epics")
         validate_btn.setProperty("secondary", "true")
         validate_btn.setToolTip("Check each Epic key against Jira")
         validate_btn.clicked.connect(self._validate_epics)
@@ -130,170 +296,861 @@ class ConfigPanel(QWidget):
         self._validation_label.setWordWrap(True)
         root.addWidget(self._validation_label)
 
-        # Report Metadata (collapsible)
-        self._meta_section = CollapsibleSection("Report Metadata", expanded=False)
-        meta = self._meta_section.body_layout
+        # ── Title Page (collapsible, collapsed) ─────────────────────────
+        self._title_section = CollapsibleSection("Title Page", expanded=False)
+        title = self._title_section.body_layout
 
         self._title_field = LabelledField(
             "Report Title",
             placeholder="Epic Progress Report",
-            tooltip="Title shown on the first page",
+            description="Displayed prominently on the report cover page",
         )
-        meta.addWidget(self._title_field)
+        title.addWidget(self._title_field)
 
         self._author_field = LabelledField(
-            "Author Name",
+            "Author",
             placeholder="Your name",
-            tooltip="Author name shown on title page",
+            description="Shown on the cover page as the report creator",
         )
-        meta.addWidget(self._author_field)
+        title.addWidget(self._author_field)
 
         self._project_name_field = LabelledField(
-            "Project Display Name",
-            placeholder="Will be pre-filled from Jira if available",
-            tooltip="Human-readable project name",
+            "Project Name",
+            placeholder="Auto-filled from Jira if left blank",
+            description="Overrides the Jira project name shown on the cover page",
         )
-        meta.addWidget(self._project_name_field)
+        title.addWidget(self._project_name_field)
 
         date_lbl = QLabel("Report Date")
         date_lbl.setProperty("subheading", "true")
-        meta.addWidget(date_lbl)
+        title.addWidget(date_lbl)
         self._date_edit = QDateEdit()
+        no_scroll_wheel(self._date_edit)
         self._date_edit.setCalendarPopup(True)
         self._date_edit.setDate(QDate.currentDate())
-        self._date_edit.setToolTip("Date shown on the title page")
-        meta.addWidget(self._date_edit)
+        title.addWidget(self._date_edit)
+        title.addWidget(self._hint("Date printed on the report cover page"))
 
-        root.addWidget(self._meta_section)
+        self._conf_check = QCheckBox("Include confidentiality notice")
+        title.addWidget(self._conf_check)
+        title.addWidget(
+            self._hint("Adds a confidentiality statement to the cover page footer")
+        )
 
-        # Confidentiality Notice (collapsible)
-        self._conf_section = CollapsibleSection("Confidentiality Notice", expanded=False)
-        conf = self._conf_section.body_layout
-        self._conf_check = QCheckBox("Include confidentiality warning")
-        self._conf_check.setToolTip("Adds a notice to the title page footer")
-        conf.addWidget(self._conf_check)
         self._company_field = LabelledField(
             "Company Name",
             placeholder="ACME Corp",
-            tooltip="Company name used in the confidentiality notice",
+            description="Referenced in the confidentiality notice text",
         )
-        conf.addWidget(self._company_field)
-        root.addWidget(self._conf_section)
+        title.addWidget(self._company_field)
 
-        # Custom Field Mapping (collapsible)
-        self._fields_section = CollapsibleSection("Custom Field Mapping", expanded=False)
-        fields = self._fields_section.body_layout
+        root.addWidget(self._title_section)
+
+        # ── Estimation & Progress (collapsible, collapsed) ──────────────
+        self._estimation_section = CollapsibleSection(
+            "Estimation & Progress",
+            expanded=False,
+        )
+        est = self._estimation_section.body_layout
+
+        est_lbl = QLabel("Estimation Method")
+        est_lbl.setProperty("subheading", "true")
+        est.addWidget(est_lbl)
+        self._estimation_combo = QComboBox()
+        no_scroll_wheel(self._estimation_combo)
+        self._estimation_combo.addItem("Story Points", "story_points")
+        self._estimation_combo.addItem("Time — Days", "time_days")
+        # Signal connections deferred until after field widgets are created
+        # (see end of _build_ui)
+        est.addWidget(self._estimation_combo)
+        est.addWidget(
+            self._hint(
+                "Story Points reads a numeric field on each issue. "
+                "Time — Days uses the gap between start and due dates."
+            )
+        )
+
+        progress_lbl = QLabel("Progress Calculation")
+        progress_lbl.setProperty("subheading", "true")
+        est.addWidget(progress_lbl)
+        self._progress_method_combo = QComboBox()
+        no_scroll_wheel(self._progress_method_combo)
+        self._progress_method_combo.addItem(
+            "Combined (Estimates × Issues)",
+            "combined",
+        )
+        self._progress_method_combo.addItem("Issues Only", "issues_only")
+        self._progress_method_combo.addItem(
+            "Estimates Only",
+            "estimates_only",
+        )
+        self._progress_method_combo.currentIndexChanged.connect(
+            lambda _: self._persist_values()
+        )
+        est.addWidget(self._progress_method_combo)
+        est.addWidget(
+            self._hint(
+                "Combined uses estimate-weighted averages multiplied by the "
+                "issue-count ratio. Issues Only counts open vs done items "
+                "with equal weight. Estimates Only uses estimate weights "
+                "without the issue-count ratio and excludes unestimated items."
+            )
+        )
+
+        self._include_subtasks_progress_check = QCheckBox(
+            "Include subtasks into progress calculation"
+        )
+        self._include_subtasks_progress_check.setChecked(True)
+        self._include_subtasks_progress_check.stateChanged.connect(
+            lambda _: self._persist_values()
+        )
+        est.addWidget(self._include_subtasks_progress_check)
+        est.addWidget(
+            self._hint(
+                "Fetch sub-tasks linked via the parent field and include them "
+                "in progress calculations"
+            )
+        )
+
+        root.addWidget(self._estimation_section)
+
+        # ── Report Content (collapsible, collapsed) ─────────────────────
+        self._content_section = CollapsibleSection("Report Content", expanded=False)
+        content = self._content_section.body_layout
+
+        self._show_additional_metrics_check = QCheckBox("Show detailed metrics")
+        self._show_additional_metrics_check.setChecked(True)
+        self._show_additional_metrics_check.stateChanged.connect(
+            lambda _: self._persist_values()
+        )
+        content.addWidget(self._show_additional_metrics_check)
+        content.addWidget(
+            self._hint(
+                "Display cycle time, velocity, scope change, and completion forecast "
+                "on each epic's detail page"
+            )
+        )
+
+        self._expand_label_details_check = QCheckBox("Expand label epics")
+        self._expand_label_details_check.setChecked(True)
+        self._expand_label_details_check.stateChanged.connect(
+            lambda _: self._persist_values()
+        )
+        content.addWidget(self._expand_label_details_check)
+        content.addWidget(
+            self._hint(
+                "Show a separate detail page for each epic found under a label, "
+                "instead of a single aggregated page"
+            )
+        )
+
+        # -- Timeline subsection --
+        tl_lbl = QLabel("Timeline")
+        tl_lbl.setProperty("subheading", "true")
+        content.addWidget(tl_lbl)
+
+        self._show_timeline_check = QCheckBox("Include timeline page")
+        self._show_timeline_check.setChecked(True)
+        self._show_timeline_check.stateChanged.connect(lambda _: self._persist_values())
+        content.addWidget(self._show_timeline_check)
+        content.addWidget(self._hint("Add a Gantt-style timeline page to the report"))
+
+        self._show_children_timeline_check = QCheckBox("Show stories/tasks on timeline")
+        self._show_children_timeline_check.setChecked(False)
+        self._show_children_timeline_check.stateChanged.connect(
+            lambda _: self._persist_values()
+        )
+        content.addWidget(self._show_children_timeline_check)
+        content.addWidget(
+            self._hint(
+                "Display each epic's direct stories and tasks as individual "
+                "bars on the Gantt chart (not recursive subtasks)"
+            )
+        )
+
+        self._include_subtasks_timeline_check = QCheckBox(
+            "Include subtask dates in timeline ranges"
+        )
+        self._include_subtasks_timeline_check.setChecked(False)
+        self._include_subtasks_timeline_check.stateChanged.connect(
+            lambda _: self._persist_values()
+        )
+        content.addWidget(self._include_subtasks_timeline_check)
+        content.addWidget(
+            self._hint("Expand epic timeline ranges using subtask start/due dates")
+        )
+
+        self._show_subtasks_timeline_check = QCheckBox("Show subtasks on timeline")
+        self._show_subtasks_timeline_check.setChecked(False)
+        self._show_subtasks_timeline_check.stateChanged.connect(
+            lambda _: self._persist_values()
+        )
+        content.addWidget(self._show_subtasks_timeline_check)
+        content.addWidget(
+            self._hint(
+                "Display subtasks as individual bars on the Gantt chart "
+                "alongside their parent issues"
+            )
+        )
+
+        # Hard start/end dates for timeline x-axis
+        hard_dates_row = QHBoxLayout()
+        hard_dates_row.setSpacing(12)
+
+        # -- Start date column --
+        start_col = QVBoxLayout()
+        start_col.setContentsMargins(0, 0, 0, 0)
+        start_col.setSpacing(4)
+        start_lbl = QLabel("Fixed Start Date")
+        start_lbl.setProperty("subheading", "true")
+        start_col.addWidget(start_lbl)
+        start_input_row = QHBoxLayout()
+        start_input_row.setSpacing(4)
+        self._hard_start_edit = QDateEdit()
+        no_scroll_wheel(self._hard_start_edit)
+        self._hard_start_edit.setCalendarPopup(True)
+        self._hard_start_edit.setDisplayFormat("yyyy-MM-dd")
+        self._hard_start_edit.setSpecialValueText(" ")
+        self._hard_start_edit.setDate(self._hard_start_edit.minimumDate())
+        self._hard_start_edit.dateChanged.connect(
+            lambda _: self._validate_hard_dates("start")
+        )
+        start_input_row.addWidget(self._hard_start_edit, 1)
+        clear_start_btn = QPushButton("×")
+        clear_start_btn.setFixedSize(18, 18)
+        clear_start_btn.setObjectName("epicKeyChipClose")
+        clear_start_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        clear_start_btn.clicked.connect(
+            lambda: self._hard_start_edit.setDate(self._hard_start_edit.minimumDate())
+        )
+        start_input_row.addWidget(clear_start_btn)
+        start_col.addLayout(start_input_row)
+        hard_dates_row.addLayout(start_col, 1)
+
+        # -- End date column --
+        end_col = QVBoxLayout()
+        end_col.setContentsMargins(0, 0, 0, 0)
+        end_col.setSpacing(4)
+        end_lbl = QLabel("Fixed End Date")
+        end_lbl.setProperty("subheading", "true")
+        end_col.addWidget(end_lbl)
+        end_input_row = QHBoxLayout()
+        end_input_row.setSpacing(4)
+        self._hard_end_edit = QDateEdit()
+        no_scroll_wheel(self._hard_end_edit)
+        self._hard_end_edit.setCalendarPopup(True)
+        self._hard_end_edit.setDisplayFormat("yyyy-MM-dd")
+        self._hard_end_edit.setSpecialValueText(" ")
+        self._hard_end_edit.setDate(self._hard_end_edit.minimumDate())
+        self._hard_end_edit.dateChanged.connect(
+            lambda _: self._validate_hard_dates("end")
+        )
+        end_input_row.addWidget(self._hard_end_edit, 1)
+        clear_end_btn = QPushButton("×")
+        clear_end_btn.setFixedSize(18, 18)
+        clear_end_btn.setObjectName("epicKeyChipClose")
+        clear_end_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        clear_end_btn.clicked.connect(
+            lambda: self._hard_end_edit.setDate(self._hard_end_edit.minimumDate())
+        )
+        end_input_row.addWidget(clear_end_btn)
+        end_col.addLayout(end_input_row)
+        hard_dates_row.addLayout(end_col, 1)
+
+        content.addLayout(hard_dates_row)
+        content.addWidget(
+            self._hint(
+                "Lock the timeline axis to specific dates. "
+                "Leave empty to auto-scale from data."
+            )
+        )
+
+        root.addWidget(self._content_section)
+
+        # ── Jira Field Mapping (collapsible, collapsed) ─────────────────
+        self._field_mapping_section = CollapsibleSection(
+            "Jira Field Mapping",
+            expanded=False,
+        )
+        fm = self._field_mapping_section.body_layout
+
+        fm.addWidget(
+            self._hint(
+                "Override the Jira custom field IDs used to fetch data. "
+                "Most users can leave these at their default values."
+            )
+        )
+
         self._sp_field = LabelledField(
             "Story Points Field",
             placeholder="story_points or customfield_XXXXX",
-            tooltip="The Jira field ID for story points",
+            description="Jira field ID that holds the story point value for each issue",
         )
-        fields.addWidget(self._sp_field)
+        fm.addWidget(self._sp_field)
+
+        est_date_fields_row = QHBoxLayout()
+        est_date_fields_row.setSpacing(12)
+        self._start_date_field_input = LabelledField(
+            "Estimation Start Date Field",
+            placeholder="startdate or customfield_XXXXX",
+            description="Jira field ID for issue start date (estimation)",
+        )
+        est_date_fields_row.addWidget(self._start_date_field_input, 1)
+        self._due_date_field_input = LabelledField(
+            "Estimation Due Date Field",
+            placeholder="duedate or customfield_XXXXX",
+            description="Jira field ID for issue due date (estimation)",
+        )
+        est_date_fields_row.addWidget(self._due_date_field_input, 1)
+        fm.addLayout(est_date_fields_row)
+
+        timeline_row = QHBoxLayout()
+        timeline_row.setSpacing(12)
+        self._timeline_start_field = LabelledField(
+            "Timeline Start Date Field",
+            placeholder="startdate or customfield_XXXXX",
+            description="Jira field for epic start date on the timeline",
+        )
+        timeline_row.addWidget(self._timeline_start_field, 1)
+        self._timeline_end_field = LabelledField(
+            "Timeline End Date Field",
+            placeholder="duedate or customfield_XXXXX",
+            description="Jira field for epic end date on the timeline",
+        )
+        timeline_row.addWidget(self._timeline_end_field, 1)
+        fm.addLayout(timeline_row)
+
         self._epic_link_field = LabelledField(
             "Epic Link Field",
             placeholder="customfield_10014",
-            tooltip="The Jira field ID used to link issues to Epics",
+            description="Jira field ID that links child issues to their parent epic",
         )
-        fields.addWidget(self._epic_link_field)
+        fm.addWidget(self._epic_link_field)
 
         detect_btn = QPushButton("Detect Fields")
         detect_btn.setProperty("secondary", "true")
         detect_btn.setToolTip("Query Jira for available fields")
         detect_btn.clicked.connect(self._detect_fields)
-        fields.addWidget(detect_btn)
-        root.addWidget(self._fields_section)
+        fm.addWidget(detect_btn)
+        fm.addWidget(
+            self._hint(
+                "Scan your Jira instance to find and auto-fill the correct field IDs"
+            )
+        )
+
+        root.addWidget(self._field_mapping_section)
+
+        # Connect estimation combo signals now that field widgets exist
+        self._estimation_combo.currentIndexChanged.connect(
+            self._on_estimation_method_changed
+        )
+        self._estimation_combo.currentIndexChanged.connect(
+            lambda _: self._persist_values()
+        )
+
+        # Initial visibility state
+        self._on_estimation_method_changed()
+
+        # Auto-save on any change + lazy label fetch
+        self._item_table.items_changed.connect(self._persist_values)
+        self._item_table.items_changed.connect(self._ensure_labels_fetched)
+        self._sp_field.field.textChanged.connect(lambda _: self._persist_values())
+        self._epic_link_field.field.textChanged.connect(
+            lambda _: self._persist_values()
+        )
+        self._start_date_field_input.field.textChanged.connect(
+            lambda _: self._persist_values()
+        )
+        self._due_date_field_input.field.textChanged.connect(
+            lambda _: self._persist_values()
+        )
+        self._timeline_start_field.field.textChanged.connect(
+            lambda _: self._persist_values()
+        )
+        self._timeline_end_field.field.textChanged.connect(
+            lambda _: self._persist_values()
+        )
+        self._title_field.field.textChanged.connect(lambda _: self._persist_values())
+        self._author_field.field.textChanged.connect(lambda _: self._persist_values())
+        self._company_field.field.textChanged.connect(lambda _: self._persist_values())
+        self._conf_check.stateChanged.connect(lambda _: self._persist_values())
+
+    def _hint(self, text: str) -> QLabel:
+        """Create a small descriptive hint label."""
+        lbl = QLabel(text)
+        lbl.setWordWrap(True)
+        lbl.setProperty("hint", "true")
+        lbl.setContentsMargins(0, 0, 0, 8)
+        return lbl
+
+    # -- estimation method toggling -------------------------------------------
+
+    def _on_estimation_method_changed(self) -> None:
+        """Show/hide fields based on the selected estimation method."""
+        method = self._estimation_combo.currentData()
+        is_sp = method != "time_days"
+        self._sp_field.setVisible(is_sp)
+        self._start_date_field_input.setVisible(not is_sp)
+        self._due_date_field_input.setVisible(not is_sp)
+
+    # -- profile switching ----------------------------------------------------
+
+    def _on_profile_switched(self, _name: str) -> None:
+        """Reload all widgets from the newly active profile."""
+        self._persisting = False
+        self._restore_values()
+        self._persisting = True
 
     # -- value persistence ----------------------------------------------------
 
     def _restore_values(self) -> None:
-        keys = self._config.get("last_epic_keys", [])
-        if keys:
-            self._epic_tag_input.set_keys(keys)
-        self._title_field.text = self._config.get("default_title", "Epic Progress Report")
-        self._author_field.text = self._config.get("default_author", "")
-        self._company_field.text = self._config.get("default_company", "")
-        self._sp_field.text = self._config.get("story_points_field", "story_points")
-        self._epic_link_field.text = self._config.get("epic_link_field", "customfield_10014")
+        # Migrate from old last_epic_keys to last_report_items
+        saved_items = self._config.get("last_report_items", [])
+        if saved_items:
+            self._item_table.set_items(saved_items)
+        else:
+            keys = self._config.get("last_epic_keys", [])
+            if keys:
+                self._item_table.set_from_epic_keys(keys)
+
+        self._title_field.text = self._config.get(
+            "default_title", _DEFAULTS["default_title"]
+        )
+        self._author_field.text = self._config.get(
+            "default_author", _DEFAULTS["default_author"]
+        )
+        self._company_field.text = self._config.get(
+            "default_company", _DEFAULTS["default_company"]
+        )
+        self._conf_check.setChecked(
+            self._config.get("confidential", _DEFAULTS["confidential"])
+        )
+        self._sp_field.text = self._config.get(
+            "story_points_field", _DEFAULTS["story_points_field"]
+        )
+        self._epic_link_field.text = self._config.get(
+            "epic_link_field", _DEFAULTS["epic_link_field"]
+        )
+        self._start_date_field_input.text = self._config.get(
+            "start_date_field", _DEFAULTS["start_date_field"]
+        )
+        self._due_date_field_input.text = self._config.get(
+            "due_date_field", _DEFAULTS["due_date_field"]
+        )
+
+        self._include_subtasks_progress_check.setChecked(
+            self._config.get("include_subtasks", True)
+        )
+        self._include_subtasks_timeline_check.setChecked(
+            self._config.get("include_subtasks_in_timeline", True)
+        )
+
+        # Restore estimation method
+        method = self._config.get("estimation_method", _DEFAULTS["estimation_method"])
+        idx = self._estimation_combo.findData(method)
+        if idx >= 0:
+            self._estimation_combo.setCurrentIndex(idx)
+        self._on_estimation_method_changed()
+
+        # Restore progress method (backward compat: story_points_only → issues_only)
+        progress_method = self._config.get(
+            "progress_method", _DEFAULTS["progress_method"]
+        )
+        if progress_method == "story_points_only":
+            progress_method = "issues_only"
+        pidx = self._progress_method_combo.findData(progress_method)
+        if pidx >= 0:
+            self._progress_method_combo.setCurrentIndex(pidx)
+
+        # Restore timeline fields
+        self._timeline_start_field.text = self._config.get("timeline_start_field", "")
+        self._timeline_end_field.text = self._config.get("timeline_end_field", "")
+
+        # Restore hard timeline dates
+        self._restore_hard_date(self._hard_start_edit, "timeline_hard_start")
+        self._restore_hard_date(self._hard_end_edit, "timeline_hard_end")
+
+        # Restore show children / subtasks on timeline
+        self._show_children_timeline_check.setChecked(
+            self._config.get("show_epic_stories_on_timeline", False)
+        )
+        self._show_subtasks_timeline_check.setChecked(
+            self._config.get("show_subtasks_on_timeline", False)
+        )
+
+        # Restore expand label details
+        self._expand_label_details_check.setChecked(
+            self._config.get("expand_label_details", True)
+        )
+
+        # Restore show additional metrics
+        self._show_additional_metrics_check.setChecked(
+            self._config.get("show_additional_metrics", True)
+        )
+
+        # Restore show timeline chart
+        self._show_timeline_check.setChecked(
+            self._config.get("show_timeline_chart", True)
+        )
+
+    _MIN_HARD_DATE_GAP_DAYS = 5
+
+    def _restore_hard_date(self, widget: QDateEdit, config_key: str) -> None:
+        date_str = self._config.get(config_key, "")
+        if date_str:
+            qd = QDate.fromString(date_str, "yyyy-MM-dd")
+            widget.setDate(qd if qd.isValid() else widget.minimumDate())
+        else:
+            widget.setDate(widget.minimumDate())
+
+    def _validate_hard_dates(self, changed: str) -> None:
+        """Ensure hard start < hard end with a minimum gap.
+
+        When the user changes one date, the *other* date is auto-corrected if
+        the constraint is violated.  Dates at the widget minimum are treated as
+        "unset" and are not validated.
+        """
+        s_date = self._hard_start_edit.date()
+        e_date = self._hard_end_edit.date()
+        s_min = self._hard_start_edit.minimumDate()
+        e_min = self._hard_end_edit.minimumDate()
+
+        # If either is unset (at minimum), nothing to validate
+        if s_date == s_min or e_date == e_min:
+            self._persist_values()
+            return
+
+        gap = s_date.daysTo(e_date)
+        if gap >= self._MIN_HARD_DATE_GAP_DAYS:
+            self._persist_values()
+            return
+
+        # Auto-correct the *other* widget so user's latest choice is kept
+        self._hard_start_edit.blockSignals(True)
+        self._hard_end_edit.blockSignals(True)
+        try:
+            if changed == "start":
+                self._hard_end_edit.setDate(
+                    s_date.addDays(self._MIN_HARD_DATE_GAP_DAYS)
+                )
+            else:
+                self._hard_start_edit.setDate(
+                    e_date.addDays(-self._MIN_HARD_DATE_GAP_DAYS)
+                )
+        finally:
+            self._hard_start_edit.blockSignals(False)
+            self._hard_end_edit.blockSignals(False)
+
+        self._persist_values()
 
     def _persist_values(self) -> None:
-        self._config.update({
-            "last_epic_keys": self._epic_tag_input.get_keys(),
-            "story_points_field": self._sp_field.text.strip() or "story_points",
-            "epic_link_field": self._epic_link_field.text.strip() or "customfield_10014",
-        })
+        """Schedule a debounced config save (300ms)."""
+        if not self._persisting:
+            return
+        self._persist_timer.start()
+
+    def _do_persist(self) -> None:
+        """Actually write config values to disk."""
+        if not self._persisting:
+            return
+        self._config.update(
+            {
+                "default_title": self._title_field.text.strip()
+                or _DEFAULTS["default_title"],
+                "default_author": self._author_field.text.strip(),
+                "default_company": self._company_field.text.strip(),
+                "confidential": self._conf_check.isChecked(),
+                "last_report_items": self._item_table.get_items_as_dicts(),
+                "estimation_method": self._estimation_combo.currentData()
+                or _DEFAULTS["estimation_method"],
+                "progress_method": self._progress_method_combo.currentData()
+                or _DEFAULTS["progress_method"],
+                "story_points_field": self._sp_field.text.strip()
+                or _DEFAULTS["story_points_field"],
+                "epic_link_field": self._epic_link_field.text.strip()
+                or _DEFAULTS["epic_link_field"],
+                "start_date_field": self._start_date_field_input.text.strip()
+                or _DEFAULTS["start_date_field"],
+                "due_date_field": self._due_date_field_input.text.strip()
+                or _DEFAULTS["due_date_field"],
+                "include_subtasks": self._include_subtasks_progress_check.isChecked(),
+                "include_subtasks_in_timeline": (
+                    self._include_subtasks_timeline_check.isChecked()
+                ),
+                "timeline_start_field": self._timeline_start_field.text.strip(),
+                "timeline_end_field": self._timeline_end_field.text.strip(),
+                "timeline_hard_start": (
+                    self._hard_start_edit.date().toString("yyyy-MM-dd")
+                    if self._hard_start_edit.date()
+                    != self._hard_start_edit.minimumDate()
+                    else ""
+                ),
+                "timeline_hard_end": (
+                    self._hard_end_edit.date().toString("yyyy-MM-dd")
+                    if self._hard_end_edit.date() != self._hard_end_edit.minimumDate()
+                    else ""
+                ),
+                "show_epic_stories_on_timeline": (
+                    self._show_children_timeline_check.isChecked()
+                ),
+                "show_subtasks_on_timeline": (
+                    self._show_subtasks_timeline_check.isChecked()
+                ),
+                "expand_label_details": (self._expand_label_details_check.isChecked()),
+                "show_additional_metrics": (
+                    self._show_additional_metrics_check.isChecked()
+                ),
+                "show_timeline_chart": self._show_timeline_check.isChecked(),
+            }
+        )
 
     # -- public API -----------------------------------------------------------
 
     def get_report_config(self) -> ReportConfig | None:
         """Build and return a ReportConfig, or None if validation fails."""
-        epic_keys = self._epic_tag_input.get_keys()
-        if not epic_keys:
-            logger.warning("No epic keys provided")
-            QMessageBox.warning(self, "No Epics", "Enter at least one Epic key.")
+        items = self._item_table.get_items()
+        if not items:
+            logger.warning("No report items provided")
+            QMessageBox.warning(self, "No Items", "Add at least one Epic key or Label.")
             return None
 
-        invalid = [k for k in epic_keys if not RE_EPIC_KEY.match(k)]
+        # Validate epic keys
+        epic_items = [it for it in items if it.kind == "epic"]
+        invalid = [it.key for it in epic_items if not RE_EPIC_KEY.match(it.key)]
         if invalid:
             logger.warning("Invalid epic key format: %s", ", ".join(invalid))
             QMessageBox.warning(
-                self, "Invalid Epic Keys",
+                self,
+                "Invalid Epic Keys",
                 f"These keys are invalid: {', '.join(invalid)}",
             )
             return None
 
-        # Derive project key from epic key prefixes
+        # Derive epic_keys for backward compat
+        epic_keys = [it.key for it in epic_items]
+
+        # Derive project key from epic key prefixes (relaxed: labels can span projects)
         prefixes = {k.rsplit("-", 1)[0] for k in epic_keys}
-        if len(prefixes) != 1:
-            logger.warning("Mixed project prefixes: %s", prefixes)
-            QMessageBox.warning(
-                self, "Mixed Projects",
-                "All epic keys must share the same project prefix.\n"
-                f"Found: {', '.join(sorted(prefixes))}",
-            )
-            return None
-        project_key = prefixes.pop()
+        project_key = (
+            prefixes.pop()
+            if len(prefixes) == 1
+            else (sorted(prefixes)[0] if prefixes else "")
+        )
 
         qdate = self._date_edit.date()
         report_date = date(qdate.year(), qdate.month(), qdate.day())
 
         # Attempt to pre-fill project name from Jira
         project_name = self._project_name_field.text.strip()
-        if not project_name and self._jira.connected:
+        if not project_name and project_key and self._jira.connected:
             project_name = self._jira.get_project_name(project_key) or project_key
+        logger.debug(
+            "Project name resolution: field=%r, key=%r, resolved=%r, "
+            "epic_keys=%r, connected=%s",
+            self._project_name_field.text.strip(),
+            project_key,
+            project_name,
+            epic_keys,
+            self._jira.connected,
+        )
+
+        # Timeline field overrides (fall back to the date fields used for estimation)
+        tl_start_raw = self._timeline_start_field.text.strip()
+        tl_end_raw = self._timeline_end_field.text.strip()
+        est_start_raw = self._start_date_field_input.text.strip()
+        est_end_raw = self._due_date_field_input.text.strip()
+        timeline_start = tl_start_raw or est_start_raw or "startdate"
+        timeline_end = tl_end_raw or est_end_raw or "duedate"
+        logger.debug(
+            "build_config: timeline_start_input=%r → %r, "
+            "timeline_end_input=%r → %r, "
+            "estimation_start=%r, estimation_end=%r",
+            tl_start_raw,
+            timeline_start,
+            tl_end_raw,
+            timeline_end,
+            est_start_raw or "startdate",
+            est_end_raw or "duedate",
+        )
+
+        # Hard timeline date overrides (None when at minimum = unset)
+        hard_start_qd = self._hard_start_edit.date()
+        hard_start = (
+            date(hard_start_qd.year(), hard_start_qd.month(), hard_start_qd.day())
+            if hard_start_qd != self._hard_start_edit.minimumDate()
+            else None
+        )
+        hard_end_qd = self._hard_end_edit.date()
+        hard_end = (
+            date(hard_end_qd.year(), hard_end_qd.month(), hard_end_qd.day())
+            if hard_end_qd != self._hard_end_edit.minimumDate()
+            else None
+        )
 
         cfg = ReportConfig(
             project_key=project_key,
             epic_keys=epic_keys,
-            title=self._title_field.text.strip() or "Epic Progress Report",
+            items=items,
+            title=self._title_field.text.strip() or _DEFAULTS["default_title"],
             author=self._author_field.text.strip(),
-            project_display_name=project_name or project_key,
+            project_display_name=project_name or project_key or "Report",
             report_date=report_date,
             confidential=self._conf_check.isChecked(),
             company_name=self._company_field.text.strip(),
-            story_points_field=self._sp_field.text.strip() or "story_points",
-            epic_link_field=self._epic_link_field.text.strip() or "customfield_10014",
+            estimation_method=self._estimation_combo.currentData()
+            or _DEFAULTS["estimation_method"],
+            progress_method=self._progress_method_combo.currentData()
+            or _DEFAULTS["progress_method"],
+            story_points_field=self._sp_field.text.strip()
+            or _DEFAULTS["story_points_field"],
+            epic_link_field=self._epic_link_field.text.strip()
+            or _DEFAULTS["epic_link_field"],
+            start_date_field=self._start_date_field_input.text.strip()
+            or _DEFAULTS["start_date_field"],
+            due_date_field=self._due_date_field_input.text.strip()
+            or _DEFAULTS["due_date_field"],
+            timeline_start_field=timeline_start,
+            timeline_end_field=timeline_end,
+            timeline_hard_start=hard_start,
+            timeline_hard_end=hard_end,
+            include_subtasks=(self._include_subtasks_progress_check.isChecked()),
+            include_subtasks_in_timeline=(
+                self._include_subtasks_timeline_check.isChecked()
+            ),
+            show_epic_stories_on_timeline=(
+                self._show_children_timeline_check.isChecked()
+            ),
+            show_subtasks_on_timeline=(self._show_subtasks_timeline_check.isChecked()),
+            expand_label_details=self._expand_label_details_check.isChecked(),
+            show_additional_metrics=self._show_additional_metrics_check.isChecked(),
+            show_timeline_chart=self._show_timeline_check.isChecked(),
         )
 
         self._persist_values()
-        logger.info("Report config built: project=%s, epics=%s", project_key, epic_keys)
+        logger.info(
+            "Report config built: project=%s, items=%d", project_key, len(items)
+        )
         return cfg
 
     def reset(self) -> None:
         """Clear all fields back to defaults."""
-        self._epic_tag_input.clear()
-        self._title_field.text = self._config.get("default_title", "Epic Progress Report")
-        self._author_field.text = self._config.get("default_author", "")
+        self._item_table.clear()
+        self._title_field.text = self._config.get(
+            "default_title", _DEFAULTS["default_title"]
+        )
+        self._author_field.text = self._config.get(
+            "default_author", _DEFAULTS["default_author"]
+        )
         self._project_name_field.text = ""
         self._date_edit.setDate(QDate.currentDate())
         self._conf_check.setChecked(False)
-        self._company_field.text = self._config.get("default_company", "")
-        self._sp_field.text = self._config.get("story_points_field", "story_points")
-        self._epic_link_field.text = self._config.get("epic_link_field", "customfield_10014")
+        self._company_field.text = self._config.get(
+            "default_company", _DEFAULTS["default_company"]
+        )
+        self._estimation_combo.setCurrentIndex(0)
+        self._progress_method_combo.setCurrentIndex(0)
+        self._sp_field.text = self._config.get(
+            "story_points_field", _DEFAULTS["story_points_field"]
+        )
+        self._epic_link_field.text = self._config.get(
+            "epic_link_field", _DEFAULTS["epic_link_field"]
+        )
+        self._start_date_field_input.text = self._config.get(
+            "start_date_field", _DEFAULTS["start_date_field"]
+        )
+        self._due_date_field_input.text = self._config.get(
+            "due_date_field", _DEFAULTS["due_date_field"]
+        )
+        self._timeline_start_field.text = ""
+        self._timeline_end_field.text = ""
+        self._hard_start_edit.setDate(self._hard_start_edit.minimumDate())
+        self._hard_end_edit.setDate(self._hard_end_edit.minimumDate())
+        self._include_subtasks_progress_check.setChecked(True)
+        self._include_subtasks_timeline_check.setChecked(False)
+        self._show_timeline_check.setChecked(True)
+        self._show_children_timeline_check.setChecked(False)
+        self._show_subtasks_timeline_check.setChecked(False)
+        self._expand_label_details_check.setChecked(True)
+        self._show_additional_metrics_check.setChecked(True)
         self._validation_label.clear()
+        self._on_estimation_method_changed()
         # Collapse optional sections
-        self._meta_section.set_expanded(False)
-        self._conf_section.set_expanded(False)
-        self._fields_section.set_expanded(False)
+        self._title_section.set_expanded(False)
+        self._estimation_section.set_expanded(False)
+        self._content_section.set_expanded(False)
+        self._field_mapping_section.set_expanded(False)
+
+    def refresh_label_completions(self) -> None:
+        """Fetch labels from Jira and update the autocomplete list.
+
+        Call this after a successful login to pre-populate suggestions.
+        """
+        self._labels_fetched = False
+        self._ensure_labels_fetched()
+
+    def _ensure_labels_fetched(self) -> None:
+        """Lazily fetch Jira labels once when any label row exists."""
+        if self._labels_fetched or not self._jira.connected:
+            return
+        self._labels_fetched = True
+
+        def _on_labels(result: object) -> None:
+            if isinstance(result, Exception):
+                logger.warning("Failed to fetch labels: %s", result)
+                return
+            labels: list[str] = result  # type: ignore[assignment]
+            if labels:
+                self._item_table.set_label_completions(labels)
+                logger.debug("Set %d label completions", len(labels))
+
+        self._run_background(self._jira.fetch_labels, _on_labels)
+
+    # -- background Jira helpers -----------------------------------------------
+
+    def _run_background(self, fn: object, callback: object) -> None:
+        """Run *fn* in a background thread and call *callback* with the result."""
+        thread = QThread(self)
+        worker = _JiraCallWorker(fn)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        self._bg_callbacks[worker] = callback
+        worker.finished.connect(self._on_bg_result)
+        worker.finished.connect(thread.quit)
+        self._bg_threads.append(thread)
+        self._bg_workers.append(worker)
+
+        def _on_thread_done(t: QThread = thread, w: _JiraCallWorker = worker) -> None:
+            self._bg_callbacks.pop(w, None)
+            if w in self._bg_workers:
+                self._bg_workers.remove(w)
+            w.deleteLater()
+            if t in self._bg_threads:
+                self._bg_threads.remove(t)
+
+        thread.finished.connect(_on_thread_done)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _on_bg_result(self, result: object) -> None:
+        """Dispatch a background-worker result to the registered callback.
+
+        Because this is a method on *self* (a QWidget), Qt uses
+        AutoConnection when the emitting worker lives on a different
+        thread, guaranteeing the callback executes on the main thread.
+        """
+        worker = self.sender()
+        callback = self._bg_callbacks.get(worker)  # type: ignore[arg-type]
+        if callback is not None:
+            callback(result)  # type: ignore[operator]
+
+    def shutdown(self) -> None:
+        """Wait for all background threads to finish."""
+        for thread in list(self._bg_threads):
+            thread.quit()
+            thread.wait()
+        self._bg_threads.clear()
+        self._bg_workers.clear()
+        self._bg_callbacks.clear()
 
     # -- helpers --------------------------------------------------------------
 
@@ -301,45 +1158,140 @@ class ConfigPanel(QWidget):
         if not self._jira.connected:
             QMessageBox.information(self, "Not Connected", "Connect to Jira first.")
             return
-        keys = self._epic_tag_input.get_keys()
-        logger.info("Validating %d epic key(s) against Jira", len(keys))
-        results: list[str] = []
-        for k in keys:
-            if not RE_EPIC_KEY.match(k):
-                results.append(f"\u2717 {k} \u2014 invalid format")
-            elif self._jira.validate_epic_key(k):
-                results.append(f"\u2713 {k}")
-            else:
-                results.append(f"\u2717 {k} \u2014 not found")
-        self._validation_label.setText("<br>".join(results))
+        items = self._item_table.get_items()
+        epic_keys = [it.key for it in items if it.kind == "epic"]
+        logger.info("Validating %d epic key(s) against Jira", len(epic_keys))
+        if not epic_keys:
+            self._validation_label.setText(
+                "No epic keys to validate (labels are not validated)"
+            )
+            return
+
+        self._validation_label.setText("Validating…")
+
+        def _do_validate() -> list[str]:
+            results: list[str] = []
+            for k in epic_keys:
+                if not RE_EPIC_KEY.match(k):
+                    results.append(f"✗ {k} — invalid format")
+                elif self._jira.validate_epic_key(k):
+                    results.append(f"✓ {k}")
+                else:
+                    results.append(f"✗ {k} — not found")
+            return results
+
+        def _on_validated(result: object) -> None:
+            if isinstance(result, Exception):
+                self._validation_label.setText(f"Validation error: {result}")
+                return
+            lines: list[str] = result  # type: ignore[assignment]
+            self._validation_label.setText("<br>".join(lines))
+
+        self._run_background(_do_validate, _on_validated)
 
     def _detect_fields(self) -> None:
         if not self._jira.connected:
             QMessageBox.information(self, "Not Connected", "Connect to Jira first.")
             return
         logger.info("Detecting Jira custom fields")
-        fields = self._jira.fetch_fields()
-        sp_candidates = [
-            f for f in fields if "point" in f["name"].lower() or "story" in f["name"].lower()
-        ]
-        epic_candidates = [
-            f for f in fields if "epic" in f["name"].lower() and "link" in f["name"].lower()
-        ]
 
-        if not sp_candidates and not epic_candidates:
-            QMessageBox.information(
-                self, "No Fields Detected",
-                "No matching Story Points or Epic Link fields were found.\n"
-                "You may need to set them manually.",
+        def _on_fields_fetched(result: object) -> None:
+            if isinstance(result, Exception):
+                QMessageBox.warning(self, "Error", f"Failed to fetch fields: {result}")
+                return
+            fields: list[dict[str, str]] = result  # type: ignore[assignment]
+            method = self._estimation_combo.currentData() or "story_points"
+
+            sp_candidates = [
+                f
+                for f in fields
+                if "point" in f["name"].lower() or "story" in f["name"].lower()
+            ]
+            epic_candidates = [
+                f
+                for f in fields
+                if "epic" in f["name"].lower() and "link" in f["name"].lower()
+            ]
+            start_date_candidates = [
+                f
+                for f in fields
+                if "start" in f["name"].lower() and "date" in f["name"].lower()
+            ]
+            due_date_candidates = [
+                f
+                for f in fields
+                if "due" in f["name"].lower()
+                or ("end" in f["name"].lower() and "date" in f["name"].lower())
+            ]
+            timeline_start_candidates = [
+                f
+                for f in fields
+                if "start" in f["name"].lower()
+                and ("date" in f["name"].lower() or "target" in f["name"].lower())
+            ]
+            timeline_end_candidates = [
+                f
+                for f in fields
+                if ("due" in f["name"].lower() or "target end" in f["name"].lower())
+                or ("end" in f["name"].lower() and "date" in f["name"].lower())
+            ]
+
+            has_any = (
+                sp_candidates
+                or epic_candidates
+                or start_date_candidates
+                or due_date_candidates
+                or timeline_start_candidates
+                or timeline_end_candidates
             )
-            return
+            if not has_any:
+                QMessageBox.information(
+                    self,
+                    "No Fields Detected",
+                    "No matching fields were found.\n"
+                    "You may need to set them manually.",
+                )
+                return
 
-        dialog = FieldPickerDialog(sp_candidates, epic_candidates, parent=self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            sp_id = dialog.selected_sp_field
-            if sp_id:
-                self._sp_field.text = sp_id
-            epic_id = dialog.selected_epic_field
-            if epic_id:
-                self._epic_link_field.text = epic_id
-            logger.info("Fields applied: sp=%s, epic_link=%s", sp_id, epic_id)
+            dialog = FieldPickerDialog(
+                sp_candidates,
+                epic_candidates,
+                parent=self,
+                estimation_method=method,
+                start_date_candidates=start_date_candidates,
+                due_date_candidates=due_date_candidates,
+                timeline_start_candidates=timeline_start_candidates,
+                timeline_end_candidates=timeline_end_candidates,
+                current_values={
+                    "story_points_field": self._sp_field.text.strip(),
+                    "epic_link_field": self._epic_link_field.text.strip(),
+                    "start_date_field": self._start_date_field_input.text.strip(),
+                    "due_date_field": self._due_date_field_input.text.strip(),
+                    "timeline_start_field": self._timeline_start_field.text.strip(),
+                    "timeline_end_field": self._timeline_end_field.text.strip(),
+                },
+            )
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                if method == "story_points":
+                    sp_id = dialog.selected_sp_field
+                    if sp_id:
+                        self._sp_field.text = sp_id
+                else:
+                    start_id = dialog.selected_start_date_field
+                    if start_id:
+                        self._start_date_field_input.text = start_id
+                    due_id = dialog.selected_due_date_field
+                    if due_id:
+                        self._due_date_field_input.text = due_id
+                epic_id = dialog.selected_epic_field
+                if epic_id:
+                    self._epic_link_field.text = epic_id
+                tl_start_id = dialog.selected_timeline_start_field
+                if tl_start_id:
+                    self._timeline_start_field.text = tl_start_id
+                tl_end_id = dialog.selected_timeline_end_field
+                if tl_end_id:
+                    self._timeline_end_field.text = tl_end_id
+                logger.info("Fields applied (method=%s)", method)
+
+        self._run_background(self._jira.fetch_fields, _on_fields_fetched)

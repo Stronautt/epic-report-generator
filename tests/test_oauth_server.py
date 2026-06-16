@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import threading
+import urllib.error
 import urllib.request
-
-import pytest
 
 from epic_report_generator.services.oauth_server import OAuthCallbackServer
 
@@ -54,9 +53,7 @@ class TestStateMismatch:
         server = _start_server(0, "expected")
         port = server.server_address[1]
 
-        status, body = _get(
-            f"http://127.0.0.1:{port}/callback?code=CODE&state=wrong"
-        )
+        status, body = _get(f"http://127.0.0.1:{port}/callback?code=CODE&state=wrong")
         server.server_close()
 
         assert status == 400
@@ -87,9 +84,11 @@ class TestErrorCallback:
         server = _start_server(0, "s")
         port = server.server_address[1]
 
-        status, body = _get(
-            f"http://127.0.0.1:{port}/callback?error=access_denied&error_description=User+denied"
+        url = (
+            f"http://127.0.0.1:{port}/callback"
+            "?error=access_denied&error_description=User+denied"
         )
+        status, body = _get(url)
         server.server_close()
 
         assert status == 400

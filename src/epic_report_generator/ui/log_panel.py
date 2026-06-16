@@ -5,8 +5,8 @@ from __future__ import annotations
 import logging
 from collections import deque
 
-from PySide6.QtCore import QObject, Signal, Qt
-from PySide6.QtGui import QTextCharFormat, QColor, QFont
+from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QTextCharFormat
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -30,11 +30,12 @@ class _QtLogHandler(logging.Handler, QObject):
         logging.Handler.__init__(self)
         QObject.__init__(self)
         self.setFormatter(
-            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-                              datefmt="%H:%M:%S")
+            logging.Formatter(
+                "%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S"
+            )
         )
 
-    def emit(self, record: logging.LogRecord) -> None:
+    def emit(self, record: logging.LogRecord) -> None:  # type: ignore[override]
         """Format the record and emit via the Qt signal."""
         try:
             msg = self.format(record)
@@ -60,15 +61,23 @@ _LEVEL_COLORS_DARK: dict[int, str] = {
     logging.CRITICAL: "#FF5630",
 }
 
-# Filter button accent colours (used for the checked state)
-_FILTER_ACCENTS: dict[int, str] = {
-    logging.DEBUG: "#8C9CB8",
-    logging.INFO: "#0052CC",
-    logging.WARNING: "#FF8B00",
-    logging.ERROR: "#DE350B",
-}
-
 _MAX_BUFFER = 5000
+
+
+def _make_fmt_cache(colors: dict[int, str]) -> dict[int, QTextCharFormat]:
+    """Build a mapping of log level → QTextCharFormat from a color palette."""
+    cache: dict[int, QTextCharFormat] = {}
+    for level, color in colors.items():
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(color))
+        if level >= logging.WARNING:
+            fmt.setFontWeight(QFont.Weight.Bold)
+        cache[level] = fmt
+    return cache
+
+
+_FMT_LIGHT = _make_fmt_cache(_LEVEL_COLORS)
+_FMT_DARK = _make_fmt_cache(_LEVEL_COLORS_DARK)
 
 
 class LogPanel(QWidget):
@@ -79,9 +88,20 @@ class LogPanel(QWidget):
         self._dark = False
         self._buffer: deque[tuple[str, int]] = deque(maxlen=_MAX_BUFFER)
         self._active_levels: set[int] = {
-            logging.DEBUG, logging.INFO, logging.WARNING, logging.ERROR, logging.CRITICAL,
+            logging.DEBUG,
+            logging.INFO,
+            logging.WARNING,
+            logging.ERROR,
+            logging.CRITICAL,
         }
+        # Batch buffer for high-frequency log messages
+        self._pending_messages: list[tuple[str, int]] = []
         self._build_ui()
+
+        # Batch flush timer (50ms interval)
+        self._flush_timer = QTimer(self)
+        self._flush_timer.setInterval(50)
+        self._flush_timer.timeout.connect(self._flush_pending)
 
         # Install the Qt log handler on the root logger
         self._handler = _QtLogHandler()
@@ -125,7 +145,9 @@ class LogPanel(QWidget):
             btn.setChecked(True)
             btn.setObjectName("logFilterBtn")
             btn.setProperty("level", label.lower())
-            btn.clicked.connect(lambda checked, lvl=level: self._on_filter_toggled(lvl, checked))
+            btn.clicked.connect(
+                lambda checked, lvl=level: self._on_filter_toggled(lvl, checked)
+            )
             self._filter_btns[level] = btn
             filter_row.addWidget(btn)
 
@@ -136,8 +158,11 @@ class LogPanel(QWidget):
         self._log_view = QPlainTextEdit()
         self._log_view.setReadOnly(True)
         self._log_view.setMaximumBlockCount(_MAX_BUFFER)
-        self._log_view.setFont(QFont("Consolas", 10) if __import__("sys").platform == "win32"
-                               else QFont("Monospace", 10))
+        self._log_view.setFont(
+            QFont("Consolas", 10)
+            if __import__("sys").platform == "win32"
+            else QFont("Monospace", 10)
+        )
         self._log_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         root.addWidget(self._log_view)
 
@@ -146,10 +171,34 @@ class LogPanel(QWidget):
         self._dark = dark
 
     def _on_message(self, text: str, level: int) -> None:
-        """Store the message and display it if its level is active."""
+        """Store the message and queue it for batched display."""
         self._buffer.append((text, level))
         if self._is_visible(level):
-            self._append_line(text, level)
+            self._pending_messages.append((text, level))
+            if not self._flush_timer.isActive():
+                self._flush_timer.start()
+
+    def _flush_pending(self) -> None:
+        """Flush all pending messages to the view in a single batch."""
+        if not self._pending_messages:
+            self._flush_timer.stop()
+            return
+        messages = self._pending_messages
+        self._pending_messages = []
+        self._flush_timer.stop()
+
+        fmt_cache = _FMT_DARK if self._dark else _FMT_LIGHT
+        default_fmt = fmt_cache[logging.INFO]
+
+        self._log_view.setUpdatesEnabled(False)
+        cursor = self._log_view.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        for text, level in messages:
+            fmt = fmt_cache.get(level, default_fmt)
+            cursor.insertText(text + "\n", fmt)
+        self._log_view.setTextCursor(cursor)
+        self._log_view.setUpdatesEnabled(True)
+        self._log_view.ensureCursorVisible()
 
     def _on_filter_toggled(self, level: int, checked: bool) -> None:
         """Update active levels and rebuild the visible log."""
@@ -169,27 +218,23 @@ class LogPanel(QWidget):
 
     def _rebuild_view(self) -> None:
         """Re-render all buffered messages with the current filter."""
+        fmt_cache = _FMT_DARK if self._dark else _FMT_LIGHT
+        default_fmt = fmt_cache[logging.INFO]
+
+        self._log_view.setUpdatesEnabled(False)
         self._log_view.clear()
-        for text, level in self._buffer:
-            if self._is_visible(level):
-                self._append_line(text, level)
-
-    def _append_line(self, text: str, level: int) -> None:
-        """Append a coloured log line to the view."""
-        palette = _LEVEL_COLORS_DARK if self._dark else _LEVEL_COLORS
-        color = palette.get(level, palette[logging.INFO])
-
-        fmt = QTextCharFormat()
-        fmt.setForeground(QColor(color))
-        if level >= logging.WARNING:
-            fmt.setFontWeight(QFont.Weight.Bold)
-
         cursor = self._log_view.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
-        cursor.insertText(text + "\n", fmt)
+        for text, level in self._buffer:
+            if self._is_visible(level):
+                fmt = fmt_cache.get(level, default_fmt)
+                cursor.insertText(text + "\n", fmt)
         self._log_view.setTextCursor(cursor)
+        self._log_view.setUpdatesEnabled(True)
         self._log_view.ensureCursorVisible()
 
     def _clear(self) -> None:
         self._buffer.clear()
+        self._pending_messages.clear()
+        self._flush_timer.stop()
         self._log_view.clear()

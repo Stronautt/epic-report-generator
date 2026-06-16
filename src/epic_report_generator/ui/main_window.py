@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QKeySequence, QPixmap, QShortcut
+from PySide6.QtGui import QCloseEvent, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
+    QApplication,
     QButtonGroup,
     QHBoxLayout,
     QMainWindow,
@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from qt_material import apply_stylesheet
 
 from epic_report_generator.core.jira_client import JiraClient
 from epic_report_generator.services.auth_manager import AuthManager
@@ -24,7 +25,7 @@ from epic_report_generator.ui.log_panel import LogPanel
 from epic_report_generator.ui.login_panel import LoginPanel
 from epic_report_generator.ui.report_panel import ReportPanel
 from epic_report_generator.ui.settings_panel import SettingsPanel
-from epic_report_generator.ui.styles import DARK_THEME, LIGHT_THEME
+from epic_report_generator.ui.styles import COMMON_THEME, DARK_THEME, LIGHT_THEME
 from epic_report_generator.ui.widgets import SidebarUserInfo
 
 logger = logging.getLogger(__name__)
@@ -49,7 +50,7 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("Epic Report Generator")
         self.setMinimumSize(960, 600)
-        self.resize(1200, 720)
+        self.resize(1280, 900)
 
         self._build_ui()
         self._setup_shortcuts()
@@ -109,12 +110,12 @@ class MainWindow(QMainWindow):
         # Inner content
         self._inner_stack = QStackedWidget()
         self._report_panel = ReportPanel(self._config, self._jira)
-        self._settings_panel = SettingsPanel(self._config, self._auth)
+        self._settings_panel = SettingsPanel(self._config, self._auth, self._jira)
         self._log_panel = LogPanel()
 
-        self._inner_stack.addWidget(self._report_panel)    # index 0
+        self._inner_stack.addWidget(self._report_panel)  # index 0
         self._inner_stack.addWidget(self._settings_panel)  # index 1
-        self._inner_stack.addWidget(self._log_panel)       # index 2
+        self._inner_stack.addWidget(self._log_panel)  # index 2
 
         self._outer_stack.addWidget(self._inner_stack)  # index 1
 
@@ -164,14 +165,19 @@ class MainWindow(QMainWindow):
             self._set_sidebar_enabled(True)
             self._outer_stack.setCurrentIndex(1)
             self._settings_panel.refresh_connection_section()
+            self._report_panel.config_panel.refresh_label_completions()
             self._go_to_panel(0)  # Report panel
 
-    def _on_login_succeeded(self, display_name: str, site_name: str, avatar_url: str) -> None:
+    def _on_login_succeeded(
+        self, display_name: str, site_name: str, avatar_url: str
+    ) -> None:
         """Populate sidebar user info after successful login."""
         self._user_display_name = display_name
         self._user_site_name = site_name
         self._sidebar_user_info.set_user(
-            display_name, site_name, auth_method=self._auth.auth_method,
+            display_name,
+            site_name,
+            auth_method=self._auth.auth_method,
         )
 
     def _on_avatar_loaded(self, pixmap: QPixmap) -> None:
@@ -220,11 +226,45 @@ class MainWindow(QMainWindow):
         for btn in self._nav_buttons:
             btn.setEnabled(enabled)
 
+    # -- cleanup --------------------------------------------------------------
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        """Shut down background threads before the window is destroyed."""
+        self._login_panel.shutdown()
+        self._report_panel.preview_panel.shutdown()
+        self._report_panel.config_panel.shutdown()
+        super().closeEvent(event)
+
     # -- theming --------------------------------------------------------------
+
+    # Material Design theme names
+    _MATERIAL_THEMES = {"light": "light_blue.xml", "dark": "dark_blue.xml"}
+
+    _MATERIAL_EXTRA = {
+        "font_family": '"Segoe UI", "SF Pro Display", "Helvetica Neue", sans-serif',
+        "density_scale": "-1",
+    }
 
     def _apply_theme(self, theme: str) -> None:
         logger.info("Applying theme: %s", theme)
         is_dark = theme == "dark"
-        self.setStyleSheet(DARK_THEME if is_dark else LIGHT_THEME)
+
+        # Apply Material Design base theme at the application level
+        app = QApplication.instance()
+        assert isinstance(app, QApplication)
+        theme_xml = self._MATERIAL_THEMES.get(theme, self._MATERIAL_THEMES["light"])
+        apply_stylesheet(app, theme=theme_xml, extra=self._MATERIAL_EXTRA)
+
+        # Patch the generated stylesheet to reduce QComboBox dropdown
+        # spacing — the popup is a top-level widget so window-level
+        # overrides cannot reach it.
+        css = app.styleSheet()
+        css += "\nQComboBox { padding-left: 4px; }\n"
+        app.setStyleSheet(css)
+
+        # Apply app-specific overrides at the window level:
+        # structural (COMMON_THEME) first, then the color overrides.
+        self.setStyleSheet(COMMON_THEME + (DARK_THEME if is_dark else LIGHT_THEME))
+
         self._log_panel.set_dark(is_dark)
         self._report_panel.set_dark(is_dark)

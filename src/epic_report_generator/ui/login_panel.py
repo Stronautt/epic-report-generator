@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from PySide6.QtCore import QObject, QThread, QUrl, Signal
 from PySide6.QtGui import QPixmap
@@ -130,9 +129,7 @@ class LoginPanel(QWidget):
         api_guide_layout.setSpacing(2)
 
         step1 = GuideStep(1, "Open the API key management portal")
-        step1.add_text(
-            "Go to the Atlassian API tokens page in your account settings."
-        )
+        step1.add_text("Go to the Atlassian API tokens page in your account settings.")
         step1.add_code(_API_TOKEN_URL)
         api_guide_layout.addWidget(step1)
 
@@ -152,13 +149,13 @@ class LoginPanel(QWidget):
         api_guide_layout.addWidget(step3)
 
         step4 = GuideStep(4, "Assign the required permissions")
-        step4.add_text(
-            "Enable the following classic scopes (recommended):"
+        step4.add_text("Enable the following classic scopes (recommended):")
+        step4.add_bullet(
+            "read:jira-work — read issues, epics, " "projects, fields, and JQL search"
         )
-        step4.add_bullet("read:jira-work \u2014 read issues, epics, "
-                         "projects, fields, and JQL search")
-        step4.add_bullet("read:jira-user \u2014 read user profiles "
-                         "and assignee information")
+        step4.add_bullet(
+            "read:jira-user — read user profiles " "and assignee information"
+        )
         step4.add_separator()
         step4.add_text(
             "Alternatively, if your instance offers granular scopes, "
@@ -179,8 +176,8 @@ class LoginPanel(QWidget):
         step5 = GuideStep(5, "Copy the API key and paste it below")
         step5.add_text(
             "Review your choices, then create the key. "
-            "Copy the generated key immediately \u2014 "
-            "you won\u2019t be able to see it again. "
+            "Copy the generated key immediately — "
+            "you won't be able to see it again. "
             "Paste it into the API Token field below."
         )
         api_guide_layout.addWidget(step5)
@@ -254,8 +251,8 @@ class LoginPanel(QWidget):
 
         step1 = GuideStep(1, "Create OAuth 2.0 app at developer.atlassian.com")
         step1.add_text(
-            'Open the Atlassian Developer Console and click '
-            '"Create" \u2192 "OAuth 2.0 integration".'
+            "Open the Atlassian Developer Console and click "
+            '"Create" → "OAuth 2.0 integration".'
         )
         step1.add_code("https://developer.atlassian.com/console/myapps/")
         guide_layout.addWidget(step1)
@@ -268,7 +265,8 @@ class LoginPanel(QWidget):
         guide_layout.addWidget(step2)
 
         step3 = GuideStep(
-            3, "Permissions \u2192 Jira API \u2192 read:jira-work, read:jira-user",
+            3,
+            "Permissions → Jira API → read:jira-work, read:jira-user",
         )
         step3.add_text(
             'In the left sidebar click "Permissions". '
@@ -277,7 +275,7 @@ class LoginPanel(QWidget):
         step3.add_separator()
         step3.add_text(
             'Click "Configure" next to "Jira API". '
-            'Under "Jira platform REST API" \u2192 "Classic Scopes", '
+            'Under "Jira platform REST API" → "Classic Scopes", '
             'click "Edit Scopes" and enable:'
         )
         step3.add_bullet("read:jira-work")
@@ -285,7 +283,8 @@ class LoginPanel(QWidget):
         guide_layout.addWidget(step3)
 
         step4 = GuideStep(
-            4, "Authorization \u2192 OAuth 2.0 (3LO) \u2192 localhost:18492",
+            4,
+            "Authorization → OAuth 2.0 (3LO) → localhost:18492",
         )
         step4.add_text(
             'In the left sidebar click "Authorization". '
@@ -295,7 +294,7 @@ class LoginPanel(QWidget):
         step4.add_code("http://localhost:18492/callback")
         guide_layout.addWidget(step4)
 
-        step5 = GuideStep(5, "Settings \u2192 copy Client ID and Secret below")
+        step5 = GuideStep(5, "Settings → copy Client ID and Secret below")
         step5.add_text(
             'In the left sidebar click "Settings". '
             "Copy the Client ID and Secret, then paste them "
@@ -309,12 +308,12 @@ class LoginPanel(QWidget):
         self._client_id_field = LabelledField(
             "Client ID",
             placeholder="Paste your OAuth Client ID",
-            tooltip="From Atlassian Developer Console \u2192 Your App \u2192 Settings",
+            tooltip="From Atlassian Developer Console → Your App → Settings",
         )
         self._client_secret_field = LabelledField(
             "Client Secret",
             placeholder="Paste your OAuth Client Secret",
-            tooltip="From Atlassian Developer Console \u2192 Your App \u2192 Settings",
+            tooltip="From Atlassian Developer Console → Your App → Settings",
             password=True,
         )
         setup_layout.addWidget(self._client_id_field)
@@ -378,7 +377,9 @@ class LoginPanel(QWidget):
         if method == "api_token":
             logger.debug("Restoring API-token session")
             api_token = self._auth.get_api_token()
-            if api_token and self._jira.connect_basic(saved_url, saved_email, api_token):
+            if api_token and self._jira.connect_basic(
+                saved_url, saved_email, api_token
+            ):
                 logger.info("API-token session restored successfully")
                 self._on_login_success()
                 return
@@ -386,10 +387,10 @@ class LoginPanel(QWidget):
             logger.warning("API-token session restore failed")
             self._status.set_connected(
                 False,
-                "Token expired or revoked \u2014 please generate a new one",
+                "Token expired or revoked — please generate a new one",
             )
             self._show_api_token_error(
-                'Your API token has expired or been revoked. '
+                "Your API token has expired or been revoked. "
                 f'<a href="{_API_TOKEN_URL}">Generate a new token</a> and reconnect.'
             )
             self._tabs.setCurrentIndex(0)
@@ -398,7 +399,7 @@ class LoginPanel(QWidget):
         if method == "oauth":
             logger.debug("Restoring OAuth session")
             if not self._auth.is_configured:
-                logger.info("OAuth not configured \u2014 showing setup section")
+                logger.info("OAuth not configured — showing setup section")
                 self._setup_section.show()
                 self._login_btn.setEnabled(False)
                 self._tabs.setCurrentIndex(1)
@@ -410,9 +411,10 @@ class LoginPanel(QWidget):
                 logger.info("OAuth session restored successfully")
                 self._on_login_success()
             else:
-                logger.warning("OAuth session expired \u2014 user must log in again")
+                logger.warning("OAuth session expired — user must log in again")
                 self._status.set_connected(
-                    False, "Session expired \u2014 please log in again",
+                    False,
+                    "Session expired — please log in again",
                 )
                 self._tabs.setCurrentIndex(1)
             return
@@ -453,7 +455,8 @@ class LoginPanel(QWidget):
 
         if not url or not email or not token:
             QMessageBox.warning(
-                self, "Missing Fields",
+                self,
+                "Missing Fields",
                 "Please fill in URL, Email, and API Token.",
             )
             return
@@ -465,7 +468,7 @@ class LoginPanel(QWidget):
 
         self._api_error_label.hide()
         self._connect_btn.setEnabled(False)
-        self._connect_btn.setText("Connecting\u2026")
+        self._connect_btn.setText("Connecting…")
 
         # Store credentials first
         self._auth.login_api_token(url, email, token)
@@ -475,8 +478,8 @@ class LoginPanel(QWidget):
             self._connect_btn.setEnabled(True)
             self._connect_btn.setText("Connect")
             self._show_api_token_error(
-                'Could not connect to Jira. Check your URL, email, '
-                'and API token and try again.'
+                "Could not connect to Jira. Check your URL, email, "
+                "and API token and try again."
             )
             return
 
@@ -495,8 +498,12 @@ class LoginPanel(QWidget):
         cid = self._client_id_field.text.strip()
         csec = self._client_secret_field.text.strip()
         if not cid or not csec:
-            logger.warning("OAuth credentials incomplete \u2014 both Client ID and Secret required")
-            QMessageBox.warning(self, "Missing Fields", "Please enter both Client ID and Client Secret.")
+            logger.warning(
+                "OAuth credentials incomplete — both Client ID and Secret required"
+            )
+            QMessageBox.warning(
+                self, "Missing Fields", "Please enter both Client ID and Client Secret."
+            )
             return
         self._config.update({"client_id": cid, "client_secret": csec})
         logger.info("OAuth credentials saved")
@@ -510,7 +517,7 @@ class LoginPanel(QWidget):
 
         logger.info("Starting browser login flow")
         self._login_btn.setEnabled(False)
-        self._login_btn.setText("Waiting for browser\u2026")
+        self._login_btn.setText("Waiting for browser…")
 
         self._thread = QThread()
         self._worker = _LoginWorker(self._auth)
@@ -519,8 +526,20 @@ class LoginPanel(QWidget):
         self._worker.finished.connect(self._on_login_finished)
         self._worker.finished.connect(self._thread.quit)
         self._worker.finished.connect(self._cleanup_worker)
-        self._thread.finished.connect(self._thread.deleteLater)
+        self._thread.finished.connect(self._clear_thread)
         self._thread.start()
+
+    def shutdown(self) -> None:
+        """Wait for the login thread to finish before closing."""
+        if self._thread is not None and self._thread.isRunning():
+            self._thread.quit()
+            self._thread.wait()
+
+    def _clear_thread(self) -> None:
+        """Release the thread reference after it finishes."""
+        if self._thread is not None:
+            self._thread.deleteLater()
+            self._thread = None
 
     def _cleanup_worker(self) -> None:
         """Release the worker reference after the login flow completes."""
@@ -528,14 +547,15 @@ class LoginPanel(QWidget):
             self._worker.deleteLater()
             self._worker = None
 
-    def _on_login_finished(self, result: dict[str, Any] | None) -> None:
+    def _on_login_finished(self, result: dict | None) -> None:
         self._login_btn.setEnabled(True)
         self._login_btn.setText("Login with Atlassian")
 
         if result is None:
-            logger.error("Login failed \u2014 authorization timed out or was denied")
+            logger.error("Login failed — authorization timed out or was denied")
             QMessageBox.warning(
-                self, "Login Failed",
+                self,
+                "Login Failed",
                 "Authorization failed or timed out. Please try again.",
             )
             return

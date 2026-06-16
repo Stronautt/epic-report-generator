@@ -1,3 +1,8 @@
 """Epic Report Generator — Jira Epic progress PDF reports."""
 
-__version__ = "0.9"
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    __version__ = version("epic-report-generator")
+except PackageNotFoundError:
+    __version__ = "0.0.0"

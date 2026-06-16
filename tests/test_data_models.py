@@ -8,8 +8,11 @@ from epic_report_generator.core.data_models import (
     EpicData,
     EpicMetrics,
     JiraIssue,
+    MilestoneItem,
     ReportConfig,
     ReportData,
+    ReportItem,
+    TimelineItem,
 )
 
 
@@ -35,13 +38,70 @@ class TestJiraIssue:
 
     def test_nullable_fields(self) -> None:
         issue = JiraIssue(
-            key="X-1", summary="", status="", status_category="To Do",
-            resolution=None, issue_type="Bug", story_points=None,
-            created=None, resolved=None, assignee=None,
+            key="X-1",
+            summary="",
+            status="",
+            status_category="To Do",
+            resolution=None,
+            issue_type="Bug",
+            story_points=None,
+            created=None,
+            resolved=None,
+            assignee=None,
         )
         assert issue.story_points is None
         assert issue.assignee is None
         assert issue.created is None
+
+    def test_progress_and_weight_defaults(self) -> None:
+        issue = JiraIssue(
+            key="X-1",
+            summary="",
+            status="",
+            status_category="To Do",
+            resolution=None,
+            issue_type="Task",
+            story_points=None,
+            created=None,
+            resolved=None,
+            assignee=None,
+        )
+        assert issue.progress == 0.0
+        assert issue.effective_weight == 1.0
+
+    def test_date_fields_default_none(self) -> None:
+        issue = JiraIssue(
+            key="X-1",
+            summary="",
+            status="",
+            status_category="To Do",
+            resolution=None,
+            issue_type="Task",
+            story_points=None,
+            created=None,
+            resolved=None,
+            assignee=None,
+        )
+        assert issue.start_date is None
+        assert issue.due_date is None
+
+    def test_date_fields_set(self) -> None:
+        issue = JiraIssue(
+            key="X-1",
+            summary="",
+            status="",
+            status_category="To Do",
+            resolution=None,
+            issue_type="Task",
+            story_points=None,
+            created=None,
+            resolved=None,
+            assignee=None,
+            start_date=date(2024, 1, 1),
+            due_date=date(2024, 1, 10),
+        )
+        assert issue.start_date == date(2024, 1, 1)
+        assert issue.due_date == date(2024, 1, 10)
 
 
 class TestEpicData:
@@ -49,9 +109,14 @@ class TestEpicData:
 
     def test_default_lists(self) -> None:
         epic = EpicData(
-            key="E-1", summary="Epic", status="Open",
-            priority=None, assignee=None, reporter=None,
-            created=None, updated=None,
+            key="E-1",
+            summary="Epic",
+            status="Open",
+            priority=None,
+            assignee=None,
+            reporter=None,
+            created=None,
+            updated=None,
         )
         assert epic.labels == []
         assert epic.fix_versions == []
@@ -59,16 +124,127 @@ class TestEpicData:
 
     def test_children_not_shared(self) -> None:
         """Default factory must produce independent lists."""
-        a = EpicData(key="A-1", summary="", status="", priority=None,
-                     assignee=None, reporter=None, created=None, updated=None)
-        b = EpicData(key="B-1", summary="", status="", priority=None,
-                     assignee=None, reporter=None, created=None, updated=None)
+        a = EpicData(
+            key="A-1",
+            summary="",
+            status="",
+            priority=None,
+            assignee=None,
+            reporter=None,
+            created=None,
+            updated=None,
+        )
+        b = EpicData(
+            key="B-1",
+            summary="",
+            status="",
+            priority=None,
+            assignee=None,
+            reporter=None,
+            created=None,
+            updated=None,
+        )
         a.children.append(
-            JiraIssue(key="C-1", summary="", status="", status_category="To Do",
-                      resolution=None, issue_type="Task", story_points=None,
-                      created=None, resolved=None, assignee=None)
+            JiraIssue(
+                key="C-1",
+                summary="",
+                status="",
+                status_category="To Do",
+                resolution=None,
+                issue_type="Task",
+                story_points=None,
+                created=None,
+                resolved=None,
+                assignee=None,
+            )
         )
         assert len(b.children) == 0
+
+
+class TestEpicDataDates:
+    """Verify EpicData start_date/due_date fields."""
+
+    def test_date_fields_default_none(self) -> None:
+        epic = EpicData(
+            key="E-1",
+            summary="Epic",
+            status="Open",
+            priority=None,
+            assignee=None,
+            reporter=None,
+            created=None,
+            updated=None,
+        )
+        assert epic.start_date is None
+        assert epic.due_date is None
+
+    def test_date_fields_set(self) -> None:
+        epic = EpicData(
+            key="E-1",
+            summary="Epic",
+            status="Open",
+            priority=None,
+            assignee=None,
+            reporter=None,
+            created=None,
+            updated=None,
+            start_date=date(2024, 3, 1),
+            due_date=date(2024, 6, 30),
+        )
+        assert epic.start_date == date(2024, 3, 1)
+        assert epic.due_date == date(2024, 6, 30)
+
+
+class TestReportItem:
+    """Verify ReportItem dataclass."""
+
+    def test_epic_item(self) -> None:
+        item = ReportItem(kind="epic", key="PROJ-1")
+        assert item.kind == "epic"
+        assert item.key == "PROJ-1"
+        assert item.display_name == ""
+        assert item.scope_certainty is None
+
+    def test_label_item_with_certainty(self) -> None:
+        item = ReportItem(
+            kind="label", key="backend", display_name="Backend", scope_certainty="High"
+        )
+        assert item.kind == "label"
+        assert item.key == "backend"
+        assert item.display_name == "Backend"
+        assert item.scope_certainty == "High"
+
+
+class TestTimelineItem:
+    """Verify TimelineItem dataclass."""
+
+    def test_creation(self) -> None:
+        item = TimelineItem(
+            name="Epic 1",
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 6, 30),
+            scope_certainty="Medium",
+            progress=45.0,
+        )
+        assert item.name == "Epic 1"
+        assert item.start_date == date(2024, 1, 1)
+        assert item.progress == 45.0
+
+    def test_defaults(self) -> None:
+        item = TimelineItem(name="Test")
+        assert item.start_date is None
+        assert item.end_date is None
+        assert item.scope_certainty is None
+        assert item.progress == 0.0
+
+
+class TestMilestoneItem:
+    """Verify MilestoneItem dataclass."""
+
+    def test_creation(self) -> None:
+        ms = MilestoneItem(name="v1.0", release_date=date(2024, 3, 15))
+        assert ms.name == "v1.0"
+        assert ms.release_date == date(2024, 3, 15)
 
 
 class TestEpicMetrics:
@@ -82,6 +258,8 @@ class TestEpicMetrics:
         assert m.velocity_sp_per_week is None
         assert m.forecast_date is None
         assert m.dates == []
+        assert m.estimation_unit == "SP"
+        assert m.scope_certainty is None
 
     def test_time_series_lists_independent(self) -> None:
         a = EpicMetrics()
@@ -96,11 +274,19 @@ class TestReportConfig:
     def test_defaults(self) -> None:
         cfg = ReportConfig()
         assert cfg.title == "Epic Progress Report"
+        assert cfg.estimation_method == "story_points"
+        assert cfg.progress_method == "combined"
         assert cfg.story_points_field == "story_points"
         assert cfg.epic_link_field == "customfield_10014"
+        assert cfg.start_date_field == "startdate"
+        assert cfg.due_date_field == "duedate"
+        assert cfg.timeline_start_field == "startdate"
+        assert cfg.timeline_end_field == "duedate"
+        assert cfg.include_subtasks is True
         assert cfg.dark_mode is False
         assert cfg.confidential is False
         assert cfg.report_date == date.today()
+        assert cfg.items == []
 
 
 class TestReportData:
@@ -112,3 +298,5 @@ class TestReportData:
         assert report.epics == []
         assert report.metrics == []
         assert report.errors == []
+        assert report.resolved_items == []
+        assert report.fix_version_dates == {}
