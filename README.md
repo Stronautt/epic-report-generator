@@ -26,13 +26,15 @@ Epic Report Generator is a desktop app that connects to Jira Cloud, pulls Epic p
 - **FR-10. Predictive Forecasting:** Based on current velocity and remaining story points, the system must generate a Forecast Completion Date for each Epic.
 - **FR-11. PDF Report Generation:** The app must compile all tables and charts into a multi-page PDF document.
 - **FR-12. Jira Label Aggregation:** The system must aggregate child issue data (Stories/Tasks) into a high-level "Label Progress Summary" table, including completion percentages. There should be the ability to add a custom display name to each label that will appear in the report.
-- **FR-13. Scope Certainty:** The system must allow users to set Scope certainty as "Low' or "Medium" or "High" for each label and/or epic during the Report configuration ("STEP 1. Configuration").
+- **FR-13. Scope Certainty:** The system must allow users to set Scope certainty as "Low' or "Medium" or "High" for each label and/or epic during the Report configuration ("STEP 1. Configuration").The "Label Certainty" dropdown should include a “Consolidated” option, allowing users to set individual certainty values for each epic associated with the label. While this option is named 'Consolidated' in the configuration settings, the report itself should display 'Low,' 'Medium,' or 'High' based on the average certainty values of the underlying child epics.
 
 ## Non-Functional Requirements
 
 - **NFR-01. Security (Auth):** The application must not store plain-text passwords; it should prefer Jira API Tokens and environment variables for sensitive data.
 - **NFR-02. Portability:** The application should be cross-platform (Windows/Mac/Linux).
 - **NFR-03. Reliability:** The system must include error handling for API connection failures and provide meaningful logs to the user.
+- **NFR-04. UI:** The “Epic Progress Summary” should be configured to fit precisely on a single page, with the layout automatically scaling its vertical dimensions based on the cumulative height of the tables
+- **NFR-05. UI:** Report must support theme customization: colors and fonts
 
 ## Quick start
 
