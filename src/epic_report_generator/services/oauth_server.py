@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import logging
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -11,25 +12,32 @@ logger = logging.getLogger(__name__)
 
 _CALLBACK_TIMEOUT_S = 300  # 5 minutes max wait for the browser OAuth flow
 
-_SUCCESS_HTML = """<!DOCTYPE html>
+_PAGE_HTML = """<!DOCTYPE html>
 <html><head><title>Epic Report Generator</title>
-<style>body{font-family:system-ui,sans-serif;display:flex;justify-content:center;
-align-items:center;height:100vh;margin:0;background:#f4f5f7;color:#172b4d}
-.card{text-align:center;padding:2rem 3rem;background:#fff;border-radius:8px;
-box-shadow:0 1px 4px rgba(0,0,0,.15)}h1{margin:0 0 .5rem;font-size:1.5rem}
-p{margin:0;color:#6b778c}</style></head>
-<body><div class="card"><h1>&#10003; Authorized</h1>
-<p>You can close this tab and return to the application.</p></div></body></html>"""
+<style>body{{font-family:system-ui,sans-serif;display:flex;justify-content:center;
+align-items:center;height:100vh;margin:0;background:#f4f5f7;color:#172b4d}}
+.card{{text-align:center;padding:2rem 3rem;background:#fff;border-radius:8px;
+box-shadow:0 1px 4px rgba(0,0,0,.15)}}h1{{margin:0 0 .5rem;font-size:1.5rem;color:{h1_color}}}
+p{{margin:0;color:#6b778c}}</style></head>
+<body><div class="card"><h1>{heading}</h1>
+<p>{body}</p></div></body></html>"""
 
-_ERROR_HTML = """<!DOCTYPE html>
-<html><head><title>Epic Report Generator</title>
-<style>body{font-family:system-ui,sans-serif;display:flex;justify-content:center;
-align-items:center;height:100vh;margin:0;background:#f4f5f7;color:#172b4d}
-.card{text-align:center;padding:2rem 3rem;background:#fff;border-radius:8px;
-box-shadow:0 1px 4px rgba(0,0,0,.15)}h1{margin:0 0 .5rem;font-size:1.5rem;color:#de350b}
-p{margin:0;color:#6b778c}</style></head>
-<body><div class="card"><h1>&#10007; Authorization Failed</h1>
-<p>%s</p></div></body></html>"""
+
+def _success_page() -> str:
+    return _PAGE_HTML.format(
+        h1_color="#172b4d",
+        heading="&#10003; Authorized",
+        body="You can close this tab and return to the application.",
+    )
+
+
+def _error_page(message: str) -> str:
+    """Build the error page, escaping the (possibly user-controlled) message."""
+    return _PAGE_HTML.format(
+        h1_color="#de350b",
+        heading="&#10007; Authorization Failed",
+        body=html.escape(message),
+    )
 
 
 class OAuthCallbackHandler(BaseHTTPRequestHandler):
@@ -52,7 +60,7 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
         if error:
             desc = params.get("error_description", [error])[0]
             logger.error("OAuth callback error: %s — %s", error, desc)
-            self._respond(400, _ERROR_HTML % desc)
+            self._respond(400, _error_page(desc))
             server.result = {"error": error, "error_description": desc}
             return
 
@@ -61,28 +69,28 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
 
         if not code or not state:
             logger.warning("OAuth callback missing code or state parameter")
-            self._respond(400, _ERROR_HTML % "Missing code or state parameter.")
+            self._respond(400, _error_page("Missing code or state parameter."))
             server.result = {"error": "missing_params"}
             return
 
         if state != server.expected_state:
             logger.error("OAuth state mismatch — possible CSRF attack")
-            self._respond(400, _ERROR_HTML % "State mismatch — possible CSRF attack.")
+            self._respond(400, _error_page("State mismatch — possible CSRF attack."))
             server.result = {"error": "state_mismatch"}
             return
 
         logger.info("OAuth callback received — authorization code captured")
-        self._respond(200, _SUCCESS_HTML)
+        self._respond(200, _success_page())
         server.result = {"code": code, "state": state}
 
-    def _respond(self, status: int, html: str) -> None:
+    def _respond(self, status: int, body: str) -> None:
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
-        self.wfile.write(html.encode())
+        self.wfile.write(body.encode())
 
     def log_message(self, format: str, *args: object) -> None:  # noqa: A002
-        """Suppress default stderr logging."""
+        """Route BaseHTTPRequestHandler access logs to the Python logger."""
         logger.debug("OAuth callback server: %s", format % args)
 
 
@@ -119,7 +127,7 @@ def wait_for_callback(port: int, expected_state: str) -> dict[str, str] | None:
 
     if thread.is_alive():
         logger.warning("OAuth callback timed out after %ds", server.timeout)
-        server.shutdown()
+        server.server_close()  # release the listening socket (shutdown() is a no-op here)
         return None
 
     logger.debug("OAuth callback server stopped")

@@ -6,6 +6,11 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Literal
 
+# Jira status category names — single source of truth across core modules.
+STATUS_TODO = "To Do"
+STATUS_IN_PROGRESS = "In Progress"
+STATUS_DONE = "Done"
+
 # Locale-independent English month names — shared across PDF, chart, and UI code.
 MONTHS_ABBR = [
     "Jan",
@@ -47,6 +52,25 @@ def fmt_date_en(d: date, fmt: str) -> str:
     result = fmt.replace("%B", MONTHS_FULL[d.month - 1])
     result = result.replace("%b", MONTHS_ABBR[d.month - 1])
     return d.strftime(result)
+
+
+# Scope-certainty vocabulary (FR-13) — ordered low→high for averaging.
+CERTAINTY_LEVELS = ["Low", "Medium", "High"]
+_CERTAINTY_TO_SCORE = {name: i + 1 for i, name in enumerate(CERTAINTY_LEVELS)}
+
+
+def average_certainty(values: list[str | None]) -> str | None:
+    """Return the rounded average certainty level, or ``None`` when none set.
+
+    Maps ``Low/Medium/High`` to ``1/2/3``, averages the set values, rounds to
+    the nearest level, and maps back to a name.  Empty/None inputs are ignored.
+    """
+    scores = [_CERTAINTY_TO_SCORE[v] for v in values if v in _CERTAINTY_TO_SCORE]
+    if not scores:
+        return None
+    avg = round(sum(scores) / len(scores))
+    avg = max(1, min(len(CERTAINTY_LEVELS), avg))
+    return CERTAINTY_LEVELS[avg - 1]
 
 
 @dataclass
@@ -106,6 +130,19 @@ class EpicData:
 
 
 @dataclass
+class ChildOverride:
+    """Per-child customisation for a report item (FR-13).
+
+    For an epic item the "children" are its stories/tasks; for a label item the
+    children are the epics tagged with that label.  Either field may be empty to
+    leave the corresponding value unchanged.
+    """
+
+    display_name: str = ""
+    scope_certainty: str | None = None  # None, "Low", "Medium", "High"
+
+
+@dataclass
 class ReportItem:
     """A single user input unit for the report — either an epic key or a label."""
 
@@ -113,6 +150,10 @@ class ReportItem:
     key: str
     display_name: str = ""
     scope_certainty: str | None = None  # None, "Low", "Medium", "High"
+    # Per-child overrides keyed by child Jira key (epic key for label items,
+    # story/task key for epic items).  Only used when scope_certainty is unset
+    # ("--" / consolidated): the report then shows the average of child values.
+    child_overrides: dict[str, ChildOverride] = field(default_factory=dict)
 
 
 @dataclass
@@ -126,6 +167,8 @@ class TimelineItem:
     progress: float = 0.0
     is_child: bool = False
     group: str = ""
+    summary: str = ""
+    weight: float = 1.0
 
 
 @dataclass
@@ -168,7 +211,6 @@ class EpicMetrics:
 class ReportConfig:
     """Configuration for a report generation run."""
 
-    project_key: str = ""
     epic_keys: list[str] = field(default_factory=list)
     items: list[ReportItem] = field(default_factory=list)
     title: str = "Epic Progress Report"
@@ -195,6 +237,10 @@ class ReportConfig:
     show_additional_metrics: bool = True
     show_timeline_chart: bool = True  # include/exclude the Gantt timeline page
     dark_mode: bool = False
+    # Appearance customization (NFR-05). Empty values keep the stock palette/font.
+    report_accent: str = ""  # "" = built-in blue, else "#rrggbb"
+    report_font_family: str = ""  # resolved family name; "" = bundled Inter
+    report_font_dir: str = ""  # dir of font files for Typst font_paths; "" = none
 
 
 def collect_child_timeline_dates(

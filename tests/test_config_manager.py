@@ -65,13 +65,6 @@ class TestSetAndGet:
         assert mgr.get("jira_url") == "https://x.atlassian.net"
         assert mgr.get("jira_email") == "a@b.com"
 
-    def test_data_property_returns_copy(self, tmp_path: Path) -> None:
-        mgr = _make_manager(tmp_path)
-        data = mgr.data
-        data["theme"] = "dark"
-        assert mgr.get("theme") == "light"  # original unchanged
-
-
 class TestPersistence:
     """Config should persist to and load from disk."""
 

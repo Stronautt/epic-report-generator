@@ -6,6 +6,7 @@ import logging
 from datetime import date, timedelta
 
 from epic_report_generator.core.data_models import (
+    STATUS_DONE,
     EpicData,
     EpicMetrics,
     JiraIssue,
@@ -20,7 +21,7 @@ PROGRESS_COMBINED = "combined"
 PROGRESS_ISSUES_ONLY = "issues_only"
 PROGRESS_ESTIMATES_ONLY = "estimates_only"
 
-STATUS_DONE = "Done"
+__all__ = ["calculate_metrics", "merge_metrics"]
 
 DEFAULT_WEIGHT = 1.0
 PROGRESS_MIN = 0.0
@@ -49,6 +50,8 @@ def calculate_metrics(
     epic: EpicData,
     estimation_method: str = "story_points",
     progress_method: str = PROGRESS_COMBINED,
+    *,
+    reference_date: date | None = None,
 ) -> EpicMetrics:
     """Compute all metrics for a single Epic from its child issues.
 
@@ -71,6 +74,7 @@ def calculate_metrics(
     progress is the weighted average of its direct children's progress.
     """
     progress_method = _normalise_progress_method(progress_method)
+    reference_date = reference_date or date.today()
     children = epic.children
     m = EpicMetrics()
     m.estimation_unit = "Days" if estimation_method == "time_days" else "SP"
@@ -95,7 +99,6 @@ def calculate_metrics(
             parent_to_subs.setdefault(c.parent_key, []).append(c)
             subtask_keys.add(c.key)
 
-    # Compute bottom-up progress for every issue and set .progress / .effective_weight
     omit_unestimated = progress_method == PROGRESS_ESTIMATES_ONLY
     _compute_all_issue_progress(
         children, direct_estimates, parent_to_subs, use_estimates, omit_unestimated
@@ -179,17 +182,21 @@ def calculate_metrics(
     m.remaining_sp = total_sp - completed_sp
 
     m.avg_cycle_time_days = _avg_cycle_time(children)
-    m.velocity_sp_per_week = _velocity(children, estimation_method, weeks=4)
+    m.velocity_sp_per_week = _velocity(
+        children, estimation_method, weeks=4, reference_date=reference_date
+    )
     m.scope_change_pct = _scope_change(children)
     m.blocked_issues = sum(
         1
         for c in children
         if "blocked" in c.status.lower() and c.status_category != STATUS_DONE
     )
-    m.forecast_date = _forecast(m.remaining_sp, m.velocity_sp_per_week)
+    m.forecast_date = _forecast(
+        m.remaining_sp, m.velocity_sp_per_week, reference_date=reference_date
+    )
 
     # Build time-series
-    _build_time_series(m, children, estimation_method)
+    _build_time_series(m, children, estimation_method, reference_date=reference_date)
 
     logger.debug(
         "Metrics for %s: progress=%.1f%%, %d/%d issues done, %.0f/%.0f %s",
@@ -211,6 +218,7 @@ def merge_metrics(
     *,
     include_subtask_timeline: bool = True,
     source_metrics_out: list[EpicMetrics] | None = None,
+    reference_date: date | None = None,
 ) -> tuple[EpicData, EpicMetrics]:
     """Merge multiple epics into a single synthetic epic and compute metrics.
 
@@ -224,6 +232,7 @@ def merge_metrics(
     the same order as *epics*.  This avoids callers needing to recompute them.
     """
     progress_method = _normalise_progress_method(progress_method)
+    reference_date = reference_date or date.today()
     seen: set[str] = set()
     merged_children: list[JiraIssue] = []
     all_labels: list[str] = []
@@ -267,7 +276,7 @@ def merge_metrics(
             continue
         collect_child_timeline_dates(c, tl_starts, tl_ends)
     if not due_dates and start_dates:
-        due_dates = [date.today()]
+        due_dates = [reference_date]
 
     synthetic = EpicData(
         key=", ".join(keys) if keys else "LABEL",
@@ -292,24 +301,24 @@ def merge_metrics(
     epic_metrics_list: list[EpicMetrics] = []
     for epic in epics:
         epic_metrics_list.append(
-            calculate_metrics(epic, estimation_method, progress_method)
+            calculate_metrics(
+                epic, estimation_method, progress_method, reference_date=reference_date
+            )
         )
     if source_metrics_out is not None:
         source_metrics_out.extend(epic_metrics_list)
 
     # Compute the label-group metrics from the merged synthetic epic
-    m = calculate_metrics(synthetic, estimation_method, progress_method)
+    m = calculate_metrics(
+        synthetic, estimation_method, progress_method, reference_date=reference_date
+    )
 
-    # Override progress: weighted average of per-epic progress values
+    # Override progress: weighted average of per-epic progress values.
+    # Reuses .effective_weight already set by the calculate_metrics calls above.
     if epic_metrics_list:
-        # Each epic's weight = sum of its direct children's effective weights
         epic_weights: list[float] = []
         for epic in epics:
-            child_key_set = {c.key for c in epic.children}
-            subtask_keys: set[str] = set()
-            for c in epic.children:
-                if c.parent_key and c.parent_key in child_key_set:
-                    subtask_keys.add(c.key)
+            subtask_keys = _subtask_keys(epic.children)
             direct_children = [c for c in epic.children if c.key not in subtask_keys]
             epic_weights.append(
                 sum(c.effective_weight for c in direct_children)
@@ -328,6 +337,12 @@ def merge_metrics(
 
 
 # -- helpers ------------------------------------------------------------------
+
+
+def _subtask_keys(children: list[JiraIssue]) -> set[str]:
+    """Return keys of children whose parent is also among *children* (subtasks)."""
+    child_key_set = {c.key for c in children}
+    return {c.key for c in children if c.parent_key and c.parent_key in child_key_set}
 
 
 def _get_estimate(issue: JiraIssue, method: str) -> float | None:
@@ -448,9 +463,11 @@ def _velocity(
     children: list[JiraIssue],
     estimation_method: str = "story_points",
     weeks: int = 4,
+    *,
+    reference_date: date | None = None,
 ) -> float | None:
     """Estimate completed per week over the last *weeks* weeks."""
-    cutoff_date = date.today() - timedelta(weeks=weeks)
+    cutoff_date = (reference_date or date.today()) - timedelta(weeks=weeks)
     sp = sum(
         est
         for c in children
@@ -476,17 +493,24 @@ def _scope_change(children: list[JiraIssue]) -> float | None:
     return (added_later / len(children)) * 100
 
 
-def _forecast(remaining_sp: float, velocity: float | None) -> date | None:
+def _forecast(
+    remaining_sp: float,
+    velocity: float | None,
+    *,
+    reference_date: date | None = None,
+) -> date | None:
     if not velocity or velocity <= 0 or remaining_sp <= 0:
         return None
     weeks_remaining = remaining_sp / velocity
-    return date.today() + timedelta(weeks=weeks_remaining)
+    return (reference_date or date.today()) + timedelta(weeks=weeks_remaining)
 
 
 def _build_time_series(
     m: EpicMetrics,
     children: list[JiraIssue],
     estimation_method: str = "story_points",
+    *,
+    reference_date: date | None = None,
 ) -> None:
     """Build daily time-series arrays for the trend chart.
 
@@ -498,7 +522,7 @@ def _build_time_series(
         return
 
     min_date = min(dt for _, dt in dated).date()
-    max_date = date.today()
+    max_date = reference_date or date.today()
     if min_date >= max_date:
         return
 

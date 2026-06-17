@@ -24,6 +24,7 @@ env:
     --include-qt-plugins=sensible
     --include-package-data=epic_report_generator.resources
     --include-package-data=qt_material
+    --include-package=typst
   # Modules to exclude — space-separated, expanded into --nofollow-import-to= flags at build time
   NUITKA_NOFOLLOW: >-
     tkinter unittest test distutils
@@ -45,20 +46,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-22.04
+          - os: ubuntu-24.04
             installer_path: "epic-report-generator.AppImage"
-          - os: macos-15
-            installer_path: "epic-report-generator-arm64.dmg"
-          - os: macos-15-intel
-            installer_path: "epic-report-generator-intel.dmg"
-          - os: windows-2022
+          - os: macos-26
+            installer_path: "epic-report-generator.dmg"
+          - os: windows-2025
             installer_path: "packaging/windows/Output/epic-report-generator-setup.exe"
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
@@ -68,7 +67,7 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends \
-            libgl1 libegl1 patchelf libxkbcommon0 libxcb-cursor0 fuse libfuse2
+            libgl1 libegl1 patchelf libxkbcommon0 libxcb-cursor0 libfuse2t64
 
       - name: Install Python deps
         run: |
@@ -101,15 +100,6 @@ jobs:
           img = Image.open('src/epic_report_generator/resources/logo.png')
           img.save('src/epic_report_generator/resources/logo.ico', sizes=[(16,16),(32,32),(48,48),(256,256)])
           "
-
-      # Homebrew on Intel places an openssl@3 symlink at /usr/local/lib/libcrypto.dylib
-      # pointing to /usr/local/opt/openssl@3/lib/libcrypto.3.dylib. Nuitka's dependency
-      # scanner cannot reconcile the two paths and aborts with a FATAL error. Unlinking
-      # removes the symlink so the scanner never encounters it. The setup-python Python
-      # ships its own OpenSSL, so nothing else is affected.
-      - name: Unlink Homebrew OpenSSL (macOS Intel)
-        if: matrix.os == 'macos-15-intel'
-        run: brew unlink openssl@3 || true
 
       - name: Build Nuitka binary
         shell: bash
@@ -208,10 +198,11 @@ jobs:
             "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage" \
             -O appimagetool
           chmod +x appimagetool
-          ARCH=x86_64 ./appimagetool packaging/linux/AppDir epic-report-generator.AppImage
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run \
+            packaging/linux/AppDir epic-report-generator.AppImage
 
       - name: Upload installer
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: installer-${{ matrix.os }}
           path: ${{ matrix.installer_path }}
@@ -220,10 +211,10 @@ jobs:
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Download all installer artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
@@ -232,7 +223,7 @@ jobs:
         run: find artifacts -type f | sort
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
           files: |

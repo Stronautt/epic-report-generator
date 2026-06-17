@@ -6,15 +6,19 @@ import re
 
 from PySide6.QtCore import (
     QEvent,
+    QMimeData,
     QObject,
     QPoint,
-    QRect,
     QSize,
     Qt,
     QTimer,
     Signal,
 )
 from PySide6.QtGui import (
+    QDrag,
+    QDragEnterEvent,
+    QDragMoveEvent,
+    QDropEvent,
     QGuiApplication,
     QMouseEvent,
     QPainter,
@@ -22,24 +26,26 @@ from PySide6.QtGui import (
     QPixmap,
 )
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QCompleter,
+    QDialog,
+    QDialogButtonBox,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
-    QLayout,
-    QLayoutItem,
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
-    QWidgetItem,
 )
 
-from epic_report_generator.core.data_models import ReportItem
+from epic_report_generator.core.data_models import ChildOverride, ReportItem
 from epic_report_generator.services.config_manager import (
     DEFAULT_PROFILE_NAME,
     ConfigManager,
@@ -66,6 +72,29 @@ def no_scroll_wheel(widget: QWidget) -> None:
     widget.installEventFilter(_IgnoreScrollFilter(widget))
     if isinstance(widget, QComboBox):
         widget.view().setIconSize(QSize(0, 0))
+
+
+def make_scroll_content(
+    *,
+    spacing: int = 16,
+    margins: tuple[int, int, int, int] = (32, 32, 32, 32),
+) -> tuple[QScrollArea, QVBoxLayout]:
+    """Return a frameless, resizable scroll area and its content layout.
+
+    The returned ``QScrollArea`` wraps an inner content ``QWidget`` whose
+    ``QVBoxLayout`` (configured with *margins* and *spacing*) is returned so
+    callers can add their widgets directly.
+    """
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+
+    content = QWidget()
+    scroll.setWidget(content)
+    layout = QVBoxLayout(content)
+    layout.setContentsMargins(*margins)
+    layout.setSpacing(spacing)
+    return scroll, layout
 
 
 class StatusIndicator(QWidget):
@@ -260,90 +289,6 @@ class GuideStep(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# FlowLayout — wrapping layout for tag chips
-# ---------------------------------------------------------------------------
-
-
-class FlowLayout(QLayout):
-    """Flow layout that arranges widgets left-to-right, wrapping rows."""
-
-    def __init__(self, parent: QWidget | None = None, spacing: int = 6) -> None:
-        super().__init__(parent)
-        self._items: list[QLayoutItem] = []
-        self._spacing = spacing
-
-    def addItem(self, item: QLayoutItem) -> None:  # noqa: N802
-        self._items.append(item)
-
-    def insertWidget(self, index: int, widget: QWidget) -> None:  # noqa: N802
-        """Insert a widget at a specific position in the flow."""
-        self.addChildWidget(widget)
-        item = QWidgetItem(widget)
-        self._items.insert(index, item)
-
-    def count(self) -> int:
-        return len(self._items)
-
-    def itemAt(self, index: int) -> QLayoutItem | None:  # noqa: N802
-        if 0 <= index < len(self._items):
-            return self._items[index]
-        return None
-
-    def takeAt(self, index: int) -> QLayoutItem | None:  # noqa: N802
-        if 0 <= index < len(self._items):
-            return self._items.pop(index)
-        return None
-
-    def expandingDirections(self) -> Qt.Orientation:  # noqa: N802
-        return Qt.Orientation(0)
-
-    def hasHeightForWidth(self) -> bool:  # noqa: N802
-        return True
-
-    def heightForWidth(self, width: int) -> int:  # noqa: N802
-        return self._do_layout(QRect(0, 0, width, 0), test_only=True)
-
-    def setGeometry(self, rect: QRect) -> None:  # noqa: N802
-        super().setGeometry(rect)
-        self._do_layout(rect, test_only=False)
-
-    def sizeHint(self) -> QSize:  # noqa: N802
-        return self.minimumSize()
-
-    def minimumSize(self) -> QSize:  # noqa: N802
-        size = QSize()
-        for item in self._items:
-            size = size.expandedTo(item.minimumSize())
-        m = self.contentsMargins()
-        size += QSize(m.left() + m.right(), m.top() + m.bottom())
-        return size
-
-    def _do_layout(self, rect: QRect, test_only: bool) -> int:
-        m = self.contentsMargins()
-        effective = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
-        x = effective.x()
-        y = effective.y()
-        row_height = 0
-
-        for item in self._items:
-            sz = item.sizeHint()
-            next_x = x + sz.width() + self._spacing
-            if next_x - self._spacing > effective.right() and row_height > 0:
-                x = effective.x()
-                y += row_height + self._spacing
-                next_x = x + sz.width() + self._spacing
-                row_height = 0
-
-            if not test_only:
-                item.setGeometry(QRect(QPoint(x, y), sz))
-
-            x = next_x
-            row_height = max(row_height, sz.height())
-
-        return y + row_height - rect.y() + m.bottom()
-
-
-# ---------------------------------------------------------------------------
 # CollapsibleSection — reusable expand/collapse section
 # ---------------------------------------------------------------------------
 
@@ -425,133 +370,32 @@ class CollapsibleSection(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# EpicKeyTagInput — tag/chip input for epic keys
+# RE_EPIC_KEY — canonical epic-key validation regex (used by config_panel)
 # ---------------------------------------------------------------------------
 
 RE_EPIC_KEY = re.compile(r"^[A-Z][A-Z0-9_]+-\d+$")
 
 
-class _EpicKeyChip(QWidget):
-    """A single removable chip representing an epic key."""
+def _coerce_overrides(raw: dict | None) -> dict[str, ChildOverride]:
+    """Normalise persisted/in-memory override data into ``ChildOverride`` objects.
 
-    removed = Signal(str)
-
-    def __init__(self, key: str, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.key = key
-        self.setObjectName("epicKeyChip")
-
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 2, 4, 2)
-        layout.setSpacing(4)
-
-        label = QLabel(key)
-        label.setStyleSheet("background: transparent; border: none; padding: 0;")
-        layout.addWidget(label)
-
-        close_btn = QPushButton("×")
-        close_btn.setFixedSize(18, 18)
-        close_btn.setObjectName("epicKeyChipClose")
-        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        close_btn.clicked.connect(lambda: self.removed.emit(self.key))
-        layout.addWidget(close_btn)
-
-        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-
-
-class EpicKeyTagInput(QWidget):
-    """Tag/chip input widget for entering Jira epic keys."""
-
-    tags_changed = Signal()
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setObjectName("epicKeyTagInput")
-        self.setCursor(Qt.CursorShape.IBeamCursor)
-
-        self._chips: list[_EpicKeyChip] = []
-
-        self._flow = FlowLayout(self, spacing=6)
-        self._flow.setContentsMargins(6, 6, 6, 6)
-
-        self._line_edit = QLineEdit()
-        self._line_edit.setPlaceholderText("Type epic key and press Enter")
-        self._line_edit.setFrame(False)
-        self._line_edit.setStyleSheet(
-            "border: none; background: transparent; padding: 4px 2px;"
-        )
-        self._line_edit.setMinimumWidth(180)
-        self._line_edit.returnPressed.connect(self._commit_text)
-        self._line_edit.installEventFilter(self)
-        self._flow.addWidget(self._line_edit)
-
-    def mousePressEvent(self, event: QMouseEvent) -> None:
-        """Focus the line edit when clicking anywhere in the container."""
-        self._line_edit.setFocus()
-        super().mousePressEvent(event)
-
-    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
-        """Handle Tab/comma for tag creation and paste for multi-value input."""
-        from PySide6.QtGui import QKeyEvent
-
-        if obj is self._line_edit and isinstance(event, QKeyEvent):
-            if event.type() == QEvent.Type.KeyPress:
-                if event.key() in (Qt.Key.Key_Tab, Qt.Key.Key_Comma):
-                    self._commit_text()
-                    return True
-        return super().eventFilter(obj, event)
-
-    def get_keys(self) -> list[str]:
-        """Return all current epic keys."""
-        return [chip.key for chip in self._chips]
-
-    def set_keys(self, keys: list[str]) -> None:
-        """Replace all chips with the given keys."""
-        self.clear()
-        for key in keys:
-            self._add_chip(key)
-
-    def clear(self) -> None:
-        """Remove all chips and clear the input."""
-        for chip in list(self._chips):
-            self._remove_chip(chip.key)
-        self._line_edit.clear()
-
-    def _commit_text(self) -> None:
-        """Parse input text and create chips for valid keys."""
-        raw = self._line_edit.text()
-        # Split on commas, newlines, whitespace for paste support
-        parts = re.split(r"[,\n\s]+", raw)
-        any_added = False
-        existing_keys = {c.key for c in self._chips}
-        for part in parts:
-            part = part.strip().upper()
-            if not part:
-                continue
-            if RE_EPIC_KEY.match(part) and part not in existing_keys:
-                self._add_chip(part)
-                existing_keys.add(part)
-                any_added = True
-        self._line_edit.clear()
-        if any_added:
-            self.tags_changed.emit()
-
-    def _add_chip(self, key: str) -> None:
-        chip = _EpicKeyChip(key)
-        chip.removed.connect(self._remove_chip)
-        self._chips.append(chip)
-        # Insert chip before the line edit
-        idx = self._flow.count() - 1  # line edit is last
-        self._flow.insertWidget(idx, chip)
-
-    def _remove_chip(self, key: str) -> None:
-        for chip in self._chips:
-            if chip.key == key:
-                self._chips.remove(chip)
-                self._flow.removeWidget(chip)
-                chip.deleteLater()
-                self.tags_changed.emit()
-                break
+    Accepts either a mapping of key → ``ChildOverride`` or key → plain dict
+    (as stored in config JSON), dropping entries with no actual override.
+    """
+    result: dict[str, ChildOverride] = {}
+    for key, value in (raw or {}).items():
+        if isinstance(value, ChildOverride):
+            display_name = value.display_name
+            certainty = value.scope_certainty
+        else:
+            display_name = (value or {}).get("display_name", "")
+            certainty = (value or {}).get("scope_certainty") or None
+        display_name = (display_name or "").strip()
+        if display_name or certainty:
+            result[key] = ChildOverride(
+                display_name=display_name, scope_certainty=certainty
+            )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -559,11 +403,59 @@ class EpicKeyTagInput(QWidget):
 # ---------------------------------------------------------------------------
 
 
+class _DragHandle(QLabel):
+    """Grip handle that initiates a drag once the cursor moves far enough.
+
+    Emits ``drag_requested`` so the owning row can ask the table to start an
+    internal-move drag. Confining drag initiation to this handle keeps the
+    row's line edits and combo boxes fully interactive.
+    """
+
+    drag_requested = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__("⠇", parent)  # ⠿ braille grip
+        self.setObjectName("dragHandle")
+        self.setFixedWidth(18)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setToolTip("Drag to reorder")
+        self.setStyleSheet(
+            "QLabel#dragHandle { color: #999; font-size: 15px; }"
+            "QLabel#dragHandle:hover { color: #555; }"
+        )
+        self._press_pos: QPoint | None = None
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._press_pos = event.position().toPoint()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        self._press_pos = None
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        super().mouseReleaseEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self._press_pos is None or not (event.buttons() & Qt.MouseButton.LeftButton):
+            super().mouseMoveEvent(event)
+            return
+        moved = (event.position().toPoint() - self._press_pos).manhattanLength()
+        if moved >= QApplication.startDragDistance():
+            self._press_pos = None
+            self.drag_requested.emit()  # blocks for the duration of the drag
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+        super().mouseMoveEvent(event)
+
+
 class _ReportItemRow(QWidget):
     """A single row in the ReportItemTable."""
 
     removed = Signal(object)  # emits self
     changed = Signal()  # emits on any field change
+    drag_started = Signal(object)  # emits self when the drag handle is dragged
+    edit_requested = Signal(object)  # emits self when the customize button is clicked
 
     def __init__(
         self,
@@ -571,12 +463,22 @@ class _ReportItemRow(QWidget):
         key: str = "",
         display_name: str = "",
         scope_certainty: str = "",
+        child_overrides: dict | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        # Per-child overrides keyed by child Jira key (see ChildOverride).
+        self._child_overrides: dict[str, ChildOverride] = _coerce_overrides(
+            child_overrides
+        )
+        self._initialised = False
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 2, 0, 2)
         layout.setSpacing(4)
+
+        self.drag_handle = _DragHandle()
+        self.drag_handle.drag_requested.connect(lambda: self.drag_started.emit(self))
+        layout.addWidget(self.drag_handle)
 
         self.kind_combo = QComboBox()
         no_scroll_wheel(self.kind_combo)
@@ -615,6 +517,19 @@ class _ReportItemRow(QWidget):
         self.certainty_combo.currentIndexChanged.connect(lambda: self.changed.emit())
         layout.addWidget(self.certainty_combo)
 
+        edit_btn = QPushButton("⚙")
+        edit_btn.setFixedSize(22, 22)
+        edit_btn.setToolTip("Customize the epics/stories within this item")
+        edit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        edit_btn.setStyleSheet(
+            "QPushButton { background: transparent; border: none; color: #999;"
+            " font-size: 14px; padding: 0; border-radius: 0; }"
+            "QPushButton:hover { background: transparent; color: #0052CC; }"
+            "QPushButton:pressed { background: transparent; color: #003C99; }"
+        )
+        edit_btn.clicked.connect(lambda: self.edit_requested.emit(self))
+        layout.addWidget(edit_btn)
+
         remove_btn = QPushButton("✕")
         remove_btn.setFixedSize(22, 22)
         remove_btn.setToolTip("Remove this row")
@@ -630,8 +545,12 @@ class _ReportItemRow(QWidget):
 
         self._label_completions: list[str] = []
 
+        # Drop stale per-child overrides when the user switches epic↔label.
+        self.kind_combo.currentIndexChanged.connect(self._on_kind_toggled)
+
         # Apply initial kind-based state
         self._on_kind_changed()
+        self._initialised = True
 
     def set_label_completions(self, labels: list[str]) -> None:
         """Set autocomplete suggestions for the key field when kind is label."""
@@ -662,6 +581,43 @@ class _ReportItemRow(QWidget):
             self.key_edit.setPlaceholderText("PROJ-123")
             self.key_edit.setCompleter(None)  # type: ignore[arg-type]
 
+    def _on_kind_toggled(self) -> None:
+        """Discard per-child overrides when the user switches the item kind.
+
+        Stale overrides keyed by the previous kind's child keys would never
+        match the new kind's children, so clear them on a genuine user toggle
+        (skipped during construction/restore where kind is set silently).
+        """
+        if self._initialised and self._child_overrides:
+            self._child_overrides = {}
+
+    @property
+    def kind(self) -> str:
+        """Current item kind (``"epic"`` or ``"label"``)."""
+        return self.kind_combo.currentData() or "epic"
+
+    @property
+    def key(self) -> str:
+        """Current trimmed key/label text."""
+        return self.key_edit.text().strip()
+
+    @property
+    def scope_certainty(self) -> str:
+        """Current parent certainty data value (``""`` when unset / consolidated)."""
+        return self.certainty_combo.currentData() or ""
+
+    def get_child_overrides(self) -> dict[str, ChildOverride]:
+        """Return a copy of the per-child overrides."""
+        return {
+            k: ChildOverride(v.display_name, v.scope_certainty)
+            for k, v in self._child_overrides.items()
+        }
+
+    def set_child_overrides(self, overrides: dict[str, ChildOverride]) -> None:
+        """Replace the per-child overrides and signal a change for persistence."""
+        self._child_overrides = _coerce_overrides(overrides)
+        self.changed.emit()
+
     def to_report_item(self) -> ReportItem | None:
         """Build a ReportItem from the row, or None if key is empty."""
         kind = self.kind_combo.currentData() or "epic"
@@ -673,7 +629,11 @@ class _ReportItemRow(QWidget):
         display_name = self.name_edit.text().strip() if kind == "label" else ""
         certainty = self.certainty_combo.currentData() or None
         return ReportItem(
-            kind=kind, key=key, display_name=display_name, scope_certainty=certainty
+            kind=kind,
+            key=key,
+            display_name=display_name,
+            scope_certainty=certainty,
+            child_overrides=self.get_child_overrides(),
         )
 
     def to_dict(self) -> dict:
@@ -684,6 +644,13 @@ class _ReportItemRow(QWidget):
             "key": self.key_edit.text().strip(),
             "display_name": self.name_edit.text().strip() if kind == "label" else "",
             "scope_certainty": self.certainty_combo.currentData() or "",
+            "child_overrides": {
+                k: {
+                    "display_name": ov.display_name,
+                    "scope_certainty": ov.scope_certainty or "",
+                }
+                for k, ov in self._child_overrides.items()
+            },
         }
 
 
@@ -691,11 +658,17 @@ class ReportItemTable(QWidget):
     """Row-based input widget for report items (epics and labels)."""
 
     items_changed = Signal()
+    edit_requested = Signal(object)  # emits the _ReportItemRow to customize
+
+    _MIME_TYPE = "application/x-erg-report-row"
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._rows: list[_ReportItemRow] = []
         self._label_completions: list[str] = []
+        self._drag_row: _ReportItemRow | None = None
+        self._drag_order: list[int] = []
+        self.setAcceptDrops(True)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -705,11 +678,13 @@ class ReportItemTable(QWidget):
         header = QHBoxLayout()
         header.setSpacing(4)
         for text, width in [
+            ("", 18),  # drag handle column
             ("Type", 70),
             ("Key / Label", 0),
             ("Display Name", 0),
             ("Cert.", 70),
-            ("", 22),
+            ("", 22),  # customize button column
+            ("", 22),  # remove button column
         ]:
             lbl = QLabel(f"<b>{text}</b>") if text else QLabel("")
             if width:
@@ -738,13 +713,16 @@ class ReportItemTable(QWidget):
         key: str = "",
         display_name: str = "",
         scope_certainty: str = "",
+        child_overrides: dict | None = None,
     ) -> _ReportItemRow:
         """Add a new row to the table."""
-        row = _ReportItemRow(kind, key, display_name, scope_certainty)
+        row = _ReportItemRow(kind, key, display_name, scope_certainty, child_overrides)
         if self._label_completions:
             row.set_label_completions(self._label_completions)
         row.removed.connect(self._remove_row)
         row.changed.connect(self.items_changed.emit)
+        row.drag_started.connect(self._start_drag)
+        row.edit_requested.connect(self.edit_requested.emit)
         self._rows.append(row)
         self._rows_layout.addWidget(row)
         self.items_changed.emit()
@@ -756,6 +734,83 @@ class ReportItemTable(QWidget):
             self._rows_layout.removeWidget(row)
             row.deleteLater()
             self.items_changed.emit()
+
+    # -- drag-to-reorder ------------------------------------------------------
+
+    def move_row(self, from_index: int, to_index: int) -> None:
+        """Reorder a row and persist the change (keyboard/programmatic API)."""
+        before = list(self._rows)
+        self._reposition(from_index, to_index)
+        if self._rows != before:
+            self.items_changed.emit()
+
+    def _reposition(self, from_index: int, to_index: int) -> None:
+        """Move a row to a new index and re-lay out, without signalling."""
+        if not 0 <= from_index < len(self._rows):
+            return
+        to_index = max(0, min(to_index, len(self._rows) - 1))
+        if from_index == to_index:
+            return
+        # Move only the dragged widget: the layout holds rows exclusively, so
+        # removing it then inserting at *to_index* leaves every other row in
+        # place (no full teardown/rebuild on each drag-move event).
+        row = self._rows.pop(from_index)
+        self._rows.insert(to_index, row)
+        self._rows_layout.removeWidget(row)
+        self._rows_layout.insertWidget(to_index, row)
+
+    def _row_insertion_index(self, y: int) -> int:
+        """Insertion index for a drop at vertical position *y* (table coords)."""
+        for i, row in enumerate(self._rows):
+            top = row.mapTo(self, row.rect().topLeft()).y()
+            if y < top + row.height() / 2:
+                return i
+        return len(self._rows)
+
+    def _start_drag(self, row: _ReportItemRow) -> None:
+        if row not in self._rows:
+            return
+        self._drag_row = row
+        self._drag_order = [id(r) for r in self._rows]
+
+        drag = QDrag(row)
+        mime = QMimeData()
+        mime.setData(self._MIME_TYPE, b"row")
+        drag.setMimeData(mime)
+        pixmap = row.grab()
+        drag.setPixmap(pixmap)
+        drag.setHotSpot(QPoint(12, pixmap.height() // 2))
+
+        drag.exec(Qt.DropAction.MoveAction)  # blocks until the drop completes
+
+        self._drag_row = None
+        # Persist once, covering both in-widget drops and drops released
+        # outside the table after the rows were already shuffled live.
+        if [id(r) for r in self._rows] != self._drag_order:
+            self.items_changed.emit()
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802
+        if self._drag_row is not None and event.mimeData().hasFormat(self._MIME_TYPE):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:  # noqa: N802
+        if self._drag_row is None:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        current = self._rows.index(self._drag_row)
+        insert_at = self._row_insertion_index(event.position().toPoint().y())
+        target = insert_at - 1 if insert_at > current else insert_at
+        if target != current:
+            self._reposition(current, target)  # live feedback, no signal yet
+
+    def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802
+        if self._drag_row is not None:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
 
     def get_items(self) -> list[ReportItem]:
         """Return all valid ReportItems from the table."""
@@ -780,6 +835,7 @@ class ReportItemTable(QWidget):
                 key=d.get("key", ""),
                 display_name=d.get("display_name", ""),
                 scope_certainty=d.get("scope_certainty", ""),
+                child_overrides=d.get("child_overrides"),
             )
         self.blockSignals(False)
         self.items_changed.emit()
@@ -802,9 +858,157 @@ class ReportItemTable(QWidget):
         if not self.signalsBlocked():
             self.items_changed.emit()
 
-    def row_count(self) -> int:
-        """Return the number of rows."""
-        return len(self._rows)
+
+# ---------------------------------------------------------------------------
+# ChildCustomizeDialog — per-child display-name & scope-certainty overrides
+# ---------------------------------------------------------------------------
+
+
+class ChildCustomizeDialog(QDialog):
+    """Modal for overriding display name & scope certainty of an item's children.
+
+    The children are the epics under a label item, or the stories/tasks under an
+    epic item.  When the parent row already has a scope certainty selected, the
+    per-child certainty selectors are disabled (the parent value wins for all
+    children).  When the parent is left at ``"--"`` the children may each set
+    their own certainty and the report shows the average (FR-13, consolidated).
+    """
+
+    _CERT_ITEMS = [("--", ""), ("Low", "Low"), ("Med", "Medium"), ("High", "High")]
+
+    def __init__(
+        self,
+        *,
+        kind: str,
+        parent_key: str,
+        parent_certainty: str,
+        children: list[tuple[str, str]],
+        overrides: dict[str, ChildOverride],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        child_noun = "Epic" if kind == "label" else "Story / Task"
+        self.setWindowTitle(f"Customize “{parent_key}”")
+        self.setMinimumWidth(640)
+        self._cert_locked = bool(parent_certainty)
+        self._name_edits: dict[str, QLineEdit] = {}
+        self._cert_combos: dict[str, QComboBox] = {}
+
+        root = QVBoxLayout(self)
+        root.setSpacing(10)
+
+        if self._cert_locked:
+            note = QLabel(
+                f"Scope certainty is fixed to <b>{parent_certainty}</b> on the parent "
+                "item, so per-child certainty is disabled. Set the parent certainty "
+                "to “--” to edit each child and show their average."
+            )
+        else:
+            note = QLabel(
+                "Override the display name and scope certainty for each child. "
+                "Leave certainty at “--” to exclude it from the average."
+            )
+        note.setWordWrap(True)
+        note.setProperty("hint", "true")
+        root.addWidget(note)
+
+        if not children:
+            empty = QLabel("No child items were found for this report item.")
+            empty.setWordWrap(True)
+            root.addWidget(empty)
+        else:
+            root.addWidget(
+                self._build_grid(child_noun, children, overrides, parent_certainty)
+            )
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def _build_grid(
+        self,
+        child_noun: str,
+        children: list[tuple[str, str]],
+        overrides: dict[str, ChildOverride],
+        parent_certainty: str,
+    ) -> QScrollArea:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        content = QWidget()
+        grid = QGridLayout(content)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(6)
+
+        for col, text in enumerate((child_noun, "Summary", "Display Name", "Cert.")):
+            lbl = QLabel(f"<b>{text}</b>")
+            grid.addWidget(lbl, 0, col)
+        grid.setColumnStretch(1, 3)
+        grid.setColumnStretch(2, 2)
+
+        for r, (key, summary) in enumerate(children, start=1):
+            ov = overrides.get(key)
+
+            key_lbl = QLabel(key)
+            key_lbl.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            grid.addWidget(key_lbl, r, 0)
+
+            sum_lbl = QLabel(summary or "")
+            sum_lbl.setWordWrap(True)
+            # Selectable so the summary can be copied when crafting a display name.
+            sum_lbl.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+                | Qt.TextInteractionFlag.TextSelectableByKeyboard
+            )
+            sum_lbl.setCursor(Qt.CursorShape.IBeamCursor)
+            grid.addWidget(sum_lbl, r, 1)
+
+            name_edit = QLineEdit(ov.display_name if ov else "")
+            name_edit.setPlaceholderText(summary or "Display name")
+            grid.addWidget(name_edit, r, 2)
+            self._name_edits[key] = name_edit
+
+            cert_combo = QComboBox()
+            no_scroll_wheel(cert_combo)
+            for label, data in self._CERT_ITEMS:
+                cert_combo.addItem(label, data)
+            cert_combo.setFixedWidth(70)
+            if self._cert_locked:
+                idx = cert_combo.findData(parent_certainty)
+                cert_combo.setCurrentIndex(idx if idx >= 0 else 0)
+                cert_combo.setEnabled(False)
+            elif ov and ov.scope_certainty:
+                idx = cert_combo.findData(ov.scope_certainty)
+                if idx >= 0:
+                    cert_combo.setCurrentIndex(idx)
+            grid.addWidget(cert_combo, r, 3)
+            self._cert_combos[key] = cert_combo
+
+        scroll.setWidget(content)
+        return scroll
+
+    def get_overrides(self) -> dict[str, ChildOverride]:
+        """Return the per-child overrides, omitting children with no override."""
+        result: dict[str, ChildOverride] = {}
+        for key, name_edit in self._name_edits.items():
+            display_name = name_edit.text().strip()
+            # When certainty is locked by the parent it isn't a child override.
+            certainty = (
+                None
+                if self._cert_locked
+                else (self._cert_combos[key].currentData() or None)
+            )
+            if display_name or certainty:
+                result[key] = ChildOverride(
+                    display_name=display_name, scope_certainty=certainty
+                )
+        return result
 
 
 # ---------------------------------------------------------------------------

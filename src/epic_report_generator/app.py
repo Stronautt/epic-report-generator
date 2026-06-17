@@ -13,7 +13,6 @@ from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
     QComboBox,
-    QGroupBox,
     QTabBar,
 )
 
@@ -24,24 +23,40 @@ from epic_report_generator.ui.main_window import MainWindow
 
 logger = logging.getLogger(__name__)
 
-# Widget types that should show a pointing-hand cursor
-_POINTER_TYPES = (QAbstractButton, QComboBox, QAbstractSpinBox, QTabBar, QGroupBox)
+_POINTER_TYPES = (QAbstractButton, QComboBox, QAbstractSpinBox, QTabBar)
 
 # Interval for the signal-wakeup timer that lets Python process SIGINT/SIGTERM
 _SIGNAL_WAKEUP_INTERVAL_MS = 200
 
 
-class _JsonCursorFilter(QObject):
-    """Application-wide event filter that sets PointingHandCursor on controls."""
+class _CursorEventFilter(QObject):
+    """Application-wide event filter that sets PointingHandCursor on controls.
+
+    Two event types are handled so every interactive control is covered:
+
+    * ``ChildAdded`` catches widgets reparented into the hierarchy (the common
+      case for hand-built panels and custom dialog buttons).
+    * ``Polish`` catches controls created inside a widget's own C++ constructor
+      whose ``ChildAdded`` never passes through this filter — most notably the
+      ``Ok``/``Cancel`` buttons of ``QDialogButtonBox`` and ``QMessageBox``,
+      which would otherwise keep the default arrow cursor inside modal dialogs.
+    """
 
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802
-        if event.type() == QEvent.Type.ChildAdded:
-            child = event.child()  # type: ignore[union-attr]
-            if isinstance(child, _POINTER_TYPES) and not child.testAttribute(
-                Qt.WidgetAttribute.WA_SetCursor
-            ):
-                child.setCursor(Qt.CursorShape.PointingHandCursor)
+        event_type = event.type()
+        if event_type == QEvent.Type.ChildAdded:
+            self._apply_pointer(event.child())  # type: ignore[union-attr]
+        elif event_type == QEvent.Type.Polish:
+            self._apply_pointer(obj)
         return False
+
+    @staticmethod
+    def _apply_pointer(obj: QObject) -> None:
+        """Set the pointing-hand cursor on interactive controls, once each."""
+        if isinstance(obj, _POINTER_TYPES) and not obj.testAttribute(
+            Qt.WidgetAttribute.WA_SetCursor
+        ):
+            obj.setCursor(Qt.CursorShape.PointingHandCursor)
 
 
 def run_app(argv: list[str] | None = None) -> int:
@@ -50,8 +65,6 @@ def run_app(argv: list[str] | None = None) -> int:
         level=logging.DEBUG,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    # Silence noisy matplotlib font manager debug logs
-    logging.getLogger("matplotlib.font_manager").setLevel(logging.WARNING)
 
     logger.info("Starting Epic Report Generator")
 
@@ -67,7 +80,7 @@ def run_app(argv: list[str] | None = None) -> int:
         logger.warning("logo.png not found; running without a window icon")
 
     _install_signal_handlers(app)
-    app.installEventFilter(_JsonCursorFilter(app))
+    app.installEventFilter(_CursorEventFilter(app))
 
     # Shared services
     config = ConfigManager()

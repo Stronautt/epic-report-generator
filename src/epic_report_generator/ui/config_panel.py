@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from datetime import date
 
-from PySide6.QtCore import QDate, QObject, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QDate, Qt, QTimer
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -24,8 +24,10 @@ from PySide6.QtWidgets import (
 from epic_report_generator.core.data_models import ReportConfig
 from epic_report_generator.core.jira_client import JiraClient
 from epic_report_generator.services.config_manager import _DEFAULTS, ConfigManager
+from epic_report_generator.ui._threading import ThreadedTask
 from epic_report_generator.ui.widgets import (
     RE_EPIC_KEY,
+    ChildCustomizeDialog,
     CollapsibleSection,
     LabelledField,
     ProfileBar,
@@ -36,23 +38,33 @@ from epic_report_generator.ui.widgets import (
 logger = logging.getLogger(__name__)
 
 
-class _JiraCallWorker(QObject):
-    """Run a callable in a background QThread and emit the result."""
+def _qdate_to_date(qd: QDate) -> date:
+    """Convert a Qt ``QDate`` to a stdlib ``date``."""
+    return date(qd.year(), qd.month(), qd.day())
 
-    finished = Signal(object)  # result of the callable
 
-    def __init__(self, fn: object) -> None:
-        super().__init__()
-        self._fn = fn
+def _populate_field_combo(
+    combo: QComboBox, candidates: list[dict], current: str | None
+) -> None:
+    """Fill *combo* with field candidates, pre-selecting *current* by id.
 
-    def run(self) -> None:
-        """Execute the callable and emit the result."""
-        try:
-            result = self._fn()  # type: ignore[operator]
-        except Exception as exc:
-            logger.warning("Background Jira call failed: %s", exc)
-            result = exc
-        self.finished.emit(result)
+    When there are no candidates the combo shows a disabled placeholder.
+    """
+    if candidates:
+        for f in candidates:
+            combo.addItem(f"{f['name']}  —  {f['id']}", userData=f["id"])
+        if current:
+            idx = combo.findData(current)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+    else:
+        combo.addItem("(No matches found)")
+        combo.setEnabled(False)
+
+
+def _field_value(combo: QComboBox) -> str | None:
+    """Return the combo's selected field id, or None when it is disabled."""
+    return combo.currentData() if combo.isEnabled() else None
 
 
 class FieldPickerDialog(QDialog):
@@ -84,15 +96,9 @@ class FieldPickerDialog(QDialog):
         self._sp_combo = QComboBox()
         no_scroll_wheel(self._sp_combo)
         if estimation_method == "story_points":
-            if sp_candidates:
-                for f in sp_candidates:
-                    self._sp_combo.addItem(
-                        f"{f['name']}  —  {f['id']}", userData=f["id"]
-                    )
-                self._select_current(self._sp_combo, cv.get("story_points_field"))
-            else:
-                self._sp_combo.addItem("(No matches found)")
-                self._sp_combo.setEnabled(False)
+            _populate_field_combo(
+                self._sp_combo, sp_candidates, cv.get("story_points_field")
+            )
             layout.addRow("Story Points Field:", self._sp_combo)
 
         # Date fields (only shown for time_days method)
@@ -101,71 +107,43 @@ class FieldPickerDialog(QDialog):
         self._due_date_combo = QComboBox()
         no_scroll_wheel(self._due_date_combo)
         if estimation_method == "time_days":
-            start_candidates = start_date_candidates or []
-            due_candidates = due_date_candidates or []
-            if start_candidates:
-                for f in start_candidates:
-                    self._start_date_combo.addItem(
-                        f"{f['name']}  —  {f['id']}", userData=f["id"]
-                    )
-                self._select_current(self._start_date_combo, cv.get("start_date_field"))
-            else:
-                self._start_date_combo.addItem("(No matches found)")
-                self._start_date_combo.setEnabled(False)
+            _populate_field_combo(
+                self._start_date_combo,
+                start_date_candidates or [],
+                cv.get("start_date_field"),
+            )
             layout.addRow("Start Date Field:", self._start_date_combo)
-
-            if due_candidates:
-                for f in due_candidates:
-                    self._due_date_combo.addItem(
-                        f"{f['name']}  —  {f['id']}", userData=f["id"]
-                    )
-                self._select_current(self._due_date_combo, cv.get("due_date_field"))
-            else:
-                self._due_date_combo.addItem("(No matches found)")
-                self._due_date_combo.setEnabled(False)
+            _populate_field_combo(
+                self._due_date_combo,
+                due_date_candidates or [],
+                cv.get("due_date_field"),
+            )
             layout.addRow("Due Date Field:", self._due_date_combo)
 
         self._epic_combo = QComboBox()
         no_scroll_wheel(self._epic_combo)
-        if epic_candidates:
-            for f in epic_candidates:
-                self._epic_combo.addItem(f"{f['name']}  —  {f['id']}", userData=f["id"])
-            self._select_current(self._epic_combo, cv.get("epic_link_field"))
-        else:
-            self._epic_combo.addItem("(No matches found)")
-            self._epic_combo.setEnabled(False)
+        _populate_field_combo(
+            self._epic_combo, epic_candidates, cv.get("epic_link_field")
+        )
         layout.addRow("Epic Link Field:", self._epic_combo)
 
         # Timeline fields (always shown)
-        tl_start = timeline_start_candidates or []
-        tl_end = timeline_end_candidates or []
-
         self._timeline_start_combo = QComboBox()
         no_scroll_wheel(self._timeline_start_combo)
-        if tl_start:
-            for f in tl_start:
-                self._timeline_start_combo.addItem(
-                    f"{f['name']}  —  {f['id']}", userData=f["id"]
-                )
-            self._select_current(
-                self._timeline_start_combo, cv.get("timeline_start_field")
-            )
-        else:
-            self._timeline_start_combo.addItem("(No matches found)")
-            self._timeline_start_combo.setEnabled(False)
+        _populate_field_combo(
+            self._timeline_start_combo,
+            timeline_start_candidates or [],
+            cv.get("timeline_start_field"),
+        )
         layout.addRow("Timeline Start Field:", self._timeline_start_combo)
 
         self._timeline_end_combo = QComboBox()
         no_scroll_wheel(self._timeline_end_combo)
-        if tl_end:
-            for f in tl_end:
-                self._timeline_end_combo.addItem(
-                    f"{f['name']}  —  {f['id']}", userData=f["id"]
-                )
-            self._select_current(self._timeline_end_combo, cv.get("timeline_end_field"))
-        else:
-            self._timeline_end_combo.addItem("(No matches found)")
-            self._timeline_end_combo.setEnabled(False)
+        _populate_field_combo(
+            self._timeline_end_combo,
+            timeline_end_candidates or [],
+            cv.get("timeline_end_field"),
+        )
         layout.addRow("Timeline End Field:", self._timeline_end_combo)
 
         buttons = QDialogButtonBox(
@@ -175,56 +153,35 @@ class FieldPickerDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addRow(buttons)
 
-    @staticmethod
-    def _select_current(combo: QComboBox, value: str | None) -> None:
-        """Pre-select the combo item matching *value* (by userData)."""
-        if not value:
-            return
-        idx = combo.findData(value)
-        if idx >= 0:
-            combo.setCurrentIndex(idx)
-
     @property
     def selected_sp_field(self) -> str | None:
         """Return the selected Story Points field ID, or None if unavailable."""
-        if not self._sp_combo.isEnabled():
-            return None
-        return self._sp_combo.currentData()
+        return _field_value(self._sp_combo)
 
     @property
     def selected_epic_field(self) -> str | None:
         """Return the selected Epic Link field ID, or None if unavailable."""
-        if not self._epic_combo.isEnabled():
-            return None
-        return self._epic_combo.currentData()
+        return _field_value(self._epic_combo)
 
     @property
     def selected_start_date_field(self) -> str | None:
         """Return the selected Start Date field ID, or None if unavailable."""
-        if not self._start_date_combo.isEnabled():
-            return None
-        return self._start_date_combo.currentData()
+        return _field_value(self._start_date_combo)
 
     @property
     def selected_due_date_field(self) -> str | None:
         """Return the selected Due Date field ID, or None if unavailable."""
-        if not self._due_date_combo.isEnabled():
-            return None
-        return self._due_date_combo.currentData()
+        return _field_value(self._due_date_combo)
 
     @property
     def selected_timeline_start_field(self) -> str | None:
         """Return the selected Timeline Start field ID, or None if unavailable."""
-        if not self._timeline_start_combo.isEnabled():
-            return None
-        return self._timeline_start_combo.currentData()
+        return _field_value(self._timeline_start_combo)
 
     @property
     def selected_timeline_end_field(self) -> str | None:
         """Return the selected Timeline End field ID, or None if unavailable."""
-        if not self._timeline_end_combo.isEnabled():
-            return None
-        return self._timeline_end_combo.currentData()
+        return _field_value(self._timeline_end_combo)
 
 
 class ConfigPanel(QWidget):
@@ -241,10 +198,8 @@ class ConfigPanel(QWidget):
         self._jira = jira
         self._persisting = False  # guard against saves during init/restore
         self._labels_fetched = False
-        self._bg_threads: list[QThread] = []
-        self._bg_workers: list[_JiraCallWorker] = []
-        self._bg_callbacks: dict[_JiraCallWorker, object] = {}
-        # Debounce timer for config persistence (300ms)
+        self._tasks = ThreadedTask(self)
+        # Debounce timer: delay config writes while the user types
         self._persist_timer = QTimer(self)
         self._persist_timer.setSingleShot(True)
         self._persist_timer.setInterval(300)
@@ -252,6 +207,41 @@ class ConfigPanel(QWidget):
         self._build_ui()
         self._restore_values()
         self._persisting = True
+
+    def _build_hard_date_column(
+        self, label: str, validate_key: str
+    ) -> tuple[QVBoxLayout, QDateEdit]:
+        """Build a labelled fixed-date picker column with a clear (×) button.
+
+        Returns the column layout and the ``QDateEdit`` so the caller can store
+        the edit (``_hard_start_edit`` / ``_hard_end_edit``).
+        """
+        col = QVBoxLayout()
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(4)
+        lbl = QLabel(label)
+        lbl.setProperty("subheading", "true")
+        col.addWidget(lbl)
+
+        input_row = QHBoxLayout()
+        input_row.setSpacing(4)
+        edit = QDateEdit()
+        no_scroll_wheel(edit)
+        edit.setCalendarPopup(True)
+        edit.setDisplayFormat("yyyy-MM-dd")
+        edit.setSpecialValueText(" ")
+        edit.setDate(edit.minimumDate())
+        edit.dateChanged.connect(lambda _: self._validate_hard_dates(validate_key))
+        input_row.addWidget(edit, 1)
+
+        clear_btn = QPushButton("×")
+        clear_btn.setFixedSize(18, 18)
+        clear_btn.setObjectName("epicKeyChipClose")
+        clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        clear_btn.clicked.connect(lambda: edit.setDate(edit.minimumDate()))
+        input_row.addWidget(clear_btn)
+        col.addLayout(input_row)
+        return col, edit
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -497,64 +487,14 @@ class ConfigPanel(QWidget):
         hard_dates_row = QHBoxLayout()
         hard_dates_row.setSpacing(12)
 
-        # -- Start date column --
-        start_col = QVBoxLayout()
-        start_col.setContentsMargins(0, 0, 0, 0)
-        start_col.setSpacing(4)
-        start_lbl = QLabel("Fixed Start Date")
-        start_lbl.setProperty("subheading", "true")
-        start_col.addWidget(start_lbl)
-        start_input_row = QHBoxLayout()
-        start_input_row.setSpacing(4)
-        self._hard_start_edit = QDateEdit()
-        no_scroll_wheel(self._hard_start_edit)
-        self._hard_start_edit.setCalendarPopup(True)
-        self._hard_start_edit.setDisplayFormat("yyyy-MM-dd")
-        self._hard_start_edit.setSpecialValueText(" ")
-        self._hard_start_edit.setDate(self._hard_start_edit.minimumDate())
-        self._hard_start_edit.dateChanged.connect(
-            lambda _: self._validate_hard_dates("start")
+        start_col, self._hard_start_edit = self._build_hard_date_column(
+            "Fixed Start Date", "start"
         )
-        start_input_row.addWidget(self._hard_start_edit, 1)
-        clear_start_btn = QPushButton("×")
-        clear_start_btn.setFixedSize(18, 18)
-        clear_start_btn.setObjectName("epicKeyChipClose")
-        clear_start_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        clear_start_btn.clicked.connect(
-            lambda: self._hard_start_edit.setDate(self._hard_start_edit.minimumDate())
-        )
-        start_input_row.addWidget(clear_start_btn)
-        start_col.addLayout(start_input_row)
         hard_dates_row.addLayout(start_col, 1)
 
-        # -- End date column --
-        end_col = QVBoxLayout()
-        end_col.setContentsMargins(0, 0, 0, 0)
-        end_col.setSpacing(4)
-        end_lbl = QLabel("Fixed End Date")
-        end_lbl.setProperty("subheading", "true")
-        end_col.addWidget(end_lbl)
-        end_input_row = QHBoxLayout()
-        end_input_row.setSpacing(4)
-        self._hard_end_edit = QDateEdit()
-        no_scroll_wheel(self._hard_end_edit)
-        self._hard_end_edit.setCalendarPopup(True)
-        self._hard_end_edit.setDisplayFormat("yyyy-MM-dd")
-        self._hard_end_edit.setSpecialValueText(" ")
-        self._hard_end_edit.setDate(self._hard_end_edit.minimumDate())
-        self._hard_end_edit.dateChanged.connect(
-            lambda _: self._validate_hard_dates("end")
+        end_col, self._hard_end_edit = self._build_hard_date_column(
+            "Fixed End Date", "end"
         )
-        end_input_row.addWidget(self._hard_end_edit, 1)
-        clear_end_btn = QPushButton("×")
-        clear_end_btn.setFixedSize(18, 18)
-        clear_end_btn.setObjectName("epicKeyChipClose")
-        clear_end_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        clear_end_btn.clicked.connect(
-            lambda: self._hard_end_edit.setDate(self._hard_end_edit.minimumDate())
-        )
-        end_input_row.addWidget(clear_end_btn)
-        end_col.addLayout(end_input_row)
         hard_dates_row.addLayout(end_col, 1)
 
         content.addLayout(hard_dates_row)
@@ -654,6 +594,7 @@ class ConfigPanel(QWidget):
         # Auto-save on any change + lazy label fetch
         self._item_table.items_changed.connect(self._persist_values)
         self._item_table.items_changed.connect(self._ensure_labels_fetched)
+        self._item_table.edit_requested.connect(self._on_customize_item)
         self._sp_field.field.textChanged.connect(lambda _: self._persist_values())
         self._epic_link_field.field.textChanged.connect(
             lambda _: self._persist_values()
@@ -745,11 +686,14 @@ class ConfigPanel(QWidget):
             self._config.get("include_subtasks_in_timeline", True)
         )
 
-        # Restore estimation method
+        # Restore estimation method (block signals so the change handler and
+        # persist callback don't fire mid-restore; apply visibility once below).
         method = self._config.get("estimation_method", _DEFAULTS["estimation_method"])
         idx = self._estimation_combo.findData(method)
         if idx >= 0:
+            blocked = self._estimation_combo.blockSignals(True)
             self._estimation_combo.setCurrentIndex(idx)
+            self._estimation_combo.blockSignals(blocked)
         self._on_estimation_method_changed()
 
         # Restore progress method (backward compat: story_points_only → issues_only)
@@ -937,8 +881,7 @@ class ConfigPanel(QWidget):
             else (sorted(prefixes)[0] if prefixes else "")
         )
 
-        qdate = self._date_edit.date()
-        report_date = date(qdate.year(), qdate.month(), qdate.day())
+        report_date = _qdate_to_date(self._date_edit.date())
 
         # Attempt to pre-fill project name from Jira
         project_name = self._project_name_field.text.strip()
@@ -976,19 +919,18 @@ class ConfigPanel(QWidget):
         # Hard timeline date overrides (None when at minimum = unset)
         hard_start_qd = self._hard_start_edit.date()
         hard_start = (
-            date(hard_start_qd.year(), hard_start_qd.month(), hard_start_qd.day())
+            _qdate_to_date(hard_start_qd)
             if hard_start_qd != self._hard_start_edit.minimumDate()
             else None
         )
         hard_end_qd = self._hard_end_edit.date()
         hard_end = (
-            date(hard_end_qd.year(), hard_end_qd.month(), hard_end_qd.day())
+            _qdate_to_date(hard_end_qd)
             if hard_end_qd != self._hard_end_edit.minimumDate()
             else None
         )
 
         cfg = ReportConfig(
-            project_key=project_key,
             epic_keys=epic_keys,
             items=items,
             title=self._title_field.text.strip() or _DEFAULTS["default_title"],
@@ -1103,60 +1045,25 @@ class ConfigPanel(QWidget):
                 self._item_table.set_label_completions(labels)
                 logger.debug("Set %d label completions", len(labels))
 
-        self._run_background(self._jira.fetch_labels, _on_labels)
+        self._tasks.start(self._jira.fetch_labels, _on_labels, capture_exceptions=True)
 
     # -- background Jira helpers -----------------------------------------------
 
-    def _run_background(self, fn: object, callback: object) -> None:
-        """Run *fn* in a background thread and call *callback* with the result."""
-        thread = QThread(self)
-        worker = _JiraCallWorker(fn)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        self._bg_callbacks[worker] = callback
-        worker.finished.connect(self._on_bg_result)
-        worker.finished.connect(thread.quit)
-        self._bg_threads.append(thread)
-        self._bg_workers.append(worker)
-
-        def _on_thread_done(t: QThread = thread, w: _JiraCallWorker = worker) -> None:
-            self._bg_callbacks.pop(w, None)
-            if w in self._bg_workers:
-                self._bg_workers.remove(w)
-            w.deleteLater()
-            if t in self._bg_threads:
-                self._bg_threads.remove(t)
-
-        thread.finished.connect(_on_thread_done)
-        thread.finished.connect(thread.deleteLater)
-        thread.start()
-
-    def _on_bg_result(self, result: object) -> None:
-        """Dispatch a background-worker result to the registered callback.
-
-        Because this is a method on *self* (a QWidget), Qt uses
-        AutoConnection when the emitting worker lives on a different
-        thread, guaranteeing the callback executes on the main thread.
-        """
-        worker = self.sender()
-        callback = self._bg_callbacks.get(worker)  # type: ignore[arg-type]
-        if callback is not None:
-            callback(result)  # type: ignore[operator]
-
     def shutdown(self) -> None:
         """Wait for all background threads to finish."""
-        for thread in list(self._bg_threads):
-            thread.quit()
-            thread.wait()
-        self._bg_threads.clear()
-        self._bg_workers.clear()
-        self._bg_callbacks.clear()
+        self._tasks.wait()
 
     # -- helpers --------------------------------------------------------------
 
-    def _validate_epics(self) -> None:
+    def _require_connected(self) -> bool:
+        """Show a 'Not Connected' notice and return ``False`` when offline."""
         if not self._jira.connected:
             QMessageBox.information(self, "Not Connected", "Connect to Jira first.")
+            return False
+        return True
+
+    def _validate_epics(self) -> None:
+        if not self._require_connected():
             return
         items = self._item_table.get_items()
         epic_keys = [it.key for it in items if it.kind == "epic"]
@@ -1187,11 +1094,69 @@ class ConfigPanel(QWidget):
             lines: list[str] = result  # type: ignore[assignment]
             self._validation_label.setText("<br>".join(lines))
 
-        self._run_background(_do_validate, _on_validated)
+        self._tasks.start(_do_validate, _on_validated, capture_exceptions=True)
+
+    def _on_customize_item(self, row: object) -> None:
+        """Open the per-item customize dialog (FR-13).
+
+        Fetches the item's children fresh from Jira on every click, then shows
+        the dialog pre-filled with any existing overrides.  Accepting writes the
+        overrides back onto the row, which persists via ``items_changed``.
+        """
+        if not self._require_connected():
+            return
+
+        kind = row.kind  # type: ignore[attr-defined]
+        key = row.key  # type: ignore[attr-defined]
+        if not key:
+            QMessageBox.information(
+                self, "No Key", "Enter an Epic key or label before customizing."
+            )
+            return
+        if kind == "epic" and not RE_EPIC_KEY.match(key.upper()):
+            QMessageBox.warning(
+                self, "Invalid Epic Key", f"'{key}' is not a valid epic key."
+            )
+            return
+
+        parent_certainty = row.scope_certainty  # type: ignore[attr-defined]
+        overrides = row.get_child_overrides()  # type: ignore[attr-defined]
+        epic_link_field = (
+            self._epic_link_field.text.strip() or _DEFAULTS["epic_link_field"]
+        )
+        logger.info("Customizing %s item %s", kind, key)
+
+        def _fetch() -> list[tuple[str, str]]:
+            if kind == "label":
+                return self._jira.fetch_epic_summaries_by_label(key)
+            return self._jira.fetch_child_summaries(key.upper(), epic_link_field)
+
+        def _on_fetched(result: object) -> None:
+            if isinstance(result, Exception):
+                QMessageBox.warning(
+                    self, "Error", f"Failed to load child items: {result}"
+                )
+                return
+            children: list[tuple[str, str]] = result  # type: ignore[assignment]
+            dialog = ChildCustomizeDialog(
+                kind=kind,
+                parent_key=key,
+                parent_certainty=parent_certainty,
+                children=children,
+                overrides=overrides,
+                parent=self,
+            )
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                new_overrides = dialog.get_overrides()
+                row.set_child_overrides(new_overrides)  # type: ignore[attr-defined]
+                logger.info(
+                    "Saved %d child override(s) for %s", len(new_overrides), key
+                )
+
+        self._tasks.start(_fetch, _on_fetched, capture_exceptions=True)
 
     def _detect_fields(self) -> None:
-        if not self._jira.connected:
-            QMessageBox.information(self, "Not Connected", "Connect to Jira first.")
+        if not self._require_connected():
             return
         logger.info("Detecting Jira custom fields")
 
@@ -1202,39 +1167,30 @@ class ConfigPanel(QWidget):
             fields: list[dict[str, str]] = result  # type: ignore[assignment]
             method = self._estimation_combo.currentData() or "story_points"
 
-            sp_candidates = [
-                f
-                for f in fields
-                if "point" in f["name"].lower() or "story" in f["name"].lower()
-            ]
-            epic_candidates = [
-                f
-                for f in fields
-                if "epic" in f["name"].lower() and "link" in f["name"].lower()
-            ]
-            start_date_candidates = [
-                f
-                for f in fields
-                if "start" in f["name"].lower() and "date" in f["name"].lower()
-            ]
-            due_date_candidates = [
-                f
-                for f in fields
-                if "due" in f["name"].lower()
-                or ("end" in f["name"].lower() and "date" in f["name"].lower())
-            ]
-            timeline_start_candidates = [
-                f
-                for f in fields
-                if "start" in f["name"].lower()
-                and ("date" in f["name"].lower() or "target" in f["name"].lower())
-            ]
-            timeline_end_candidates = [
-                f
-                for f in fields
-                if ("due" in f["name"].lower() or "target end" in f["name"].lower())
-                or ("end" in f["name"].lower() and "date" in f["name"].lower())
-            ]
+            # Classify each field once into every bucket it matches (a single
+            # field can be e.g. both a start-date and a timeline-start candidate).
+            sp_candidates: list[dict[str, str]] = []
+            epic_candidates: list[dict[str, str]] = []
+            start_date_candidates: list[dict[str, str]] = []
+            due_date_candidates: list[dict[str, str]] = []
+            timeline_start_candidates: list[dict[str, str]] = []
+            timeline_end_candidates: list[dict[str, str]] = []
+            for f in fields:
+                name = f["name"].lower()
+                if "point" in name or "story" in name:
+                    sp_candidates.append(f)
+                if "epic" in name and "link" in name:
+                    epic_candidates.append(f)
+                if "start" in name and "date" in name:
+                    start_date_candidates.append(f)
+                if "due" in name or ("end" in name and "date" in name):
+                    due_date_candidates.append(f)
+                if "start" in name and ("date" in name or "target" in name):
+                    timeline_start_candidates.append(f)
+                if ("due" in name or "target end" in name) or (
+                    "end" in name and "date" in name
+                ):
+                    timeline_end_candidates.append(f)
 
             has_any = (
                 sp_candidates

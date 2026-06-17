@@ -16,6 +16,13 @@ from epic_report_generator.core.metrics import (
 )
 
 
+def test_status_done_reexported_from_data_models() -> None:
+    """metrics.STATUS_DONE stays the single 'Done' constant from data_models."""
+    from epic_report_generator.core import data_models, metrics
+
+    assert metrics.STATUS_DONE == data_models.STATUS_DONE == "Done"
+
+
 def _make_issue(
     key: str = "TEST-1",
     status_category: str = "To Do",
@@ -56,6 +63,48 @@ def _make_epic(children: list[JiraIssue] | None = None) -> EpicData:
         updated=datetime.now(tz=timezone.utc),
         children=children or [],
     )
+
+
+class TestReferenceDate:
+    """``reference_date`` makes time-based metrics deterministic (no date.today())."""
+
+    REF = date(2024, 6, 15)
+
+    def _epic(self) -> EpicData:
+        children = [
+            _make_issue(
+                "T-1",
+                "Done",
+                8.0,
+                created=datetime(2024, 5, 1, tzinfo=timezone.utc),
+                resolved=datetime(2024, 6, 1, tzinfo=timezone.utc),
+            ),
+            _make_issue(
+                "T-2",
+                "To Do",
+                4.0,
+                created=datetime(2024, 5, 1, tzinfo=timezone.utc),
+            ),
+        ]
+        return _make_epic(children)
+
+    def test_velocity_and_forecast_are_deterministic(self) -> None:
+        m = calculate_metrics(self._epic(), reference_date=self.REF)
+        # 8 SP done within the 4 weeks before REF → 8 / 4 = 2.0 SP/week
+        assert m.velocity_sp_per_week == pytest.approx(2.0)
+        # remaining 4 SP / 2.0 per week = 2 weeks after REF
+        assert m.forecast_date == date(2024, 6, 29)
+
+    def test_time_series_ends_at_reference_date(self) -> None:
+        m = calculate_metrics(self._epic(), reference_date=self.REF)
+        assert m.dates[-1] == self.REF
+        assert len(m.dates) == (self.REF - date(2024, 5, 1)).days + 1
+
+    def test_repeatable_across_calls(self) -> None:
+        a = calculate_metrics(self._epic(), reference_date=self.REF)
+        b = calculate_metrics(self._epic(), reference_date=self.REF)
+        assert a.velocity_sp_per_week == b.velocity_sp_per_week
+        assert a.forecast_date == b.forecast_date == date(2024, 6, 29)
 
 
 class TestProgressCalculation:

@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone
 
+import pytest
+
 from epic_report_generator.core.data_models import (
+    ChildOverride,
     EpicData,
     EpicMetrics,
     JiraIssue,
@@ -13,6 +16,7 @@ from epic_report_generator.core.data_models import (
     ReportData,
     ReportItem,
     TimelineItem,
+    average_certainty,
 )
 
 
@@ -214,6 +218,36 @@ class TestReportItem:
         assert item.display_name == "Backend"
         assert item.scope_certainty == "High"
 
+    def test_child_overrides_default_independent(self) -> None:
+        a = ReportItem(kind="label", key="a")
+        b = ReportItem(kind="label", key="b")
+        assert a.child_overrides == {}
+        a.child_overrides["X-1"] = ChildOverride("Name", "Low")
+        assert b.child_overrides == {}
+
+    def test_child_override_defaults(self) -> None:
+        ov = ChildOverride()
+        assert ov.display_name == ""
+        assert ov.scope_certainty is None
+
+
+@pytest.mark.parametrize(
+    ("values", "expected"),
+    [
+        ([], None),
+        ([None, "", None], None),
+        (["High"], "High"),
+        (["Low", "High"], "Medium"),  # (1+3)/2 = 2
+        (["High", "High"], "High"),
+        (["Low", "Low", "Medium"], "Low"),  # (1+1+2)/3 ≈ 1.33 → 1
+        (["Medium", "High", "High"], "High"),  # (2+3+3)/3 ≈ 2.67 → 3
+        (["High", None, "High"], "High"),  # None entries ignored
+        (["bogus", "Low"], "Low"),  # unknown values ignored
+    ],
+)
+def test_average_certainty(values, expected) -> None:
+    assert average_certainty(values) == expected
+
 
 class TestTimelineItem:
     """Verify TimelineItem dataclass."""
@@ -293,7 +327,7 @@ class TestReportData:
     """Verify ReportData defaults."""
 
     def test_empty_report(self) -> None:
-        cfg = ReportConfig(project_key="PROJ", epic_keys=["PROJ-1"])
+        cfg = ReportConfig(epic_keys=["PROJ-1"])
         report = ReportData(config=cfg)
         assert report.epics == []
         assert report.metrics == []

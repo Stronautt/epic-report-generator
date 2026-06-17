@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from collections import deque
 
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -44,7 +45,6 @@ class _QtLogHandler(logging.Handler, QObject):
             self.handleError(record)
 
 
-# Colours per log level
 _LEVEL_COLORS: dict[int, str] = {
     logging.DEBUG: "#8C9CB8",
     logging.INFO: "#172B4D",
@@ -98,7 +98,6 @@ class LogPanel(QWidget):
         self._pending_messages: list[tuple[str, int]] = []
         self._build_ui()
 
-        # Batch flush timer (50ms interval)
         self._flush_timer = QTimer(self)
         self._flush_timer.setInterval(50)
         self._flush_timer.timeout.connect(self._flush_pending)
@@ -159,9 +158,7 @@ class LogPanel(QWidget):
         self._log_view.setReadOnly(True)
         self._log_view.setMaximumBlockCount(_MAX_BUFFER)
         self._log_view.setFont(
-            QFont("Consolas", 10)
-            if __import__("sys").platform == "win32"
-            else QFont("Monospace", 10)
+            QFont("Consolas", 10) if sys.platform == "win32" else QFont("Monospace", 10)
         )
         self._log_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         root.addWidget(self._log_view)
@@ -178,19 +175,16 @@ class LogPanel(QWidget):
             if not self._flush_timer.isActive():
                 self._flush_timer.start()
 
-    def _flush_pending(self) -> None:
-        """Flush all pending messages to the view in a single batch."""
-        if not self._pending_messages:
-            self._flush_timer.stop()
-            return
-        messages = self._pending_messages
-        self._pending_messages = []
-        self._flush_timer.stop()
-
+    def _write_messages_to_view(
+        self, messages: list[tuple[str, int]], *, clear: bool = False
+    ) -> None:
+        """Append ``(text, level)`` messages to the view with per-level formatting."""
         fmt_cache = _FMT_DARK if self._dark else _FMT_LIGHT
         default_fmt = fmt_cache[logging.INFO]
 
         self._log_view.setUpdatesEnabled(False)
+        if clear:
+            self._log_view.clear()
         cursor = self._log_view.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
         for text, level in messages:
@@ -199,6 +193,16 @@ class LogPanel(QWidget):
         self._log_view.setTextCursor(cursor)
         self._log_view.setUpdatesEnabled(True)
         self._log_view.ensureCursorVisible()
+
+    def _flush_pending(self) -> None:
+        """Flush all pending messages to the view in a single batch."""
+        if not self._pending_messages:
+            self._flush_timer.stop()
+            return
+        messages = self._pending_messages
+        self._pending_messages = []
+        self._flush_timer.stop()
+        self._write_messages_to_view(messages)
 
     def _on_filter_toggled(self, level: int, checked: bool) -> None:
         """Update active levels and rebuild the visible log."""
@@ -218,20 +222,8 @@ class LogPanel(QWidget):
 
     def _rebuild_view(self) -> None:
         """Re-render all buffered messages with the current filter."""
-        fmt_cache = _FMT_DARK if self._dark else _FMT_LIGHT
-        default_fmt = fmt_cache[logging.INFO]
-
-        self._log_view.setUpdatesEnabled(False)
-        self._log_view.clear()
-        cursor = self._log_view.textCursor()
-        cursor.movePosition(cursor.MoveOperation.End)
-        for text, level in self._buffer:
-            if self._is_visible(level):
-                fmt = fmt_cache.get(level, default_fmt)
-                cursor.insertText(text + "\n", fmt)
-        self._log_view.setTextCursor(cursor)
-        self._log_view.setUpdatesEnabled(True)
-        self._log_view.ensureCursorVisible()
+        visible = [(t, lvl) for t, lvl in self._buffer if self._is_visible(lvl)]
+        self._write_messages_to_view(visible, clear=True)
 
     def _clear(self) -> None:
         self._buffer.clear()

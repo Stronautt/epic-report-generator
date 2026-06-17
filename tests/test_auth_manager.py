@@ -136,6 +136,46 @@ class TestGetAccessToken:
         auth = AuthManager(_make_config(tmp_path))
         assert auth.get_access_token() == "restored"
 
+    @patch("epic_report_generator.services.auth_manager.keyring")
+    def test_cached_near_expiry_token_not_used(
+        self,
+        mock_keyring: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """A cached token expiring within the skew buffer is treated as expired."""
+        mock_keyring.get_password.return_value = None  # nothing to fall back to
+        auth = AuthManager(_make_config(tmp_path))
+        auth._access_token = "cached"
+        auth._token_expiry = time.time() + 30  # within the 60s skew buffer
+        assert auth.get_access_token() is None
+
+    @patch("epic_report_generator.services.auth_manager.keyring")
+    def test_stored_near_expiry_token_not_used(
+        self,
+        mock_keyring: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """A stored token expiring within the skew buffer is not restored."""
+        stored = {
+            "access_token": "restored",
+            "refresh_token": "",  # no refresh available
+            "expiry": time.time() + 30,
+        }
+        mock_keyring.get_password.return_value = json.dumps(stored)
+        auth = AuthManager(_make_config(tmp_path))
+        assert auth.get_access_token() is None
+
+    @patch("epic_report_generator.services.auth_manager.keyring")
+    def test_malformed_stored_token_returns_none(
+        self,
+        mock_keyring: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """A corrupt keyring entry yields None instead of raising."""
+        mock_keyring.get_password.return_value = "{not valid json"
+        auth = AuthManager(_make_config(tmp_path))
+        assert auth.get_access_token() is None
+
     @patch("epic_report_generator.services.auth_manager.requests")
     @patch("epic_report_generator.services.auth_manager.keyring")
     def test_refreshes_expired_token(

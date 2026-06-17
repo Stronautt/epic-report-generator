@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import QObject, QThread, QUrl, Signal
+from PySide6.QtCore import QUrl, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
-    QScrollArea,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -20,39 +19,30 @@ from PySide6.QtWidgets import (
 from epic_report_generator.core.jira_client import JiraClient
 from epic_report_generator.services.auth_manager import AuthManager
 from epic_report_generator.services.config_manager import ConfigManager
-from epic_report_generator.ui.widgets import GuideStep, LabelledField, StatusIndicator
+from epic_report_generator.ui._threading import ThreadedTask
+from epic_report_generator.ui.widgets import (
+    GuideStep,
+    LabelledField,
+    StatusIndicator,
+    make_scroll_content,
+)
 
 logger = logging.getLogger(__name__)
 
 _API_TOKEN_URL = "https://id.atlassian.com/manage-profile/security/api-tokens"
 
 
-class _LoginWorker(QObject):
-    """Runs the blocking OAuth flow in a background thread."""
-
-    finished = Signal(object)  # dict | None
-
-    def __init__(self, auth: AuthManager) -> None:
-        super().__init__()
-        self._auth = auth
-
-    def run(self) -> None:
-        """Execute the OAuth login flow."""
-        result = self._auth.start_login()
-        self.finished.emit(result)
-
-
 class LoginPanel(QWidget):
     """Panel for Jira connection via API Token or OAuth 2.0 (3LO).
 
     Emits ``login_state_changed(bool)`` on auth state change.
-    Emits ``login_succeeded(str, str, str)`` with (display_name, site_name, avatar_url)
-    after a successful login so the main window can populate the sidebar user info.
+    Emits ``login_succeeded(str, str)`` with (display_name, site_name) after a
+    successful login so the main window can populate the sidebar user info.
     Emits ``avatar_loaded(QPixmap)`` once the avatar image has been downloaded.
     """
 
     login_state_changed = Signal(bool)
-    login_succeeded = Signal(str, str, str)  # display_name, site_name, avatar_url
+    login_succeeded = Signal(str, str)  # display_name, site_name
     avatar_loaded = Signal(object)  # QPixmap
 
     def __init__(
@@ -66,8 +56,7 @@ class LoginPanel(QWidget):
         self._config = config
         self._auth = auth
         self._jira = jira
-        self._thread: QThread | None = None
-        self._worker: _LoginWorker | None = None
+        self._tasks = ThreadedTask(self)
         self._nam = QNetworkAccessManager(self)
 
         self._build_ui()
@@ -78,16 +67,8 @@ class LoginPanel(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll, root = make_scroll_content()
         outer.addWidget(scroll)
-
-        content = QWidget()
-        scroll.setWidget(content)
-        root = QVBoxLayout(content)
-        root.setContentsMargins(32, 32, 32, 32)
-        root.setSpacing(16)
 
         title = QLabel("Jira Connection")
         title.setProperty("heading", "true")
@@ -462,7 +443,7 @@ class LoginPanel(QWidget):
             return
 
         # Basic URL validation
-        if not url.startswith("http"):
+        if not url.startswith(("http://", "https://")):
             url = f"https://{url}"
             self._url_field.text = url
 
@@ -519,33 +500,11 @@ class LoginPanel(QWidget):
         self._login_btn.setEnabled(False)
         self._login_btn.setText("Waiting for browser…")
 
-        self._thread = QThread()
-        self._worker = _LoginWorker(self._auth)
-        self._worker.moveToThread(self._thread)
-        self._thread.started.connect(self._worker.run)
-        self._worker.finished.connect(self._on_login_finished)
-        self._worker.finished.connect(self._thread.quit)
-        self._worker.finished.connect(self._cleanup_worker)
-        self._thread.finished.connect(self._clear_thread)
-        self._thread.start()
+        self._tasks.start(self._auth.start_login, self._on_login_finished)
 
     def shutdown(self) -> None:
         """Wait for the login thread to finish before closing."""
-        if self._thread is not None and self._thread.isRunning():
-            self._thread.quit()
-            self._thread.wait()
-
-    def _clear_thread(self) -> None:
-        """Release the thread reference after it finishes."""
-        if self._thread is not None:
-            self._thread.deleteLater()
-            self._thread = None
-
-    def _cleanup_worker(self) -> None:
-        """Release the worker reference after the login flow completes."""
-        if self._worker is not None:
-            self._worker.deleteLater()
-            self._worker = None
+        self._tasks.wait()
 
     def _on_login_finished(self, result: dict | None) -> None:
         self._login_btn.setEnabled(True)
@@ -585,7 +544,7 @@ class LoginPanel(QWidget):
         self._tabs.hide()
 
         # Emit signals for main window / sidebar
-        self.login_succeeded.emit(display_name, site, avatar_url)
+        self.login_succeeded.emit(display_name, site)
 
         if avatar_url:
             self._load_avatar(avatar_url)

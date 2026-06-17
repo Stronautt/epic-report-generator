@@ -5,6 +5,8 @@ from __future__ import annotations
 import copy
 import json
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -65,7 +67,15 @@ _DEFAULTS: dict[str, Any] = {
     "cloud_id": "",
     "site_name": "",
     "theme": "light",
-    "last_epic_keys": [],
+    # Appearance customization (NFR-05) — global, like `theme`.
+    # accent_color: "" = built-in blue, else "#rrggbb".
+    # font_source: "" = default font, "file", or "google".
+    # font_value: file path (file) or family name (google).
+    # font_family: resolved family name applied to the UI and the report.
+    "accent_color": "",
+    "font_source": "",
+    "font_value": "",
+    "font_family": "",
     # Profile infrastructure
     "active_profile": DEFAULT_PROFILE_NAME,
     "profiles": {},
@@ -98,13 +108,41 @@ _DEFAULTS: dict[str, Any] = {
 class ConfigManager:
     """Read/write JSON configuration stored in the platform config directory."""
 
+    # Class-level defaults so instances built via __new__ (e.g. in tests that
+    # bypass __init__) still have the deferred-save flags available.
+    _dirty: bool = False
+    _deferred: bool = False
+    _profile_names_cache: list[str] | None = None
+
     def __init__(self) -> None:
         self._dir = Path(user_config_dir(APP_NAME, appauthor=False))
         self._path = self._dir / CONFIG_FILENAME
         self._data: dict[str, Any] = copy.deepcopy(_DEFAULTS)
         self._dir_created = False
+        self._dirty = False
+        self._deferred = False
+        self._profile_names_cache = None
         self._load()
         logger.debug("Config loaded from %s", self._path)
+
+    @contextmanager
+    def batch(self) -> Iterator[None]:
+        """Defer disk writes until the block exits, then flush once if dirty.
+
+        Useful when applying many ``set()`` calls in a row; the default is to
+        write eagerly on every change so headless callers need no event loop.
+        """
+        self._deferred = True
+        try:
+            yield
+        finally:
+            self._deferred = False
+            self.flush()
+
+    def flush(self) -> None:
+        """Write buffered changes to disk if any are pending."""
+        if self._dirty:
+            self._write()
 
     # -- public API -----------------------------------------------------------
 
@@ -149,24 +187,13 @@ class ConfigManager:
     def reset(self) -> None:
         """Reset the active profile to defaults and persist."""
         logger.info("Resetting active profile to defaults")
-        name = self._data.get("active_profile", DEFAULT_PROFILE_NAME)
-        profiles = self._data.setdefault("profiles", {})
+        name = self.active_profile_name
+        profiles = self._profiles_dict()
         old_created = profiles.get(name, {}).get("_created_at")
         profiles[name] = dict(self._default_profile_values())
         if old_created:
             profiles[name]["_created_at"] = old_created
         self._save()
-
-    @property
-    def data(self) -> dict[str, Any]:
-        """Return a shallow copy of all configuration.
-
-        Profile-scoped keys are merged from the active profile so callers
-        see a flat view.
-        """
-        flat = dict(self._data)
-        flat.update(self._active_profile_data())
-        return flat
 
     # -- profile management ---------------------------------------------------
 
@@ -177,7 +204,12 @@ class ConfigManager:
 
     @property
     def profile_names(self) -> list[str]:
-        """Return profile names in sorted order, with Default always first."""
+        """Return profile names in sorted order, with Default always first.
+
+        Memoized; the cache is invalidated whenever config is saved or loaded.
+        """
+        if self._profile_names_cache is not None:
+            return self._profile_names_cache
         profiles: dict = self._data.get("profiles", {})
         names = sorted(
             profiles.keys(),
@@ -191,11 +223,12 @@ class ConfigManager:
             # Ensure at least Default exists
             self._active_profile_data()
             names = [DEFAULT_PROFILE_NAME]
+        self._profile_names_cache = names
         return names
 
     def switch_profile(self, name: str) -> None:
         """Switch to the named profile, creating it with defaults if missing."""
-        profiles = self._data.setdefault("profiles", {})
+        profiles = self._profiles_dict()
         if name not in profiles:
             profiles[name] = dict(self._default_profile_values())
             profiles[name]["_created_at"] = _now_iso()
@@ -205,7 +238,7 @@ class ConfigManager:
 
     def create_profile(self, name: str, clone_from: str | None = None) -> None:
         """Create a new profile, optionally cloning values from another profile."""
-        profiles = self._data.setdefault("profiles", {})
+        profiles = self._profiles_dict()
         if clone_from and clone_from in profiles:
             profiles[name] = copy.deepcopy(profiles[clone_from])
         else:
@@ -219,7 +252,7 @@ class ConfigManager:
         """Rename a profile. Cannot rename the Default profile."""
         if old_name == DEFAULT_PROFILE_NAME:
             return
-        profiles = self._data.setdefault("profiles", {})
+        profiles = self._profiles_dict()
         if old_name not in profiles:
             return
         profiles[new_name] = profiles.pop(old_name)
@@ -232,7 +265,7 @@ class ConfigManager:
         """Delete a profile. Cannot delete the Default profile."""
         if name == DEFAULT_PROFILE_NAME:
             return
-        profiles = self._data.setdefault("profiles", {})
+        profiles = self._profiles_dict()
         profiles.pop(name, None)
         if self._data.get("active_profile") == name:
             self._data["active_profile"] = DEFAULT_PROFILE_NAME
@@ -241,14 +274,18 @@ class ConfigManager:
 
     # -- internals ------------------------------------------------------------
 
+    def _profiles_dict(self) -> dict[str, Any]:
+        """Return the profiles container, creating it if missing."""
+        return self._data.setdefault("profiles", {})
+
     def _default_profile_values(self) -> dict[str, Any]:
         """Return default values for a new profile."""
         return {k: copy.deepcopy(_DEFAULTS[k]) for k in PROFILE_KEYS if k in _DEFAULTS}
 
     def _active_profile_data(self) -> dict[str, Any]:
         """Return the dict for the current active profile, creating if missing."""
-        profiles = self._data.setdefault("profiles", {})
-        name = self._data.get("active_profile", DEFAULT_PROFILE_NAME)
+        profiles = self._profiles_dict()
+        name = self.active_profile_name
         if name not in profiles:
             profiles[name] = dict(self._default_profile_values())
             profiles[name]["_created_at"] = _now_iso()
@@ -263,7 +300,7 @@ class ConfigManager:
             if key in self._data:
                 profile_values[key] = self._data.pop(key)
         if profile_values:
-            self._data.setdefault("profiles", {})[DEFAULT_PROFILE_NAME] = profile_values
+            self._profiles_dict()[DEFAULT_PROFILE_NAME] = profile_values
             self._data.setdefault("active_profile", DEFAULT_PROFILE_NAME)
             self._save()
             logger.info("Migrated existing config into Default profile")
@@ -291,13 +328,21 @@ class ConfigManager:
             logger.warning("Failed to load config from %s: %s", self._path, exc)
         self._migrate_to_profiles()
         self._migrate_profile_timestamps()
+        self._profile_names_cache = None
 
     def _save(self) -> None:
+        self._dirty = True
+        self._profile_names_cache = None
+        if not self._deferred:
+            self._write()
+
+    def _write(self) -> None:
         try:
             if not self._dir_created:
                 self._dir.mkdir(parents=True, exist_ok=True)
                 self._dir_created = True
             with open(self._path, "w", encoding="utf-8") as fh:
                 json.dump(self._data, fh, indent=2, default=str)
+            self._dirty = False
         except OSError as exc:
             logger.warning("Failed to save config to %s: %s", self._path, exc)

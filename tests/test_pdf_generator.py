@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import io
 from datetime import date, datetime, timedelta, timezone
+
+from pypdf import PdfReader
 
 from epic_report_generator.core.data_models import (
     EpicData,
@@ -67,7 +70,6 @@ def _make_report(
         metrics_list.append(calculate_metrics(epic))
 
     cfg = ReportConfig(
-        project_key="PROJ",
         epic_keys=[e.key for e in epics],
         title="Test Report",
         author="Test Author",
@@ -108,7 +110,7 @@ class TestGeneratePdf:
 
     def test_empty_epics(self) -> None:
         """Report with no epics still produces a valid PDF."""
-        cfg = ReportConfig(title="Empty Report", project_key="X")
+        cfg = ReportConfig(title="Empty Report")
         report = ReportData(config=cfg)
         pdf = generate_pdf(report)
         assert pdf[:5] == b"%PDF-"
@@ -117,7 +119,27 @@ class TestGeneratePdf:
         """An epic with no children should not crash PDF generation."""
         epic = _make_epic("PROJ-99", [])
         metrics = calculate_metrics(epic)
-        cfg = ReportConfig(project_key="PROJ", epic_keys=["PROJ-99"])
+        cfg = ReportConfig(epic_keys=["PROJ-99"])
         report = ReportData(config=cfg, epics=[epic], metrics=[metrics])
         pdf = generate_pdf(report)
         assert pdf[:5] == b"%PDF-"
+
+
+def _page_count(pdf: bytes) -> int:
+    return len(PdfReader(io.BytesIO(pdf)).pages)
+
+
+class TestPageLayout:
+    """Page structure: title + summary + (timeline) + one page per epic."""
+
+    def test_page_count(self) -> None:
+        # title + summary + timeline (default on) + 2 epic pages
+        pdf = generate_pdf(_make_report(num_epics=2))
+        assert _page_count(pdf) == 5
+
+    def test_timeline_toggle_changes_page_count(self) -> None:
+        report = _make_report(num_epics=2)
+        with_timeline = generate_pdf(report)
+        report.config.show_timeline_chart = False
+        without_timeline = generate_pdf(report)
+        assert _page_count(with_timeline) == _page_count(without_timeline) + 1

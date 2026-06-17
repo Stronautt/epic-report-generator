@@ -38,14 +38,13 @@ Only installer artifacts are uploaded — plain binaries are not retained. The w
 - **GUI**: PySide6 (Qt 6)
 - **Theming**: `qt-material` (Material Design base themes) + app-specific QSS overlays
 - **Jira API**: `jira` library (pycontribs/jira)
-- **OAuth**: `requests_oauthlib` for Atlassian OAuth 2.0 (3LO)
-- **PDF**: ReportLab
-- **Charts**: matplotlib with `Agg` backend
-- **Data**: pandas
+- **OAuth**: hand-rolled Atlassian OAuth 2.0 (3LO) over `requests`
+- **PDF**: Typst (`typst-py`) — bundled `.typ` templates compiled to PDF
+- **Charts**: drawn natively in Typst (Gantt timeline + dual-axis trend chart); no matplotlib
 - **Token storage**: `keyring` (OS-native)
 - **Config**: `platformdirs` + JSON
 - **Dates**: python-dateutil
-- **Python**: >=3.10
+- **Python**: >=3.11
 
 ## Project Structure
 
@@ -55,14 +54,17 @@ src/epic_report_generator/
 ├── __main__.py                    # Entry point
 ├── app.py                         # QApplication setup, signal handlers
 ├── core/
-│   ├── data_models.py             # Dataclasses: JiraIssue (with parent_key, progress, effective_weight), EpicData, EpicMetrics, ReportConfig, ReportData, TimelineItem
+│   ├── data_models.py             # Dataclasses: JiraIssue (with parent_key, progress, effective_weight), EpicData, EpicMetrics, ReportConfig, ReportData, ReportItem (with child_overrides), ChildOverride, TimelineItem; average_certainty() helper
 │   ├── jira_client.py             # JIRA library wrapper, API-token + OAuth connection, pagination, retry, date expansion
 │   ├── metrics.py                 # Bottom-up hierarchical progress, velocity, cycle time, scope change, forecasting, time-series
-│   ├── chart_generator.py         # Matplotlib Jira-style trend charts (light/dark)
-│   └── pdf_generator.py           # ReportLab PDF builder (title, summary table, epic detail pages)
+│   ├── theming.py                 # Accent-colour maths shared by app + report: hex/mix/lighten, qt_shades(), report_overrides()
+│   ├── report_view_model.py       # Flattens ReportData → JSON payload + native chart geometry (Gantt, trend)
+│   ├── pdf_generator.py           # Orchestrates view-model + Typst render (generate_pdf → bytes)
+│   └── typst_renderer.py          # Compiles bundled .typ templates to PDF (temp-dir project, bundled + custom fonts)
 ├── services/
 │   ├── auth_manager.py            # OAuth 2.0 (3LO) flow + API-token auth + keyring token storage
 │   ├── config_manager.py          # JSON config via platformdirs
+│   ├── font_manager.py            # Provision custom fonts (file copy / Google Fonts download) for UI + report
 │   └── oauth_server.py            # Local HTTP callback server for OAuth redirect
 ├── ui/
 │   ├── main_window.py             # Login overlay → sidebar/stacked-panel layout
@@ -70,14 +72,17 @@ src/epic_report_generator/
 │   ├── config_panel.py            # Epic keys (tag input), metadata, field mapping
 │   ├── report_panel.py            # Two-step flow: configuration + preview (collapsible sections)
 │   ├── preview_panel.py           # PDF generation worker, QPdfDocument preview, export
-│   ├── settings_panel.py          # Connection info, theme toggle, logout, defaults
+│   ├── settings_panel.py          # Connection info, theme + accent/font customization, logout, defaults
 │   ├── log_panel.py               # Live log viewer with level filtering
-│   ├── widgets.py                 # Reusable: StatusIndicator, LabelledField, GuideStep, FlowLayout,
-│   │                              #   CollapsibleSection, EpicKeyTagInput, SidebarUserInfo
+│   ├── widgets.py                 # Reusable: StatusIndicator, LabelledField, GuideStep,
+│   │                              #   CollapsibleSection, ReportItemTable (drag-to-reorder,
+│   │                              #   per-row customize button), ChildCustomizeDialog,
+│   │                              #   SidebarUserInfo
 │   └── styles.py                  # App-specific QSS overlays on top of qt-material base themes
 └── resources/
-    ├── fonts/
-    └── icons/
+    ├── typst/                     # Templates: theme, components (gantt, trend_chart, progress_bar, …), pages
+    ├── fonts/                     # Bundled Inter (deterministic cross-OS rendering)
+    └── logo.png
 ```
 
 ## Architecture
@@ -101,6 +106,32 @@ Two estimation methods are supported — selectable in the Config panel under "C
 2. **Time — Days**: uses `(due_date - start_date).days` as the estimate for each issue. Issues missing either date are counted as unestimated. Labels display "Days".
 
 The `estimation_method` field on `ReportConfig` (`"story_points"` or `"time_days"`) threads through `calculate_metrics()`, chart generation, and PDF rendering. `EpicMetrics.estimation_unit` (`"SP"` or `"Days"`) drives all display labels.
+
+### Scope Certainty (FR-13)
+
+Each report item (epic or label) carries an optional scope certainty
+(`ReportItem.scope_certainty`: `None`/`"Low"`/`"Medium"`/`"High"`) chosen in the
+`Cert.` column of the `ReportItemTable`. Each row also has a **customize** button
+(gear icon, left of the remove button) that opens `ChildCustomizeDialog`, listing
+the item's children — the epics under a label, or the stories/tasks under an epic
+(fetched fresh on every open via `JiraClient.fetch_epic_summaries_by_label` /
+`fetch_child_summaries`). Per child the user can override the **display name** and
+**scope certainty**, persisted in `ReportItem.child_overrides`
+(`dict[str, ChildOverride]`, keyed by child Jira key) inside `last_report_items`.
+
+Parent vs. child precedence:
+
+- **Parent certainty set** (`Low`/`Med`/`High`) — all children inherit it; the
+  per-child certainty selectors in the dialog are disabled.
+- **Parent `"--"` (consolidated)** — children may each set their own certainty,
+  and the report shows the **average** (`average_certainty()` maps Low/Med/High →
+  1/2/3, averages set values, rounds, maps back). This is FR-13's "Consolidated"
+  behaviour, triggered by the default `"--"` rather than a separate dropdown entry.
+
+Overrides are applied in `preview_panel._generate_report`: child display names
+overwrite `JiraIssue.summary` (epic items) or `EpicData.summary` (label items),
+and certainty flows to `EpicMetrics.scope_certainty` per source epic / group.
+Switching a row's kind (epic↔label) drops its now-stale child overrides.
 
 ### Subtask Fetching
 
@@ -151,7 +182,9 @@ For **label-group merges** (`merge_metrics`), progress is the weighted average o
 
 ### PDF Layout
 
-Landscape 16:9 pages (406mm x 228.4mm). Page 1: title page. Page 2: summary table with progress bars (label-group header rows show aggregated statistics) and optional scope-certainty legend. Page 3 (optional): Gantt-style timeline chart with optional scope-certainty legend — included by default but can be excluded via `ReportConfig.show_timeline_chart`. Remaining pages: per-epic detail with trend chart + metrics sidebar.
+Landscape pages 406mm wide. The title and per-epic pages are a fixed 16:9 (406mm x 228.4mm). Page 1: title page. Page 2: summary table with progress bars (label-group header rows show aggregated statistics) and optional scope-certainty legend; the aggregate KPI strip shows Epics / Overall / Issues / Total {unit} / Done {unit}. Page 3 (optional): Gantt-style timeline chart with optional scope-certainty legend — included by default but can be excluded via `ReportConfig.show_timeline_chart`. Remaining pages: per-epic detail with trend chart + metrics sidebar.
+
+**Adaptive height (summary + timeline only).** These two pages render on `#page(height: auto)` (`main.typ`) so a large table or Gantt grows the sheet taller instead of paginating onto a second page. The floor is the standard 228.4mm height: `summary.typ` measures its body and pads up to the floor; `timeline.typ` measures the heading/legend and hands the Gantt a `min-height` so it fills to the floor, then grows beyond it. The Gantt (`gantt.typ`) therefore computes its own intrinsic height from a fixed per-row height (floored to `min-height`) rather than reading the page height. Epic detail and title pages keep their fixed 16:9 height; the epic loop uses `pagebreak(weak: true)` so the auto-height pages introduce no blank pages.
 
 Progress bars in the summary table use a 10-character bar where each character represents 10%. Filled squares (`■`) are coloured by threshold (green >= 75%, yellow >= 25%, red < 25%) and empty squares (`□`) render in a muted/grey colour. The label uses a space before the percent sign. Example: `■■■■■■□□□□ 60 %`.
 
@@ -165,7 +198,45 @@ The UI uses a two-layer theming architecture:
 
 2. **Overlay layer**: `styles.py` contains app-specific QSS overrides applied at the `QMainWindow` level. These use object-name selectors (`#sidebar`, `#collapsibleHeader`, etc.) and property selectors (`QPushButton[secondary="true"]`) to style custom UI components without duplicating base widget rules.
 
-A global `_JsonCursorFilter` event filter in `app.py` sets `PointingHandCursor` on interactive controls (`QAbstractButton`, `QComboBox`, `QAbstractSpinBox`, `QTabBar`, `QGroupBox`).
+A global `_CursorEventFilter` event filter in `app.py` sets `PointingHandCursor` on interactive controls (`QAbstractButton`, `QComboBox`, `QAbstractSpinBox`, `QTabBar`).
+
+### Theme Customization (NFR-05)
+
+The Settings → Appearance section lets the user override the **accent colour** and
+**font**, applied to both the app UI and the PDF report and persisted as **global**
+config keys (`accent_color`, `font_source`, `font_value`, `font_family`) alongside
+`theme`. A "Reset Appearance to Defaults" button clears them.
+
+**Accent.** `core/theming.py` is the single source of accent maths (dependency-free,
+unit-tested). It derives every shade from one base hex:
+
+- `qt_shades(accent, dark)` → the overlay tints (`accent`/`soft`/`softer`/`border`).
+  `styles.py` is tokenised (`@ACCENT@`/`@SOFT@`/`@SOFTER@`/`@BORDER@`); `light_theme()`/
+  `dark_theme()` substitute them. Called with no argument they emit the historical blue
+  **byte-for-byte**, so the stock look is unchanged when no accent is set.
+- `qt_material_extra(accent, dark)` → `primaryColor`/`primaryLightColor` only, passed to
+  `apply_stylesheet(..., extra=…)`. qt-material does `theme.update(extra)` after loading the
+  XML, so this overrides the base accent without temp files. The text-colour tokens
+  (`primaryTextColor`/`secondaryTextColor`) are left untouched — in qt-material they are the
+  main control foreground (dark on light themes, white on dark), so overriding them would
+  make text unreadable.
+- `report_overrides(accent, dark)` → accent-family hex overrides injected into the Typst
+  payload as `theme.colors`; `main.typ` merges them over the base palette via `c.insert`.
+  Only accent-tinted entries change — semantic colours stay fixed: progress green/amber/red,
+  the purple sprint lane, and the in-progress status badge (a dedicated `info` blue in
+  `theme.typ`, not the accent, so a custom accent never recolours it).
+
+**Font.** `services/font_manager.py` provisions fonts into a cache under the config dir:
+a chosen **file** is copied in; a **Google Fonts** name is resolved against the upstream
+`google/fonts` GitHub repo (contents API across the `ofl`/`apache`/`ufl` license dirs,
+preferring the variable-font file) and its TTFs are downloaded. The repo is used because
+the Fonts CSS API only serves woff2 for modern variable families (e.g. Manrope), which
+Typst cannot read. The resolved family is registered with `QFontDatabase` and prepended to the
+qt-material font stack for the UI; for the PDF the cache dir is added to Typst's
+`font_paths` and `main.typ` sets `font: (custom, "Inter")` so bundled Inter stays the
+fallback. `report_panel` resolves accent + font onto `ReportConfig`
+(`report_accent`/`report_font_family`/`report_font_dir`) just before generation, the same
+place `dark_mode` is set.
 
 ## Code Standards
 
@@ -174,7 +245,8 @@ A global `_JsonCursorFilter` event filter in `app.py` sets `PointingHandCursor` 
 - OAuth tokens never logged or displayed in plain text
 - Exponential backoff for Jira rate limiting (429 responses)
 - `RE_EPIC_KEY` regex (in `widgets.py`) is the single source of truth for epic key validation
-- matplotlib backend set to `Agg` before any matplotlib submodule imports
+- Report-item order **is** the row order in `ReportItemTable._rows`. Rows carry a drag handle (`_DragHandle`); dragging starts an internal-move `QDrag`, and `dragMoveEvent` reorders live while `move_row()`/`_reposition()` handle the list mutation. Any reorder emits `items_changed`, which the config panel persists to `last_report_items` (debounced) and the view-model consumes in order — so the on-screen order, the saved order, and the PDF order are always the same
+- Charts are drawn natively in Typst components (`layout()` + `place`/`rect`/`line`); the Python view-model supplies geometry (day offsets, nice axes, ticks) so labels never overlap
 - Custom/configurable Jira fields read via `_get_raw_field()` (raw JSON dict) rather than the `jira` library's `PropertyHolder` which may drop custom fields
 
 ## Security

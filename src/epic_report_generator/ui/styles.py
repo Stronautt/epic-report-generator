@@ -5,8 +5,13 @@ The base Material Design theme (light_blue / dark_blue) is applied via
 contain only app-specific overrides (object-name and property selectors)
 that complement the material base.
 
-Usage:  apply COMMON_THEME first, then the appropriate LIGHT_THEME or
-DARK_THEME on top.  All three are applied at the window level.
+Usage:  apply COMMON_THEME first, then ``light_theme()`` or ``dark_theme()``
+on top.  All three are applied at the window level.
+
+Accent colours are tokenised (``@ACCENT@``/``@SOFT@``/``@SOFTER@``/``@BORDER@``)
+so a custom accent (NFR-05) can recolour the overlay.  ``light_theme()`` /
+``dark_theme()`` substitute the tokens; called with no argument they use the
+historical blue defaults, reproducing the stock look exactly.
 """
 
 from __future__ import annotations
@@ -173,10 +178,10 @@ QLabel[status="connected"] {
 """
 
 # ---------------------------------------------------------------------------
-# Light theme overlay — color overrides only
+# Light theme overlay — color overrides only (accent tokenised)
 # ---------------------------------------------------------------------------
 
-LIGHT_THEME = """
+_LIGHT_TEMPLATE = """
 /* ── Sidebar ─────────────────────────────────────────────────────── */
 #sidebar {
     background-color: #e8eaf0;
@@ -189,8 +194,8 @@ LIGHT_THEME = """
     background-color: #dcdfe5;
 }
 #sidebar QPushButton:checked {
-    background-color: #d4e4ff;
-    color: #2979ff;
+    background-color: @SOFT@;
+    color: @ACCENT@;
 }
 #sidebar QPushButton:disabled {
     color: #aaaaaa;
@@ -198,11 +203,11 @@ LIGHT_THEME = """
 
 /* ── Buttons — property variants ────────────────────────────────── */
 QPushButton[secondary="true"] {
-    color: #2979ff;
-    border: 1px solid #2979ff;
+    color: @ACCENT@;
+    border: 1px solid @ACCENT@;
 }
 QPushButton[secondary="true"]:hover {
-    background-color: #e3f0ff;
+    background-color: @SOFTER@;
 }
 QPushButton[secondary="true"]:disabled {
     color: #aaaaaa;
@@ -256,7 +261,7 @@ QLabel[status="disconnected"] {
     background: #90a4ae;
 }
 #logFilterBtn[level="info"]:checked {
-    background: #2979ff;
+    background: @ACCENT@;
 }
 #logFilterBtn[level="warning"]:checked {
     background: #ff8f00;
@@ -281,15 +286,15 @@ QLabel[status="disconnected"] {
 
 /* ── Epic key chips ─────────────────────────────────────────────── */
 #epicKeyChip {
-    background-color: #e3f0ff;
-    border: 1px solid #b3d4ff;
-    color: #2979ff;
+    background-color: @SOFTER@;
+    border: 1px solid @BORDER@;
+    color: @ACCENT@;
 }
 #epicKeyChipClose {
-    color: #2979ff;
+    color: @ACCENT@;
 }
 #epicKeyChipClose:hover {
-    background-color: #b3d4ff;
+    background-color: @BORDER@;
 }
 
 /* ── Epic key tag input container ───────────────────────────────── */
@@ -308,8 +313,8 @@ QLabel[status="disconnected"] {
     border-top: 1px solid #d0d4dc;
 }
 #sidebarAvatar {
-    background: #d4e4ff;
-    color: #2979ff;
+    background: @SOFT@;
+    color: @ACCENT@;
 }
 #sidebarUserName {
     color: #212121;
@@ -329,10 +334,10 @@ QLabel[status="disconnected"] {
 """
 
 # ---------------------------------------------------------------------------
-# Dark theme overlay — color overrides only
+# Dark theme overlay — color overrides only (accent tokenised)
 # ---------------------------------------------------------------------------
 
-DARK_THEME = """
+_DARK_TEMPLATE = """
 /* ── Sidebar ─────────────────────────────────────────────────────── */
 #sidebar {
     background-color: #1a1d21;
@@ -345,8 +350,8 @@ DARK_THEME = """
     background-color: #2c2f33;
 }
 #sidebar QPushButton:checked {
-    background-color: #1a2744;
-    color: #448aff;
+    background-color: @SOFT@;
+    color: @ACCENT@;
 }
 #sidebar QPushButton:disabled {
     color: #555555;
@@ -354,11 +359,11 @@ DARK_THEME = """
 
 /* ── Buttons — property variants ────────────────────────────────── */
 QPushButton[secondary="true"] {
-    color: #448aff;
-    border: 1px solid #448aff;
+    color: @ACCENT@;
+    border: 1px solid @ACCENT@;
 }
 QPushButton[secondary="true"]:hover {
-    background-color: #1a2744;
+    background-color: @SOFT@;
 }
 QPushButton[secondary="true"]:disabled {
     color: #555555;
@@ -409,7 +414,7 @@ QLabel[status="disconnected"] {
     background: #78909c;
 }
 #logFilterBtn[level="info"]:checked {
-    background: #448aff;
+    background: @ACCENT@;
 }
 #logFilterBtn[level="warning"]:checked {
     background: #ffab00;
@@ -435,15 +440,15 @@ QLabel[status="disconnected"] {
 
 /* ── Epic key chips ─────────────────────────────────────────────── */
 #epicKeyChip {
-    background-color: #1a2744;
-    border: 1px solid #1e3a5f;
-    color: #448aff;
+    background-color: @SOFT@;
+    border: 1px solid @BORDER@;
+    color: @ACCENT@;
 }
 #epicKeyChipClose {
-    color: #448aff;
+    color: @ACCENT@;
 }
 #epicKeyChipClose:hover {
-    background-color: #1e3a5f;
+    background-color: @BORDER@;
 }
 
 /* ── Epic key tag input container ───────────────────────────────── */
@@ -462,8 +467,8 @@ QLabel[status="disconnected"] {
     border-top: 1px solid #3a3d41;
 }
 #sidebarAvatar {
-    background: #1a2744;
-    color: #448aff;
+    background: @SOFT@;
+    color: @ACCENT@;
 }
 #sidebarSiteName {
     color: #9e9e9e;
@@ -478,3 +483,41 @@ QLabel[status="disconnected"] {
     color: #ef5350;
 }
 """
+
+# Historical blue defaults — reproduce the stock overlay byte-for-byte.
+_LIGHT_DEFAULT_SHADES = {
+    "accent": "#2979ff",
+    "soft": "#d4e4ff",
+    "softer": "#e3f0ff",
+    "border": "#b3d4ff",
+}
+_DARK_DEFAULT_SHADES = {
+    "accent": "#448aff",
+    "soft": "#1a2744",
+    "softer": "#1a2744",
+    "border": "#1e3a5f",
+}
+
+
+def _render(template: str, shades: dict[str, str]) -> str:
+    """Substitute accent tokens in *template* with *shades* hex values.
+
+    ``@SOFTER@`` is replaced before ``@SOFT@`` because the latter is a prefix
+    of the former.
+    """
+    return (
+        template.replace("@ACCENT@", shades["accent"])
+        .replace("@SOFTER@", shades["softer"])
+        .replace("@SOFT@", shades["soft"])
+        .replace("@BORDER@", shades["border"])
+    )
+
+
+def light_theme(shades: dict[str, str] | None = None) -> str:
+    """Render the light overlay; *shades* ``None`` uses the stock blue."""
+    return _render(_LIGHT_TEMPLATE, shades or _LIGHT_DEFAULT_SHADES)
+
+
+def dark_theme(shades: dict[str, str] | None = None) -> str:
+    """Render the dark overlay; *shades* ``None`` uses the stock blue."""
+    return _render(_DARK_TEMPLATE, shades or _DARK_DEFAULT_SHADES)

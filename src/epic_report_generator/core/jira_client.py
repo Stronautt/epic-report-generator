@@ -12,6 +12,8 @@ from dateutil.parser import parse as _dt_parse
 from jira import JIRA, JIRAError
 
 from epic_report_generator.core.data_models import (
+    STATUS_DONE,
+    STATUS_TODO,
     EpicData,
     JiraIssue,
     SprintInfo,
@@ -27,11 +29,40 @@ _BACKOFF_BASE = 1.0  # seconds
 # Maximum number of keys in a single JQL IN clause for subtask batching.
 # JQL supports much larger IN clauses than the pagination page size.
 _JQL_IN_BATCH_SIZE = 500
+# The combined epics+children query repeats the key list three times
+# (key in / epic_link in / parent in), so keep each batch small enough that
+# 3× the list stays well under practical JQL IN-clause limits.
+_COMBINED_BATCH_SIZE = 150
+
+# Standard (non-configurable) issue fields read by the parsers.  Used to build
+# an explicit field projection so searches don't download every custom field.
+# ``status`` carries the nested ``statusCategory``; ``parent`` and the configured
+# epic-link field are required for client-side grouping of batched results.
+_FIXED_FIELDS: tuple[str, ...] = (
+    "summary",
+    "status",
+    "priority",
+    "assignee",
+    "reporter",
+    "created",
+    "updated",
+    "resolution",
+    "resolutiondate",
+    "issuetype",
+    "labels",
+    "fixVersions",
+    "parent",
+)
 
 
 def _drop_subtasks(children: list[JiraIssue]) -> list[JiraIssue]:
     """Return a copy of *children* with is_subtask=True items removed."""
     return [c for c in children if not c.is_subtask]
+
+
+def _chunks(seq: list[str], size: int) -> list[list[str]]:
+    """Split *seq* into consecutive chunks of at most *size* items."""
+    return [seq[i : i + size] for i in range(0, len(seq), size)]
 
 
 class JiraClient:
@@ -148,28 +179,6 @@ class JiraClient:
             logger.warning("Failed to resolve cloudId from %s: %s", tenant_url, exc)
             return None
 
-    def connect_from_config(self) -> bool:
-        """Connect using whichever auth method is configured.
-
-        Reads ``auth_method`` from the :class:`AuthManager` and dispatches
-        to the appropriate connection path.
-        """
-        method = self._auth.auth_method
-        if method == "api_token":
-            api_token = self._auth.get_api_token()
-            if not api_token:
-                logger.warning("Cannot connect — no API token in keyring")
-                return False
-            return self.connect_basic(
-                self._auth.jira_url,
-                self._auth.jira_email,
-                api_token,
-            )
-        if method == "oauth":
-            return self.connect()
-        logger.debug("No auth_method configured — skipping auto-connect")
-        return False
-
     @property
     def connected(self) -> bool:
         """Return True when the Jira session is active."""
@@ -225,46 +234,26 @@ class JiraClient:
             timeline_end_field or due_date_field,
         )
         try:
-            issue = self._search_with_retry(f"key = {epic_key}", max_results=1)
-            if not issue:
-                logger.warning("Epic %s not found", epic_key)
-                return None
-            raw = issue[0]
+            epics = self._fetch_epics_bulk(
+                [epic_key],
+                sp_field=sp_field,
+                epic_link_field=epic_link_field,
+                start_date_field=start_date_field,
+                due_date_field=due_date_field,
+                include_subtasks=include_subtasks,
+                include_subtasks_in_timeline=include_subtasks_in_timeline,
+                sprint_field=sprint_field,
+                timeline_start_field=timeline_start_field,
+                timeline_end_field=timeline_end_field,
+            )
         except JIRAError as exc:
             logger.error("Failed to fetch epic %s: %s", epic_key, exc)
             return None
 
-        epic = self._parse_epic_from_raw(
-            raw,
-            start_date_field,
-            due_date_field,
-            timeline_start_field,
-            timeline_end_field,
-        )
-
-        # Fetch children with pagination
-        epic.children = self._fetch_children(
-            epic_key,
-            sp_field,
-            epic_link_field,
-            start_date_field,
-            due_date_field,
-            include_subtasks=include_subtasks,
-            include_subtasks_in_timeline=include_subtasks_in_timeline,
-            sprint_field=sprint_field,
-            timeline_start_field=timeline_start_field,
-            timeline_end_field=timeline_end_field,
-        )
-
-        # Expand epic dates to cover the full range of children
-        self._fill_epic_dates_from_children(
-            epic, include_subtask_timeline=include_subtasks_in_timeline
-        )
-
-        # If subtasks were fetched only for timeline but not for progress,
-        # remove them so calculate_metrics treats their parents as leaf nodes.
-        if not include_subtasks and include_subtasks_in_timeline:
-            epic.children = _drop_subtasks(epic.children)
+        epic = epics.get(epic_key)
+        if epic is None:
+            logger.warning("Epic %s not found", epic_key)
+            return None
 
         logger.info(
             "Fetched epic %s: %d children, status=%s",
@@ -280,7 +269,9 @@ class JiraClient:
             return False
         logger.debug("Validating epic key %s", epic_key)
         try:
-            results = self._search_with_retry(f"key = {epic_key}", max_results=1)
+            results = self._search_with_retry(
+                f"key = {epic_key}", max_results=1, fields=["key"]
+            )
             valid = bool(results)
             logger.debug("Epic key %s valid=%s", epic_key, valid)
             return valid
@@ -304,10 +295,7 @@ class JiraClient:
             return self._fields_cache
         logger.debug("Fetching Jira fields")
         try:
-            result = [
-                {"id": f["id"], "name": f["name"], "custom": f.get("custom", False)}
-                for f in self._jira.fields()
-            ]
+            result = [{"id": f["id"], "name": f["name"]} for f in self._jira.fields()]
             logger.info("Fetched %d Jira fields", len(result))
             self._fields_cache = result
             self._fields_cache_time = time.monotonic()
@@ -351,55 +339,148 @@ class JiraClient:
         if not self._jira:
             return []
 
-        jql = f'issuetype = Epic AND labels = "{label}" ORDER BY key ASC'
         logger.info("Fetching epics by label %r", label)
-        epics: list[EpicData] = []
-        start = 0
+        keys = self._fetch_epic_keys_by_label(label)
+        if not keys:
+            logger.info("Found 0 epic(s) with label %r", label)
+            return []
 
-        while True:
-            results = self._search_with_retry(
-                jql, start_at=start, max_results=_MAX_RESULTS
-            )
-            if not results:
-                break
-            for raw in results:
-                epic = self._parse_epic_from_raw(
-                    raw,
-                    start_date_field,
-                    due_date_field,
-                    timeline_start_field,
-                    timeline_end_field,
-                )
-
-                epic.children = self._fetch_children(
-                    epic.key,
-                    sp_field,
-                    epic_link_field,
-                    start_date_field,
-                    due_date_field,
-                    include_subtasks=include_subtasks,
-                    include_subtasks_in_timeline=include_subtasks_in_timeline,
-                    sprint_field=sprint_field,
-                    timeline_start_field=timeline_start_field,
-                    timeline_end_field=timeline_end_field,
-                )
-
-                # Expand epic dates to cover the full range of children
-                self._fill_epic_dates_from_children(
-                    epic, include_subtask_timeline=include_subtasks_in_timeline
-                )
-
-                # If subtasks fetched only for timeline, remove for progress
-                if not include_subtasks and include_subtasks_in_timeline:
-                    epic.children = _drop_subtasks(epic.children)
-
-                epics.append(epic)
-            if len(results) < _MAX_RESULTS:
-                break
-            start += _MAX_RESULTS
-
+        epics_by_key = self._fetch_epics_bulk(
+            keys,
+            sp_field=sp_field,
+            epic_link_field=epic_link_field,
+            start_date_field=start_date_field,
+            due_date_field=due_date_field,
+            include_subtasks=include_subtasks,
+            include_subtasks_in_timeline=include_subtasks_in_timeline,
+            sprint_field=sprint_field,
+            timeline_start_field=timeline_start_field,
+            timeline_end_field=timeline_end_field,
+        )
+        # Preserve the key-ASC discovery order.
+        epics = [epics_by_key[k] for k in keys if k in epics_by_key]
         logger.info("Found %d epic(s) with label %r", len(epics), label)
         return epics
+
+    def _fetch_epic_keys_by_label(self, label: str) -> list[str]:
+        """Return the Epic keys carrying *label*, ordered by key (key-only)."""
+        jql = f'issuetype = Epic AND labels = "{label}" ORDER BY key ASC'
+        try:
+            rows = self._search_with_retry(
+                jql, max_results=False, fields=["key"], use_post=True
+            )
+        except JIRAError as exc:
+            logger.warning("Label epic discovery failed (%s): %s", label, exc)
+            return []
+        return [raw.key for raw in rows]
+
+    def fetch_report_epics(
+        self,
+        epic_keys: list[str],
+        labels: list[str],
+        *,
+        sp_field: str = "story_points",
+        epic_link_field: str = "customfield_10014",
+        start_date_field: str = "startdate",
+        due_date_field: str = "duedate",
+        include_subtasks: bool = True,
+        include_subtasks_in_timeline: bool = True,
+        sprint_field: str = "customfield_10020",
+        timeline_start_field: str = "",
+        timeline_end_field: str = "",
+    ) -> tuple[dict[str, EpicData], dict[str, list[str]]]:
+        """Fetch every epic needed for a report in as few requests as possible.
+
+        Resolves each label to its epic keys (one cheap key-only query per
+        label), then fetches all epics — direct items plus label members,
+        de-duplicated — through a single batched :meth:`_fetch_epics_bulk` pass.
+
+        Returns ``(epics_by_key, label_to_keys)`` where *epics_by_key* maps each
+        resolved epic key to its fully-assembled :class:`EpicData`, and
+        *label_to_keys* maps each label to its epic keys in key-ASC order.  A
+        requested key absent from *epics_by_key* simply was not found in Jira.
+        """
+        if not self._jira:
+            return {}, {}
+
+        label_to_keys: dict[str, list[str]] = {}
+        all_keys: list[str] = list(epic_keys)
+        for label in labels:
+            keys = self._fetch_epic_keys_by_label(label)
+            label_to_keys[label] = keys
+            all_keys.extend(keys)
+
+        # De-duplicate while preserving first-seen order.
+        unique_keys = list(dict.fromkeys(all_keys))
+        epics_by_key = self._fetch_epics_bulk(
+            unique_keys,
+            sp_field=sp_field,
+            epic_link_field=epic_link_field,
+            start_date_field=start_date_field,
+            due_date_field=due_date_field,
+            include_subtasks=include_subtasks,
+            include_subtasks_in_timeline=include_subtasks_in_timeline,
+            sprint_field=sprint_field,
+            timeline_start_field=timeline_start_field,
+            timeline_end_field=timeline_end_field,
+        )
+        logger.info(
+            "Report fetch: %d epic(s) across %d label(s) → %d resolved",
+            len(epic_keys),
+            len(labels),
+            len(epics_by_key),
+        )
+        return epics_by_key, label_to_keys
+
+    def fetch_epic_summaries_by_label(self, label: str) -> list[tuple[str, str]]:
+        """Return ``(key, summary)`` for every Epic carrying *label*.
+
+        Lightweight counterpart to :meth:`fetch_epics_by_label` — it does not
+        pull child issues, so it is cheap enough to call when opening the
+        per-item customize dialog.
+        """
+        if not self._jira:
+            return []
+        jql = f'issuetype = Epic AND labels = "{label}" ORDER BY key ASC'
+        logger.debug("Fetching epic summaries for label %r", label)
+        return self._fetch_key_summaries(jql)
+
+    def fetch_child_summaries(
+        self,
+        epic_key: str,
+        epic_link_field: str = "customfield_10014",
+    ) -> list[tuple[str, str]]:
+        """Return ``(key, summary)`` for the direct stories/tasks of *epic_key*.
+
+        Combines the Epic-Link and parent-hierarchy queries (deduplicated),
+        excluding deeper subtasks — mirroring the direct children used in the
+        report. Lightweight; intended for the per-item customize dialog.
+        """
+        if not self._jira:
+            return []
+        logger.debug("Fetching child summaries for %s", epic_key)
+        seen: set[str] = set()
+        out: list[tuple[str, str]] = []
+        for jql in (
+            f'"{epic_link_field}" = {epic_key} ORDER BY created ASC',
+            f"parent = {epic_key} ORDER BY created ASC",
+        ):
+            for key, summary in self._fetch_key_summaries(jql):
+                if key not in seen:
+                    seen.add(key)
+                    out.append((key, summary))
+        return out
+
+    def _fetch_key_summaries(self, jql: str) -> list[tuple[str, str]]:
+        """Run a JQL search returning ``(key, summary)`` pairs (summary only)."""
+        try:
+            results = self._search_with_retry(
+                jql, max_results=False, fields=["summary"], use_post=True
+            )
+        except JIRAError as exc:
+            logger.warning("Summary search failed (%s): %s", jql, exc)
+            return []
+        return [(raw.key, getattr(raw.fields, "summary", "") or "") for raw in results]
 
     def fetch_fix_version_dates(self, project_key: str) -> dict[str, date | None]:
         """Fetch release dates for all fix versions in a project.
@@ -457,6 +538,7 @@ class JiraClient:
             results = self._search_with_retry(
                 "labels is not EMPTY ORDER BY updated DESC",
                 max_results=50,
+                fields=["labels"],
             )
             label_set: set[str] = set()
             for raw in results:
@@ -519,7 +601,7 @@ class JiraClient:
             # Estimation end
             if c.due_date:
                 candidate_ends.append(c.due_date)
-            elif c.resolved and c.status_category == "Done":
+            elif c.resolved and c.status_category == STATUS_DONE:
                 candidate_ends.append(c.resolved.date())
 
             # Skip subtasks for timeline dates when not included
@@ -540,6 +622,191 @@ class JiraClient:
             epic.timeline_end = max(tl_ends)
 
     # -- internals ------------------------------------------------------------
+
+    def _build_field_list(
+        self,
+        sp_field: str,
+        epic_link_field: str,
+        start_date_field: str,
+        due_date_field: str,
+        timeline_start_field: str,
+        timeline_end_field: str,
+        sprint_field: str,
+    ) -> list[str]:
+        """Build the explicit field projection for epic/children searches.
+
+        Combines the fixed fields read by the parsers with the configurable
+        field ids (estimate, epic-link, sprint, estimation + timeline dates) and
+        the ``customfield_10016`` story-points fallback.  ``epic_link_field`` and
+        ``parent`` (in :data:`_FIXED_FIELDS`) are required to regroup batched
+        results back to their epics.
+        """
+        fields = [
+            *_FIXED_FIELDS,
+            sp_field,
+            "customfield_10016",  # default Jira Cloud SP field (fallback)
+            epic_link_field,
+            sprint_field,
+            start_date_field,
+            due_date_field,
+            timeline_start_field or start_date_field,
+            timeline_end_field or due_date_field,
+        ]
+        # De-duplicate, preserving order and dropping empty names.
+        seen: set[str] = set()
+        out: list[str] = []
+        for name in fields:
+            if name and name not in seen:
+                seen.add(name)
+                out.append(name)
+        return out
+
+    @staticmethod
+    def _epic_key_of(value: Any) -> str | None:
+        """Normalise an Epic-Link field value to a plain issue key.
+
+        Classic projects store the epic key as a string; some configurations
+        return a dict or object — handle all three.
+        """
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            return value.get("key")
+        return getattr(value, "key", None)
+
+    def _fetch_epics_bulk(
+        self,
+        epic_keys: list[str],
+        *,
+        sp_field: str = "story_points",
+        epic_link_field: str = "customfield_10014",
+        start_date_field: str = "startdate",
+        due_date_field: str = "duedate",
+        include_subtasks: bool = True,
+        include_subtasks_in_timeline: bool = True,
+        sprint_field: str = "customfield_10020",
+        timeline_start_field: str = "",
+        timeline_end_field: str = "",
+    ) -> dict[str, EpicData]:
+        """Fetch many epics and all their children in a handful of requests.
+
+        Issues one combined ``key in / epic_link in / parent in`` query per key
+        batch (epics + direct children together), then one batched
+        ``parent in (...)`` query for subtasks across every epic.  Results are
+        grouped back to their epics client-side.  Returns a mapping of epic key →
+        assembled :class:`EpicData`; requested keys not found in Jira are simply
+        absent from the result.
+        """
+        if not self._jira or not epic_keys:
+            return {}
+
+        unique_keys = list(dict.fromkeys(epic_keys))
+        epic_set = set(unique_keys)
+        fields = self._build_field_list(
+            sp_field,
+            epic_link_field,
+            start_date_field,
+            due_date_field,
+            timeline_start_field,
+            timeline_end_field,
+            sprint_field,
+        )
+
+        epics: dict[str, EpicData] = {}
+        direct_children: dict[str, list[JiraIssue]] = {k: [] for k in unique_keys}
+        subtasks: dict[str, list[JiraIssue]] = {k: [] for k in unique_keys}
+        child_to_epic: dict[str, str] = {}
+        seen_children: set[str] = set()
+
+        def parse_child(raw: Any) -> JiraIssue:
+            return self._parse_child_issue(
+                raw,
+                sp_field,
+                start_date_field,
+                due_date_field,
+                sprint_field,
+                timeline_start_field,
+                timeline_end_field,
+            )
+
+        # Phase 1: epics + their direct children, batched into combined queries.
+        for batch in _chunks(unique_keys, _COMBINED_BATCH_SIZE):
+            keys_csv = ", ".join(batch)
+            jql = (
+                f"(key in ({keys_csv}) "
+                f'OR "{epic_link_field}" in ({keys_csv}) '
+                f"OR parent in ({keys_csv})) "
+                f"ORDER BY created ASC"
+            )
+            logger.debug("Bulk fetch epics+children for %d key(s)", len(batch))
+            rows = self._search_with_retry(
+                jql, max_results=False, fields=fields, use_post=True
+            )
+            for raw in rows:
+                # Key-first: a requested key is always its own epic, never a
+                # child (covers an epic nested under another requested epic).
+                if raw.key in epic_set:
+                    if raw.key not in epics:
+                        epics[raw.key] = self._parse_epic_from_raw(
+                            raw,
+                            start_date_field,
+                            due_date_field,
+                            timeline_start_field,
+                            timeline_end_field,
+                        )
+                    continue
+                if raw.key in seen_children:
+                    continue
+                issue = parse_child(raw)
+                link = self._epic_key_of(self._get_raw_field(raw, epic_link_field))
+                if link in epic_set:
+                    owner: str | None = link
+                elif issue.parent_key in epic_set:
+                    owner = issue.parent_key
+                else:
+                    logger.debug("Ungroupable child row %s — skipping", raw.key)
+                    continue
+                issue.is_subtask = False
+                seen_children.add(issue.key)
+                direct_children[owner].append(issue)
+                child_to_epic[issue.key] = owner
+
+        # Phase 2: subtasks of every direct child, batched across all epics.
+        need_subtasks = include_subtasks or include_subtasks_in_timeline
+        if need_subtasks and child_to_epic:
+            for batch in _chunks(list(child_to_epic), _JQL_IN_BATCH_SIZE):
+                keys_csv = ", ".join(batch)
+                jql = f"parent in ({keys_csv}) ORDER BY created ASC"
+                logger.debug("Bulk fetch subtasks for %d parent(s)", len(batch))
+                rows = self._search_with_retry(
+                    jql, max_results=False, fields=fields, use_post=True
+                )
+                for raw in rows:
+                    if raw.key in seen_children or raw.key in epic_set:
+                        continue
+                    issue = parse_child(raw)
+                    owner = child_to_epic.get(issue.parent_key or "")
+                    if owner is None:
+                        continue
+                    issue.is_subtask = True
+                    seen_children.add(issue.key)
+                    subtasks[owner].append(issue)
+
+        # Assemble each epic: direct children (created-ASC from the per-epic
+        # query) followed by subtasks; expand epic dates; optionally drop the
+        # timeline-only subtasks so metrics treat their parents as leaves.
+        for key, epic in epics.items():
+            epic.children = direct_children[key] + subtasks[key]
+            self._fill_epic_dates_from_children(
+                epic, include_subtask_timeline=include_subtasks_in_timeline
+            )
+            if not include_subtasks and include_subtasks_in_timeline:
+                epic.children = _drop_subtasks(epic.children)
+            logger.debug("Assembled epic %s: %d children", key, len(epic.children))
+
+        return epics
 
     def _parse_epic_from_raw(
         self,
@@ -582,119 +849,6 @@ class JiraClient:
             epic.timeline_end,
         )
         return epic
-
-    def _paginated_search(
-        self,
-        jql: str,
-        sp_field: str,
-        start_date_field: str,
-        due_date_field: str,
-        sprint_field: str,
-        timeline_start_field: str,
-        timeline_end_field: str,
-        seen: set[str],
-        children: list[JiraIssue],
-    ) -> None:
-        """Run a paginated JQL search and append deduplicated child issues."""
-        start = 0
-        while True:
-            results = self._search_with_retry(
-                jql, start_at=start, max_results=_MAX_RESULTS
-            )
-            if not results:
-                break
-            for raw in results:
-                issue = self._parse_child_issue(
-                    raw,
-                    sp_field,
-                    start_date_field,
-                    due_date_field,
-                    sprint_field,
-                    timeline_start_field,
-                    timeline_end_field,
-                )
-                if issue.key not in seen:
-                    seen.add(issue.key)
-                    children.append(issue)
-            if len(results) < _MAX_RESULTS:
-                break
-            start += _MAX_RESULTS
-
-    def _fetch_children(
-        self,
-        epic_key: str,
-        sp_field: str,
-        epic_link_field: str,
-        start_date_field: str = "startdate",
-        due_date_field: str = "duedate",
-        include_subtasks: bool = True,
-        include_subtasks_in_timeline: bool = True,
-        sprint_field: str = "customfield_10020",
-        timeline_start_field: str = "",
-        timeline_end_field: str = "",
-    ) -> list[JiraIssue]:
-        children: list[JiraIssue] = []
-        seen: set[str] = set()
-
-        # 1) Issues linked via the Epic Link custom field (Stories, Bugs, etc.)
-        jql = f'"{epic_link_field}" = {epic_key} ORDER BY created ASC'
-        logger.debug("Fetching children for %s (field=%s)", epic_key, epic_link_field)
-        self._paginated_search(
-            jql,
-            sp_field,
-            start_date_field,
-            due_date_field,
-            sprint_field,
-            timeline_start_field,
-            timeline_end_field,
-            seen,
-            children,
-        )
-
-        # 2) Issues linked via the parent hierarchy (Tasks, Defects, etc.)
-        #    In Jira Cloud, these may not have the Epic Link field set.
-        parent_jql = f"parent = {epic_key} ORDER BY created ASC"
-        logger.debug("Fetching parent-linked children for %s", epic_key)
-        self._paginated_search(
-            parent_jql,
-            sp_field,
-            start_date_field,
-            due_date_field,
-            sprint_field,
-            timeline_start_field,
-            timeline_end_field,
-            seen,
-            children,
-        )
-
-        # Fetch subtasks of direct children when needed for progress or timeline
-        need_subtasks = include_subtasks or include_subtasks_in_timeline
-        if need_subtasks and children:
-            direct_child_count = len(children)
-            child_keys = [c.key for c in children]
-            for batch_start in range(0, len(child_keys), _JQL_IN_BATCH_SIZE):
-                batch = child_keys[batch_start : batch_start + _JQL_IN_BATCH_SIZE]
-                subtask_jql = f"parent in ({', '.join(batch)}) ORDER BY created ASC"
-                logger.debug("Fetching subtasks for %d parent(s)", len(batch))
-                self._paginated_search(
-                    subtask_jql,
-                    sp_field,
-                    start_date_field,
-                    due_date_field,
-                    sprint_field,
-                    timeline_start_field,
-                    timeline_end_field,
-                    seen,
-                    children,
-                )
-            # Mark newly added issues as subtasks
-            for c in children[direct_child_count:]:
-                c.is_subtask = True
-            logger.debug(
-                "Total children + subtasks for %s: %d", epic_key, len(children)
-            )
-
-        return children
 
     def _parse_child_issue(
         self,
@@ -750,14 +904,33 @@ class JiraClient:
         return issue
 
     def _search_with_retry(
-        self, jql: str, *, start_at: int = 0, max_results: int = _MAX_RESULTS
+        self,
+        jql: str,
+        *,
+        start_at: int = 0,
+        max_results: int | bool = _MAX_RESULTS,
+        fields: list[str] | None = None,
+        use_post: bool = False,
     ) -> list[Any]:
-        """Execute a JQL search with exponential backoff on 429."""
-        assert self._jira is not None, "call connect() first"
+        """Execute a JQL search with exponential backoff on 429.
+
+        *fields* restricts the returned field set (a projection); ``None`` keeps
+        the library default of every field.  Passing a falsy *max_results* lets
+        the ``jira`` library fetch all pages in one call via the Jira Cloud
+        token-paginated endpoint — this is required because ``search_issues``
+        raises on ``startAt > 0`` against Cloud.  *use_post* sends the JQL in the
+        request body, avoiding URL-length limits for large ``IN`` clauses.
+        """
+        if self._jira is None:
+            raise RuntimeError("call connect() first")
         for attempt in range(_MAX_RETRIES):
             try:
                 return self._jira.search_issues(
-                    jql, startAt=start_at, maxResults=max_results
+                    jql,
+                    startAt=start_at,
+                    maxResults=max_results,
+                    fields=fields,
+                    use_post=use_post,
                 )
             except JIRAError as exc:
                 if exc.status_code == 429 and attempt < _MAX_RETRIES - 1:
@@ -773,12 +946,12 @@ class JiraClient:
     def _status_category(fields: Any) -> str:
         status = getattr(fields, "status", None)
         if status is None:
-            return "To Do"
+            return STATUS_TODO
         cat = getattr(status, "statusCategory", None)
         if cat is None:
-            return "To Do"
+            return STATUS_TODO
         name = getattr(cat, "name", None)
-        return str(name) if name else "To Do"
+        return str(name) if name else STATUS_TODO
 
     @staticmethod
     def _name(obj: Any) -> str | None:
@@ -823,29 +996,17 @@ class JiraClient:
                     end = getattr(entry, "endDate", None)
                     state = getattr(entry, "state", "")
 
-                start_d = None
-                if start:
-                    try:
-                        start_d = date.fromisoformat(str(start)[:10])
-                    except (ValueError, TypeError):
-                        pass
-                end_d = None
-                if end:
-                    try:
-                        end_d = date.fromisoformat(str(end)[:10])
-                    except (ValueError, TypeError):
-                        pass
-
                 if name:
                     result.append(
                         SprintInfo(
                             name=str(name),
-                            start_date=start_d,
-                            end_date=end_d,
+                            start_date=JiraClient._parse_date(start),
+                            end_date=JiraClient._parse_date(end),
                             state=str(state),
                         )
                     )
-            except Exception:
+            except (TypeError, AttributeError, KeyError) as exc:
+                logger.debug("Skipping malformed sprint entry: %s", exc)
                 continue
         return result
 

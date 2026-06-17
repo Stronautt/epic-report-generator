@@ -11,6 +11,7 @@ Epic Report Generator is a desktop app that connects to Jira Cloud, pulls Epic p
 - **Timeline page** — optional Gantt-style chart showing epic and (optionally) child issue date ranges with milestone markers (included by default; can be excluded via the "Include timeline chart" option)
 - **Per-Epic detail pages** — trend chart (total vs. completed SP, cumulative issues, weekend bands) plus a metrics sidebar (velocity, cycle time, scope change %, forecast date)
 - **Light & Dark themes** — Material Design base with app-specific overlays; the PDF and the app UI both follow your preference
+- **Theme customization** — pick a custom accent colour and font (from a file or by Google Fonts name) in Settings → Appearance; both the app and the report update, and a one-click reset restores the defaults
 
 ## Functional Requirements
 
@@ -27,6 +28,7 @@ Epic Report Generator is a desktop app that connects to Jira Cloud, pulls Epic p
 - **FR-11. PDF Report Generation:** The app must compile all tables and charts into a multi-page PDF document.
 - **FR-12. Jira Label Aggregation:** The system must aggregate child issue data (Stories/Tasks) into a high-level "Label Progress Summary" table, including completion percentages. There should be the ability to add a custom display name to each label that will appear in the report.
 - **FR-13. Scope Certainty:** The system must allow users to set Scope certainty as "Low' or "Medium" or "High" for each label and/or epic during the Report configuration ("STEP 1. Configuration").The "Label Certainty" dropdown should include a “Consolidated” option, allowing users to set individual certainty values for each epic associated with the label. While this option is named 'Consolidated' in the configuration settings, the report itself should display 'Low,' 'Medium,' or 'High' based on the average certainty values of the underlying child epics.
+- **FR-14. Report Items Re-ordering:** It should be possible to drag the items in the list to change the order in the final report.
 
 ## Non-Functional Requirements
 
@@ -34,7 +36,7 @@ Epic Report Generator is a desktop app that connects to Jira Cloud, pulls Epic p
 - **NFR-02. Portability:** The application should be cross-platform (Windows/Mac/Linux).
 - **NFR-03. Reliability:** The system must include error handling for API connection failures and provide meaningful logs to the user.
 - **NFR-04. UI:** The “Epic Progress Summary” should be configured to fit precisely on a single page, with the layout automatically scaling its vertical dimensions based on the cumulative height of the tables
-- **NFR-05. UI:** Report must support theme customization: colors and fonts
+- **NFR-05. UI:** The app and the report must support theme customization — a custom accent colour and a custom font (loaded from a file or by Google Fonts name), applied to both the UI and the generated PDF, persisted between sessions, and resettable to defaults.
 
 ## Quick start
 
@@ -128,7 +130,7 @@ Three progress methods are available:
 
 ## Tech stack
 
-PySide6 · qt-material · ReportLab · matplotlib · jira · keyring · platformdirs · pandas
+PySide6 · qt-material · ReportLab · matplotlib · jira · keyring · platformdirs
 
 ## License
 

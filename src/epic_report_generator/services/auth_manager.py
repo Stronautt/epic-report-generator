@@ -24,6 +24,8 @@ _AUTH_URL = "https://auth.atlassian.com/authorize"
 _TOKEN_URL = "https://auth.atlassian.com/oauth/token"
 _RESOURCES_URL = "https://api.atlassian.com/oauth/token/accessible-resources"
 _SCOPES = "read:jira-work read:jira-user offline_access"
+# Treat tokens expiring within this window as already expired (clock-skew guard).
+_TOKEN_EXPIRY_BUFFER_S = 60
 
 
 class AuthManager:
@@ -38,7 +40,9 @@ class AuthManager:
         self._access_token: str | None = None
         self._token_expiry: float = 0.0
 
-    # -- public helpers -------------------------------------------------------
+    def _cfg_str(self, key: str) -> str:
+        """Return a config value as a string, defaulting to empty."""
+        return str(self._config.get(key, ""))
 
     @property
     def is_configured(self) -> bool:
@@ -50,33 +54,31 @@ class AuthManager:
     @property
     def cloud_id(self) -> str:
         """Return the stored Jira Cloud ID."""
-        return str(self._config.get("cloud_id", ""))
+        return self._cfg_str("cloud_id")
 
     @property
     def site_name(self) -> str:
         """Return the stored Jira site display name."""
-        return str(self._config.get("site_name", ""))
+        return self._cfg_str("site_name")
 
     @property
     def auth_method(self) -> str:
         """Return the active auth method: ``"api_token"``, ``"oauth"``, or ``""``."""
-        return str(self._config.get("auth_method", ""))
+        return self._cfg_str("auth_method")
 
     @property
     def jira_url(self) -> str:
         """Return the stored Jira instance URL (API-token auth)."""
-        return str(self._config.get("jira_url", ""))
+        return self._cfg_str("jira_url")
 
     @property
     def jira_email(self) -> str:
         """Return the stored Jira email (API-token auth)."""
-        return str(self._config.get("jira_email", ""))
+        return self._cfg_str("jira_email")
 
     def set_cloud_id(self, cloud_id: str) -> None:
         """Persist a cloud_id discovered during connection."""
         self._config.set("cloud_id", cloud_id)
-
-    # -- API-token auth -------------------------------------------------------
 
     def login_api_token(self, url: str, email: str, token: str) -> None:
         """Store API-token credentials and persist config.
@@ -104,18 +106,18 @@ class AuthManager:
         """Retrieve the API token from the OS keyring."""
         return keyring.get_password(KEYRING_SERVICE, "api_token")
 
-    # -- token access ---------------------------------------------------------
-
     def get_access_token(self) -> str | None:
         """Return a valid access token, refreshing if necessary."""
-        if self._access_token and time.time() < self._token_expiry:
+        if (
+            self._access_token
+            and time.time() + _TOKEN_EXPIRY_BUFFER_S < self._token_expiry
+        ):
             logger.debug(
                 "Using cached access token (expires in %.0fs)",
                 self._token_expiry - time.time(),
             )
             return self._access_token
 
-        # Try to restore from keyring
         stored = self._load_tokens()
         if not stored:
             logger.debug("No stored tokens found in keyring")
@@ -124,7 +126,7 @@ class AuthManager:
         access = stored.get("access_token", "")
         expiry = stored.get("expiry", 0.0)
 
-        if access and time.time() < expiry:
+        if access and time.time() + _TOKEN_EXPIRY_BUFFER_S < expiry:
             logger.info(
                 "Restored access token from keyring (expires in %.0fs)",
                 expiry - time.time(),
@@ -133,7 +135,6 @@ class AuthManager:
             self._token_expiry = expiry
             return access
 
-        # Token expired — attempt refresh
         refresh = stored.get("refresh_token", "")
         if refresh:
             logger.info("Access token expired, refreshing")
@@ -141,8 +142,6 @@ class AuthManager:
 
         logger.warning("No refresh token available, re-login required")
         return None
-
-    # -- login flow -----------------------------------------------------------
 
     def start_login(self) -> dict[str, Any] | None:
         """Run the full browser-based OAuth login flow (blocking).
@@ -228,19 +227,19 @@ class AuthManager:
             }
         )
 
-    # -- internals ------------------------------------------------------------
+    def _post_token_request(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        """POST to the OAuth token endpoint with client credentials + payload.
 
-    def _exchange_code(self, code: str, redirect_uri: str) -> dict[str, Any] | None:
-        logger.debug("Exchanging authorization code for tokens")
+        Stamps ``expiry``, caches the access token in memory, and returns the
+        response dict, or ``None`` on failure. Callers persist refresh tokens.
+        """
         try:
             resp = requests.post(
                 _TOKEN_URL,
                 json={
-                    "grant_type": "authorization_code",
                     "client_id": self._config.get("client_id"),
                     "client_secret": self._config.get("client_secret"),
-                    "code": code,
-                    "redirect_uri": redirect_uri,
+                    **payload,
                 },
                 timeout=30,
             )
@@ -250,45 +249,36 @@ class AuthManager:
             self._access_token = data["access_token"]
             self._token_expiry = data["expiry"]
             logger.info(
-                "Token exchange successful (expires_in=%ds)",
+                "Token request successful (expires_in=%ds)",
                 data.get("expires_in", 3600),
             )
             return data
         except requests.RequestException as exc:
-            logger.error("Token exchange failed: %s", exc)
-            return None
-
-    def _refresh_token(self, refresh_token: str) -> str | None:
-        logger.debug("Refreshing access token")
-        try:
-            resp = requests.post(
-                _TOKEN_URL,
-                json={
-                    "grant_type": "refresh_token",
-                    "client_id": self._config.get("client_id"),
-                    "client_secret": self._config.get("client_secret"),
-                    "refresh_token": refresh_token,
-                },
-                timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            data["expiry"] = time.time() + data.get("expires_in", 3600)
-
-            # Store the new rotating refresh token immediately
-            self._store_tokens(data)
-            self._access_token = data["access_token"]
-            self._token_expiry = data["expiry"]
-            logger.info(
-                "Token refreshed successfully (expires_in=%ds)",
-                data.get("expires_in", 3600),
-            )
-            return data["access_token"]
-        except requests.RequestException as exc:
-            logger.error("Token refresh failed: %s", exc)
+            logger.error("Token request failed: %s", exc)
             self._access_token = None
             self._token_expiry = 0.0
             return None
+
+    def _exchange_code(self, code: str, redirect_uri: str) -> dict[str, Any] | None:
+        logger.debug("Exchanging authorization code for tokens")
+        return self._post_token_request(
+            {
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+            }
+        )
+
+    def _refresh_token(self, refresh_token: str) -> str | None:
+        logger.debug("Refreshing access token")
+        data = self._post_token_request(
+            {"grant_type": "refresh_token", "refresh_token": refresh_token}
+        )
+        if data is None:
+            return None
+        # Store the new rotating refresh token immediately
+        self._store_tokens(data)
+        return data["access_token"]
 
     def _fetch_accessible_resources(
         self, access_token: str
@@ -338,4 +328,5 @@ class AuthManager:
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
+            logger.warning("Stored OAuth tokens are malformed; re-login required")
             return None

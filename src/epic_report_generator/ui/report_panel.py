@@ -8,16 +8,16 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
 
 from epic_report_generator.core.jira_client import JiraClient
 from epic_report_generator.services.config_manager import ConfigManager
+from epic_report_generator.services.font_manager import FontManager
 from epic_report_generator.ui.config_panel import ConfigPanel
 from epic_report_generator.ui.preview_panel import PreviewPanel
-from epic_report_generator.ui.widgets import CollapsibleSection
+from epic_report_generator.ui.widgets import CollapsibleSection, make_scroll_content
 
 logger = logging.getLogger(__name__)
 
@@ -29,27 +29,21 @@ class ReportPanel(QWidget):
         self,
         config: ConfigManager,
         jira: JiraClient,
+        font_manager: FontManager,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._config_mgr = config
         self._jira = jira
+        self._font_manager = font_manager
         self._build_ui()
 
     def _build_ui(self) -> None:
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll, root = make_scroll_content()
         outer.addWidget(scroll)
-
-        content = QWidget()
-        scroll.setWidget(content)
-        root = QVBoxLayout(content)
-        root.setContentsMargins(32, 32, 32, 32)
-        root.setSpacing(16)
 
         # Heading
         title = QLabel("Report")
@@ -109,7 +103,7 @@ class ReportPanel(QWidget):
 
     def trigger_export(self) -> None:
         """Public method for keyboard shortcut (Ctrl+E)."""
-        self._preview_panel._export_pdf()
+        self._preview_panel.trigger_export()
 
     def set_dark(self, dark: bool) -> None:
         """Pass dark mode flag to the preview panel."""
@@ -129,10 +123,20 @@ class ReportPanel(QWidget):
             return
 
         cfg.dark_mode = self._config_mgr.get("theme", "light") == "dark"
+
+        # Appearance customization (NFR-05): carry the configured accent and the
+        # resolved custom font (family + provisioned dir) into the renderer.
+        cfg.report_accent = self._config_mgr.get("accent_color", "")
+        cfg.report_font_family, cfg.report_font_dir = (
+            self._font_manager.resolve_for_report()
+        )
+
         logger.info(
-            "Starting report generation: %d epic(s), dark_mode=%s",
+            "Starting report generation: %d epic(s), dark_mode=%s, accent=%s, font=%s",
             len(cfg.epic_keys),
             cfg.dark_mode,
+            cfg.report_accent or "default",
+            cfg.report_font_family or "Inter",
         )
 
         # Collapse config, expand preview
