@@ -9,10 +9,12 @@ from collections import OrderedDict
 from collections.abc import Callable
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from platformdirs import user_downloads_dir
+from PySide6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QTimer
 from PySide6.QtGui import QPixmap, QResizeEvent
 from PySide6.QtWidgets import (
     QFileDialog,
+    QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
     QMessageBox,
@@ -35,6 +37,7 @@ from epic_report_generator.core.data_models import (
 from epic_report_generator.core.jira_client import JiraClient
 from epic_report_generator.core.metrics import calculate_metrics, merge_metrics
 from epic_report_generator.core.pdf_generator import generate_pdf
+from epic_report_generator.services.config_manager import ConfigManager
 from epic_report_generator.ui._threading import ThreadedTask
 
 logger = logging.getLogger(__name__)
@@ -51,6 +54,11 @@ _PREVIEW_BORDER_LIGHT = "#ccc"
 # Prevents memory bloat when resizing, while avoiding re-renders on
 # common back-and-forth resize patterns.
 _PIXMAP_CACHE_MAX_ENTRIES = 2
+
+
+def _project_prefix(key: str) -> str | None:
+    """Return the Jira project prefix (text before the last '-'), or None."""
+    return key.rsplit("-", 1)[0] if "-" in key else None
 
 
 def _generate_report(
@@ -138,8 +146,8 @@ def _generate_report(
             report.metrics.append(metrics)
             report.resolved_items.append((item, epic, metrics))
             # Collect project key
-            if "-" in item.key:
-                project_keys.add(item.key.rsplit("-", 1)[0])
+            if (prefix := _project_prefix(item.key)) is not None:
+                project_keys.add(prefix)
 
         elif item.kind == "label":
             keys = label_to_keys.get(item.key, [])
@@ -177,8 +185,8 @@ def _generate_report(
                 else:
                     em.scope_certainty = ov.scope_certainty if ov else None
                 source_pairs.append((e, em))
-                if "-" in e.key:
-                    project_keys.add(e.key.rsplit("-", 1)[0])
+                if (prefix := _project_prefix(e.key)) is not None:
+                    project_keys.add(prefix)
             report.label_source_epics[item.key] = source_pairs
             # Group certainty: explicit parent value, else average of children.
             if item.scope_certainty:
@@ -241,9 +249,15 @@ class PreviewPanel(QWidget):
     Designed to be embedded inside ReportPanel — no heading or generate button.
     """
 
-    def __init__(self, jira: JiraClient, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        jira: JiraClient,
+        config_mgr: ConfigManager,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self._jira = jira
+        self._config_mgr = config_mgr
         self._pdf_bytes: bytes | None = None
         self._config: ReportConfig | None = None
         self._tasks = ThreadedTask(self)
@@ -252,7 +266,12 @@ class PreviewPanel(QWidget):
         self._pixmap_cache: OrderedDict[tuple[int, int, float], list[QPixmap]] = (
             OrderedDict()
         )
-        # Debounce timer for resize events
+        # Parsed PDF document (+ its backing buffer) reused across resize
+        # re-renders, keyed by the bytes' identity, so changing only the scale
+        # doesn't re-parse the whole PDF each time.
+        self._pdf_doc: object | None = None
+        self._pdf_buf: object | None = None
+        self._pdf_doc_id: int | None = None
         self._resize_timer = QTimer(self)
         self._resize_timer.setSingleShot(True)
         self._resize_timer.setInterval(150)
@@ -297,6 +316,18 @@ class PreviewPanel(QWidget):
         self._apply_preview_bg()
         root.addWidget(self._scroll, 1)
 
+        # Fade-in for freshly generated previews — masks the abrupt flicker
+        # when pages first appear. The effect stays disabled (so it adds no
+        # rendering cost during normal scrolling / resize re-renders) and is
+        # only enabled for the duration of the animation.
+        self._fade_effect = QGraphicsOpacityEffect(self._preview_container)
+        self._fade_effect.setEnabled(False)
+        self._preview_container.setGraphicsEffect(self._fade_effect)
+        self._fade_anim = QPropertyAnimation(self._fade_effect, b"opacity", self)
+        self._fade_anim.setDuration(280)
+        self._fade_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._fade_anim.finished.connect(lambda: self._fade_effect.setEnabled(False))
+
     def _apply_preview_bg(self) -> None:
         """Set the preview container background for the current theme."""
         bg = _PREVIEW_BG_DARK if self._dark else _PREVIEW_BG_LIGHT
@@ -307,6 +338,20 @@ class PreviewPanel(QWidget):
     def shutdown(self) -> None:
         """Wait for the generation thread to finish before closing."""
         self._tasks.wait()
+        self._dispose_pdf_doc()
+
+    def show_busy(self, message: str) -> None:
+        """Show an indeterminate progress bar with *message*.
+
+        Surfaces a pre-generation step — currently report-item validation —
+        before the generation worker starts reporting its own determinate
+        progress. The marquee (range 0–0) makes clear that work is happening
+        even though no percentage is available yet.
+        """
+        self.clear_preview()
+        self._progress_bar.setRange(0, 0)
+        self._progress_bar.show()
+        self._status_label.setText(message)
 
     def trigger_export(self) -> None:
         """Public entry point to export the generated PDF (used by ReportPanel)."""
@@ -331,10 +376,18 @@ class PreviewPanel(QWidget):
             logger.warning("Generate called while a previous run is still active")
             return
 
+        # Work on a private copy: the worker thread mutates fields on the config
+        # (e.g. project_display_name auto-fill) while the caller still holds the
+        # original — the copy avoids a cross-thread data race and is what the UI
+        # keeps for the export filename.
+        config = copy.deepcopy(config)
+
         item_count = len(config.items) or len(config.epic_keys)
         self._config = config
         logger.info("Starting report generation for %d item(s)", item_count)
         self.clear_preview()
+        # Reset to determinate mode in case a busy (validation) bar was showing.
+        self._progress_bar.setRange(0, 100)
         self._progress_bar.setValue(0)
         self._progress_bar.show()
 
@@ -352,6 +405,7 @@ class PreviewPanel(QWidget):
         self._clear_preview()
         self._pdf_bytes = None
         self._pixmap_cache.clear()
+        self._dispose_pdf_doc()
         self._export_btn.setEnabled(False)
         self._status_label.clear()
         self._progress_bar.hide()
@@ -408,17 +462,30 @@ class PreviewPanel(QWidget):
 
         self._pdf_bytes = pdf_bytes
         self._pixmap_cache.clear()
+        self._dispose_pdf_doc()  # force a fresh parse for the new document
         self._progress_bar.hide()
         logger.info(
-            "PDF generated: %d epic(s), %s bytes",
+            "PDF generated: %d epic(s), %d bytes",
             epic_count,
-            f"{len(self._pdf_bytes):,}",
+            len(self._pdf_bytes),
         )
         self._status_label.setText(
             f"Report ready — {epic_count} epic(s), " f"{len(self._pdf_bytes):,} bytes"
         )
         self._export_btn.setEnabled(True)
+        # Start the fade from fully transparent *before* rendering so the pages
+        # never flash at full opacity for a frame, then animate up to opaque.
+        self._fade_effect.setEnabled(True)
+        self._fade_effect.setOpacity(0.0)
         self._render_preview()
+        self._start_fade_in()
+
+    def _start_fade_in(self) -> None:
+        """Animate the freshly rendered preview from transparent to opaque."""
+        self._fade_anim.stop()
+        self._fade_anim.setStartValue(0.0)
+        self._fade_anim.setEndValue(1.0)
+        self._fade_anim.start()
 
     def _export_pdf(self) -> None:
         if not self._pdf_bytes:
@@ -431,13 +498,31 @@ class PreviewPanel(QWidget):
             rd = self._config.report_date
             date_str = f"{rd.day}-{MONTHS_ABBR[rd.month - 1]}-{rd.strftime('%y')}"
             default_name = f"{title_slug}-{date_str}.pdf"
+        initial = str(self._initial_export_dir() / default_name)
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export Report", default_name, "PDF Files (*.pdf)"
+            self, "Export Report", initial, "PDF Files (*.pdf)"
         )
         if path:
             Path(path).write_bytes(self._pdf_bytes)
+            self._config_mgr.set("last_export_dir", str(Path(path).parent))
             logger.info("PDF exported to %s", path)
             self._status_label.setText(f"Exported to {path}")
+
+    def _initial_export_dir(self) -> Path:
+        """Resolve the directory to open the export dialog in.
+
+        Prefers the directory of the user's last export (persisted across
+        sessions). Falls back to the cross-platform Downloads folder when no
+        directory has been saved yet or the saved one no longer exists, and
+        finally to the home directory if Downloads is unavailable.
+        """
+        saved = self._config_mgr.get("last_export_dir", "")
+        if saved and Path(saved).is_dir():
+            return Path(saved)
+        downloads = Path(user_downloads_dir())
+        if downloads.is_dir():
+            return downloads
+        return Path.home()
 
     # -- preview rendering ----------------------------------------------------
 
@@ -461,12 +546,54 @@ class PreviewPanel(QWidget):
             self._render_preview()
 
     def _clear_preview(self) -> None:
+        # Remove from the end so QLayout doesn't re-index the remaining items
+        # on every take (front removal is O(n²)).
         while self._preview_layout.count():
-            item = self._preview_layout.takeAt(0)
+            item = self._preview_layout.takeAt(self._preview_layout.count() - 1)
             if item is not None:
                 w = item.widget()
                 if w is not None:
                     w.deleteLater()
+
+    def _ensure_pdf_doc(self) -> object | None:
+        """Return a parsed ``QPdfDocument`` for the current bytes, reused on resize.
+
+        The document (and the buffer it reads from) is kept alive and re-parsed
+        only when the underlying bytes change. Returns ``None`` when
+        PySide6-QtPdf is unavailable.
+        """
+        if not self._pdf_bytes:
+            return None
+        pdf_id = id(self._pdf_bytes)
+        if self._pdf_doc is not None and self._pdf_doc_id == pdf_id:
+            return self._pdf_doc
+        try:
+            from PySide6.QtCore import QBuffer, QIODevice
+            from PySide6.QtPdf import QPdfDocument
+        except ImportError:
+            return None
+
+        self._dispose_pdf_doc()
+        buf = QBuffer(self)
+        buf.setData(self._pdf_bytes)
+        buf.open(QIODevice.OpenModeFlag.ReadOnly)
+        doc = QPdfDocument(self)
+        doc.load(buf)
+        # Keep the backing buffer alive — QPdfDocument reads from it lazily.
+        self._pdf_doc = doc
+        self._pdf_buf = buf
+        self._pdf_doc_id = pdf_id
+        return doc
+
+    def _dispose_pdf_doc(self) -> None:
+        """Release the cached PDF document and its backing buffer."""
+        if self._pdf_doc is not None:
+            self._pdf_doc.close()
+            self._pdf_doc = None
+        if self._pdf_buf is not None:
+            self._pdf_buf.close()
+            self._pdf_buf = None
+        self._pdf_doc_id = None
 
     def _render_preview(self) -> None:
         """Render PDF pages as QPixmap images scaled to fit the panel width.
@@ -489,11 +616,11 @@ class PreviewPanel(QWidget):
             # Move to end (most recently used)
             self._pixmap_cache.move_to_end(cache_key)
         else:
-            # Render from PDF
-            try:
-                from PySide6.QtCore import QBuffer, QIODevice, QSize
-                from PySide6.QtPdf import QPdfDocument
-            except ImportError:
+            # Render from the (reused) parsed PDF document.
+            from PySide6.QtCore import QSize
+
+            doc = self._ensure_pdf_doc()
+            if doc is None:
                 self._clear_preview()
                 lbl = QLabel(
                     "PDF preview requires PySide6-QtPdf.\n"
@@ -503,32 +630,22 @@ class PreviewPanel(QWidget):
                 self._preview_layout.addWidget(lbl)
                 return
 
-            buf = QBuffer(self)
-            buf.setData(self._pdf_bytes)
-            buf.open(QIODevice.OpenModeFlag.ReadOnly)
-            doc = QPdfDocument(self)
-            try:
-                doc.load(buf)
-
-                cached_pixmaps = []
-                for i in range(doc.pageCount()):
-                    page_size = doc.pagePointSize(i)
-                    if page_size.width() > 0:
-                        scale = available_width / page_size.width()
-                    else:
-                        scale = 1.5
-                    scale = max(0.5, min(scale, 3.0))
-                    render_size = QSize(
-                        int(page_size.width() * scale * dpr),
-                        int(page_size.height() * scale * dpr),
-                    )
-                    image = doc.render(i, render_size)
-                    pixmap = QPixmap.fromImage(image)
-                    pixmap.setDevicePixelRatio(dpr)
-                    cached_pixmaps.append(pixmap)
-            finally:
-                doc.close()
-                buf.close()
+            cached_pixmaps = []
+            for i in range(doc.pageCount()):
+                page_size = doc.pagePointSize(i)
+                if page_size.width() > 0:
+                    scale = available_width / page_size.width()
+                else:
+                    scale = 1.5
+                scale = max(0.5, min(scale, 3.0))
+                render_size = QSize(
+                    int(page_size.width() * scale * dpr),
+                    int(page_size.height() * scale * dpr),
+                )
+                image = doc.render(i, render_size)
+                pixmap = QPixmap.fromImage(image)
+                pixmap.setDevicePixelRatio(dpr)
+                cached_pixmaps.append(pixmap)
 
             # Store in LRU cache, evict oldest if at capacity
             self._pixmap_cache[cache_key] = cached_pixmaps
@@ -552,5 +669,7 @@ class PreviewPanel(QWidget):
                 self._preview_layout.addWidget(label)
         for i, pixmap in enumerate(pixmaps):
             label = self._preview_layout.itemAt(i).widget()
+            if label is None:
+                continue
             label.setPixmap(pixmap)
             label.setStyleSheet(border_style)

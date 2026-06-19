@@ -68,7 +68,15 @@ def test_on_color_contrast() -> None:
 def test_qt_shades_keys_and_validity() -> None:
     for dark in (False, True):
         shades = theming.qt_shades("#2979ff", dark)
-        assert set(shades) == {"accent", "soft", "softer", "border"}
+        assert set(shades) == {
+            "accent",
+            "soft",
+            "softer",
+            "border",
+            "accent_hover",
+            "accent_pressed",
+            "accent_on",
+        }
         assert all(theming.is_valid_hex(v) for v in shades.values())
 
 
@@ -78,6 +86,42 @@ def test_qt_shades_light_vs_dark_differ() -> None:
     # Dark soft backgrounds are far darker than the light tints.
     assert theming.relative_luminance(dark["soft"]) < theming.relative_luminance(
         light["soft"]
+    )
+
+
+def test_qt_shades_stock_palette_snapshot() -> None:
+    """Pin the stock (DEFAULT_ACCENT) palette so an accent-maths change that
+    would silently alter the default theme fails loudly instead."""
+    assert theming.qt_shades(theming.DEFAULT_ACCENT, False) == {
+        "accent": "#2979ff",
+        "soft": "#d8e7ff",
+        "softer": "#eaf2ff",
+        "border": "#aeccff",
+        "accent_hover": "#256de6",
+        "accent_pressed": "#2263d1",
+        "accent_on": "#ffffff",
+    }
+    assert theming.qt_shades(theming.DEFAULT_ACCENT, True) == {
+        "accent": "#5494ff",
+        "soft": "#222e40",
+        "softer": "#222e40",
+        "border": "#2a3e5f",
+        "accent_hover": "#69a1ff",
+        "accent_pressed": "#7aacff",
+        "accent_on": "#ffffff",
+    }
+
+
+def test_styles_default_shades_match_algorithm() -> None:
+    """The stock overlay shades must come from ``qt_shades(DEFAULT_ACCENT)`` so the
+    default look and a custom accent always go through the same algorithm."""
+    from epic_report_generator.ui import styles
+
+    assert styles._LIGHT_DEFAULT_SHADES == theming.qt_shades(
+        theming.DEFAULT_ACCENT, dark=False
+    )
+    assert styles._DARK_DEFAULT_SHADES == theming.qt_shades(
+        theming.DEFAULT_ACCENT, dark=True
     )
 
 

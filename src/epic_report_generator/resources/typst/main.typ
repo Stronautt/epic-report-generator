@@ -1,7 +1,7 @@
 // Entry point for the Epic progress report. Loads the JSON view-model written
 // next to this file by the Python renderer and emits the pages in order:
 // title -> summary -> (optional) timeline -> one page per epic.
-#import "theme.typ": pal, page-width, page-height, page-margin
+#import "theme.typ": page-height, page-margin, page-width, pal
 #import "components/footer.typ": make-footer
 #import "pages/title.typ": title-page
 #import "pages/summary.typ": summary-page
@@ -16,7 +16,15 @@
 #let color-overrides = data.theme.at("colors", default: (:))
 #for (name, hex) in color-overrides { c.insert(name, rgb(hex)) }
 #let font-name = data.theme.at("font", default: "")
-#let body-font = if font-name != "" { (font-name, "Inter") } else { ("Inter",) }
+// Per-glyph fallback chain: custom font -> Inter (Latin/Cyrillic/Greek) -> Noto
+// Sans CJK JP for ideographs/kana/Hangul Inter lacks. Inter stays first so Latin
+// and Cyrillic keep its metrics; Noto is consulted only for glyphs Inter misses.
+#let cjk-fallback = "Noto Sans CJK JP"
+#let body-font = if font-name != "" {
+  (font-name, "Inter", cjk-fallback)
+} else {
+  ("Inter", cjk-fallback)
+}
 
 #set document(
   title: data.title.title,

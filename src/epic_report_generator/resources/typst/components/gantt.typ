@@ -13,15 +13,32 @@
 // with the epic keys. `t` is the timeline chart-data dict, `c` the palette.
 
 #let _at(x, y, body) = place(top + left, dx: x, dy: y, body)
-#let _ctext(x, y, w, body) = place(top + left, dx: x - w / 2, dy: y, box(width: w, align(center, body)))
-#let _ltext(x, y, w, body) = place(top + left, dx: x, dy: y, box(width: w, body))
-#let _vline(x, y, len, stroke) = place(top + left, dx: x, dy: y, line(start: (0pt, 0pt), end: (0pt, len), stroke: stroke))
-#let _hline(x, y, len, stroke) = place(top + left, dx: x, dy: y, line(start: (0pt, 0pt), end: (len, 0pt), stroke: stroke))
+#let _ctext(x, y, w, body) = place(top + left, dx: x - w / 2, dy: y, box(
+  width: w,
+  align(center, body),
+))
+#let _ltext(x, y, w, body) = place(top + left, dx: x, dy: y, box(
+  width: w,
+  body,
+))
+#let _vline(x, y, len, stroke) = place(top + left, dx: x, dy: y, line(
+  start: (0pt, 0pt),
+  end: (0pt, len),
+  stroke: stroke,
+))
+#let _hline(x, y, len, stroke) = place(top + left, dx: x, dy: y, line(
+  start: (0pt, 0pt),
+  end: (len, 0pt),
+  stroke: stroke,
+))
 
-#let gantt(t, c, min-height: 0pt) = layout(sz => {
+// `color-by-certainty`: when true (any item has a scope certainty) the bars and
+// the group roll-up bar are tinted by certainty (the group by its aggregate);
+// otherwise both fall back to the progress threshold colour.
+#let gantt(t, c, min-height: 0pt, color-by-certainty: false) = layout(sz => {
   let cw = sz.width
-  let gutter = 56mm   // epic-key column (key + title line, up to ~50 chars)
-  let rpad = 15mm     // right breathing room for frontier % + Today label
+  let gutter = 56mm // epic-key column (key + title line, up to ~50 chars)
+  let rpad = 15mm // right breathing room for frontier % + Today label
   let botax = 7mm
 
   let has-sprints = t.sprints.len() > 0
@@ -76,7 +93,14 @@
   box(width: cw, height: ch, {
     // --- alternating row bands ----------------------------------------------
     for i in range(n) {
-      if calc.odd(i) { _at(px0, ytops.at(i), rect(width: pw, height: rh, fill: c.surface, stroke: none)) }
+      if calc.odd(i) {
+        _at(px0, ytops.at(i), rect(
+          width: pw,
+          height: rh,
+          fill: c.surface,
+          stroke: none,
+        ))
+      }
     }
 
     // --- gridlines + year boundary separators -------------------------------
@@ -93,7 +117,12 @@
 
     // --- future region (today -> end) faint shade ---------------------------
     if tx != none and tx < px0 + pw {
-      _at(tx, py0, rect(width: px0 + pw - tx, height: ph, fill: c.muted.transparentize(93%), stroke: none))
+      _at(tx, py0, rect(
+        width: px0 + pw - tx,
+        height: ph,
+        fill: c.muted.transparentize(93%),
+        stroke: none,
+      ))
     }
 
     _hline(px0, py0, pw, 0.6pt + c.grid)
@@ -113,8 +142,11 @@
       let x0 = xof(ti.start)
       let x1 = xof(ti.end)
       if ti.start > 0 { _vline(x0, 0pt, tier-h, 0.7pt + c.grid) }
-      _ctext(x0 + (x1 - x0) / 2, 0.2mm, calc.max(x1 - x0, 14mm),
-        text(8.5pt, weight: "bold", fill: c.muted)[#ti.label])
+      _ctext(x0 + (x1 - x0) / 2, 0.2mm, calc.max(x1 - x0, 14mm), text(
+        8.5pt,
+        weight: "bold",
+        fill: c.muted,
+      )[#ti.label])
     }
     for st in t.subtiers {
       let x0 = xof(st.start)
@@ -123,8 +155,10 @@
       if st.start > 0 { _vline(x0, tier-h - 2.4mm, 2.4mm, 0.6pt + c.grid) }
       // label only when the visible quarter is wide enough to be meaningful
       if x1 - x0 >= 12mm {
-        _ctext(x0 + (x1 - x0) / 2, tier-h - 2.7mm, x1 - x0,
-          text(6pt, fill: c.muted)[#st.label])
+        _ctext(x0 + (x1 - x0) / 2, tier-h - 2.7mm, x1 - x0, text(
+          6pt,
+          fill: c.muted,
+        )[#st.label])
       }
     }
 
@@ -134,15 +168,29 @@
       for (si, s) in t.sprints.enumerate() {
         let x0 = xof(s.start)
         let sw = xof(s.end) - x0
-        let fillc = if s.active { c.tl-sprint-active } else if calc.even(si) { c.tl-sprint-a } else { c.tl-sprint-b }
-        let slabel = if sw >= 22mm { s.label } else if sw >= 5mm { s.short } else { none }
+        let fillc = if s.active { c.tl-sprint-active } else if calc.even(si) {
+          c.tl-sprint-a
+        } else { c.tl-sprint-b }
+        let slabel = if sw >= 22mm { s.label } else if sw >= 5mm {
+          s.short
+        } else { none }
         let content = if slabel != none {
-          text(5.6pt, weight: if s.active { "bold" } else { "regular" }, fill: c.tl-sprint-text)[#slabel]
+          text(
+            5.6pt,
+            weight: if s.active { "bold" } else { "regular" },
+            fill: c.tl-sprint-text,
+          )[#slabel]
         } else { [] }
         // single box with horizon-centred label fixes vertical alignment
-        _at(x0, sy + 0.3mm, box(width: calc.max(sw - 0.5mm, 0.4mm), height: sprint-h - 0.6mm,
-          radius: 1pt, fill: fillc, inset: (x: 1pt, y: 0pt), clip: true,
-          align(center + horizon, content)))
+        _at(x0, sy + 0.3mm, box(
+          width: calc.max(sw - 0.5mm, 0.4mm),
+          height: sprint-h - 0.6mm,
+          radius: 1pt,
+          fill: fillc,
+          inset: (x: 1pt, y: 0pt),
+          clip: true,
+          align(center + horizon, content),
+        ))
       }
     }
 
@@ -150,7 +198,9 @@
     for g in labelled {
       let sh = strip-h(g)
       let hy = ytops.at(g.start-row) - sh
-      let bandc = if g.n-epics >= 2 { c.tl-group-bg } else { c.tl-group-bg.transparentize(45%) }
+      let bandc = if g.n-epics >= 2 { c.tl-group-bg } else {
+        c.tl-group-bg.transparentize(45%)
+      }
       _at(0pt, hy, rect(width: cw, height: sh, fill: bandc, stroke: none))
       _at(0pt, hy, rect(width: 2.2mm, height: sh, fill: c.accent, stroke: none))
       _hline(0pt, hy + sh, cw, 0.5pt + c.tl-group-rule)
@@ -159,16 +209,39 @@
         let bar-w = 18mm
         let lbl-w = 30mm
         let rx = px0 + pw - bar-w - 2mm - lbl-w
-        let pc = progress-color(g.progress, c)
-        _at(rx, hy + sh / 2 - 2pt, rect(width: bar-w, height: 4pt, radius: 2pt, fill: c.grid, stroke: none))
-        _at(rx, hy + sh / 2 - 2pt, rect(width: bar-w * g.progress / 100, height: 4pt, radius: 2pt, fill: pc, stroke: none))
-        _ltext(rx + bar-w + 2mm, hy + sh / 2 - 4.5pt, lbl-w,
-          text(7pt, weight: "bold", fill: c.text)[#g.progress% #h(2pt) #text(6.5pt, weight: "regular", fill: c.muted)[#g.n-epics epics]])
-        _ltext(3.5mm, hy + sh / 2 - 4pt, rx - 5mm,
-          text(7.5pt, weight: "bold", fill: c.text)[#upper(g.label)])
+        let pc = if color-by-certainty {
+          certainty-color(g.certainty, c)
+        } else { progress-color(g.progress, c) }
+        _at(rx, hy + sh / 2 - 2pt, rect(
+          width: bar-w,
+          height: 4pt,
+          radius: 2pt,
+          fill: c.grid,
+          stroke: none,
+        ))
+        _at(rx, hy + sh / 2 - 2pt, rect(
+          width: bar-w * g.progress / 100,
+          height: 4pt,
+          radius: 2pt,
+          fill: pc,
+          stroke: none,
+        ))
+        _ltext(rx + bar-w + 2mm, hy + sh / 2 - 4.5pt, lbl-w, text(
+          7pt,
+          weight: "bold",
+          fill: c.text,
+        )[#g.progress% #h(2pt) #text(6.5pt, weight: "regular", fill: c.muted)[#g.n-epics epics]])
+        _ltext(3.5mm, hy + sh / 2 - 4pt, rx - 5mm, text(
+          7.5pt,
+          weight: "bold",
+          fill: c.text,
+        )[#upper(g.label)])
       } else {
-        _ltext(3.5mm, hy + sh / 2 - 3.5pt, pw,
-          text(6.5pt, weight: "bold", fill: c.muted)[#upper(g.label)])
+        _ltext(3.5mm, hy + sh / 2 - 3.5pt, pw, text(
+          6.5pt,
+          weight: "bold",
+          fill: c.muted,
+        )[#upper(g.label)])
       }
     }
 
@@ -181,21 +254,43 @@
       let kw = gutter - indent - 2mm
       let show-title = (not r.child) and r.title != "" and rh >= 4.6mm
       if show-title {
-        _ltext(indent, yc - 6pt, kw, text(keyfs, weight: "bold", fill: c.text)[#r.key])
+        _ltext(indent, yc - 6pt, kw, text(
+          keyfs,
+          weight: "bold",
+          fill: c.text,
+        )[#r.key])
         _ltext(indent, yc + 1.5pt, kw, text(5.5pt, fill: c.muted)[#r.title])
       } else {
-        _ltext(indent, yc - 4pt, kw, text(keyfs, weight: if r.child { "regular" } else { "bold" },
-          fill: if r.child { c.muted } else { c.text })[#r.key])
+        _ltext(indent, yc - 4pt, kw, text(
+          keyfs,
+          weight: if r.child { "regular" } else { "bold" },
+          fill: if r.child { c.muted } else { c.text },
+        )[#r.key])
       }
       if r.start != none {
         let bx = xof(r.start)
         let bw = xof(r.end) - bx
-        let bh = if r.child { calc.min(rh * 0.30, 8pt) } else { calc.min(rh * 0.46, 13pt) }
-        let col = certainty-color(r.certainty, c)
-        _at(bx, yc - bh / 2, rect(width: bw, height: bh, radius: bh / 2,
-          fill: col.transparentize(78%), stroke: 0.5pt + col.transparentize(35%)))
+        let bh = if r.child { calc.min(rh * 0.30, 8pt) } else {
+          calc.min(rh * 0.46, 13pt)
+        }
+        let col = if color-by-certainty {
+          certainty-color(r.certainty, c)
+        } else { progress-color(r.progress, c) }
+        _at(bx, yc - bh / 2, rect(
+          width: bw,
+          height: bh,
+          radius: bh / 2,
+          fill: col.transparentize(78%),
+          stroke: 0.5pt + col.transparentize(35%),
+        ))
         if r.progress > 0 {
-          _at(bx, yc - bh / 2, rect(width: bw * r.progress / 100, height: bh, radius: bh / 2, fill: col, stroke: none))
+          _at(bx, yc - bh / 2, rect(
+            width: bw * r.progress / 100,
+            height: bh,
+            radius: bh / 2,
+            fill: col,
+            stroke: none,
+          ))
         }
         if not r.child {
           let fx = bx + bw * r.progress / 100
@@ -212,15 +307,31 @@
     // --- milestones (fix versions): pill lane + dashed line -----------------
     for m in t.milestones {
       let x = xof(m.off)
-      _vline(x, tier-h + ms-h, ph + (py0 - tier-h - ms-h), (paint: c.yellow, thickness: 1pt, dash: "dashed"))
-      _ctext(x, tier-h + 0.3mm, 30mm, box(inset: (x: 4pt, y: 1pt), radius: 3pt,
-        fill: c.yellow.transparentize(55%), stroke: 0.5pt + c.yellow)[#text(6.5pt, weight: "bold", fill: c.text)[#m.label]])
+      _vline(x, tier-h + ms-h, ph + (py0 - tier-h - ms-h), (
+        paint: c.yellow,
+        thickness: 1pt,
+        dash: "dashed",
+      ))
+      _ctext(x, tier-h + 0.3mm, 30mm, box(
+        inset: (x: 4pt, y: 1pt),
+        radius: 3pt,
+        fill: c.yellow.transparentize(55%),
+        stroke: 0.5pt + c.yellow,
+      )[#text(6.5pt, weight: "bold", fill: c.text)[#m.label]])
     }
 
     // --- today marker -------------------------------------------------------
     if tx != none {
-      _vline(tx, py0, ph, (paint: c.accent, thickness: 1pt, dash: "densely-dotted"))
-      _ctext(tx, py0 + ph + 3.4mm, 16mm, text(6.5pt, weight: "bold", fill: c.accent)[Today])
+      _vline(tx, py0, ph, (
+        paint: c.accent,
+        thickness: 1pt,
+        dash: "densely-dotted",
+      ))
+      _ctext(tx, py0 + ph + 3.4mm, 16mm, text(
+        6.5pt,
+        weight: "bold",
+        fill: c.accent,
+      )[Today])
     }
   })
 })

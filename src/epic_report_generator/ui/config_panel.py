@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
+import html
 import logging
+from collections.abc import Callable
 from datetime import date
 
-from PySide6.QtCore import QDate, Qt, QTimer
+from PySide6.QtCore import QDate, QEvent, QObject, Qt, QTimer
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDateEdit,
     QDialog,
-    QDialogButtonBox,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -32,6 +33,7 @@ from epic_report_generator.ui.widgets import (
     LabelledField,
     ProfileBar,
     ReportItemTable,
+    make_dialog_button_box,
     no_scroll_wheel,
 )
 
@@ -41,6 +43,32 @@ logger = logging.getLogger(__name__)
 def _qdate_to_date(qd: QDate) -> date:
     """Convert a Qt ``QDate`` to a stdlib ``date``."""
     return date(qd.year(), qd.month(), qd.day())
+
+
+class _EmptyAwareDateEdit(QDateEdit):
+    """A ``QDateEdit`` whose calendar popup opens on today's month when empty.
+
+    The fixed-date pickers use ``setSpecialValueText`` together with
+    ``setDate(minimumDate())`` to represent an *unset* field. Without this,
+    opening the popup while empty navigates the calendar to the minimum date
+    (~1752), which is awkward to scroll away from. When the field is empty we
+    instead show the current month so picking a date starts near today.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setCalendarPopup(True)
+        self.calendarWidget().installEventFilter(self)
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        if (
+            obj is self.calendarWidget()
+            and event.type() == QEvent.Type.Show
+            and self.date() == self.minimumDate()
+        ):
+            today = QDate.currentDate()
+            self.calendarWidget().setCurrentPage(today.year(), today.month())
+        return super().eventFilter(obj, event)
 
 
 def _populate_field_combo(
@@ -67,6 +95,14 @@ def _field_value(combo: QComboBox) -> str | None:
     return combo.currentData() if combo.isEnabled() else None
 
 
+def _make_field_combo(candidates: list[dict], current: str | None) -> QComboBox:
+    """Build a no-scroll field-picker combo populated with *candidates*."""
+    combo = QComboBox()
+    no_scroll_wheel(combo)
+    _populate_field_combo(combo, candidates, current)
+    return combo
+
+
 class FieldPickerDialog(QDialog):
     """Dialog letting the user choose from detected Jira field candidates."""
 
@@ -89,69 +125,43 @@ class FieldPickerDialog(QDialog):
 
         layout = QFormLayout(self)
 
-        self._estimation_method = estimation_method
         cv = current_values or {}
 
+        # Combos are built (and populated) up front; visibility is controlled by
+        # which rows are added below. A hidden, populated combo is harmless — its
+        # selected_* getter is only read for the matching estimation method.
+
         # Story Points field (only shown for story_points method)
-        self._sp_combo = QComboBox()
-        no_scroll_wheel(self._sp_combo)
+        self._sp_combo = _make_field_combo(sp_candidates, cv.get("story_points_field"))
         if estimation_method == "story_points":
-            _populate_field_combo(
-                self._sp_combo, sp_candidates, cv.get("story_points_field")
-            )
             layout.addRow("Story Points Field:", self._sp_combo)
 
         # Date fields (only shown for time_days method)
-        self._start_date_combo = QComboBox()
-        no_scroll_wheel(self._start_date_combo)
-        self._due_date_combo = QComboBox()
-        no_scroll_wheel(self._due_date_combo)
+        self._start_date_combo = _make_field_combo(
+            start_date_candidates or [], cv.get("start_date_field")
+        )
+        self._due_date_combo = _make_field_combo(
+            due_date_candidates or [], cv.get("due_date_field")
+        )
         if estimation_method == "time_days":
-            _populate_field_combo(
-                self._start_date_combo,
-                start_date_candidates or [],
-                cv.get("start_date_field"),
-            )
             layout.addRow("Start Date Field:", self._start_date_combo)
-            _populate_field_combo(
-                self._due_date_combo,
-                due_date_candidates or [],
-                cv.get("due_date_field"),
-            )
             layout.addRow("Due Date Field:", self._due_date_combo)
 
-        self._epic_combo = QComboBox()
-        no_scroll_wheel(self._epic_combo)
-        _populate_field_combo(
-            self._epic_combo, epic_candidates, cv.get("epic_link_field")
-        )
+        self._epic_combo = _make_field_combo(epic_candidates, cv.get("epic_link_field"))
         layout.addRow("Epic Link Field:", self._epic_combo)
 
         # Timeline fields (always shown)
-        self._timeline_start_combo = QComboBox()
-        no_scroll_wheel(self._timeline_start_combo)
-        _populate_field_combo(
-            self._timeline_start_combo,
-            timeline_start_candidates or [],
-            cv.get("timeline_start_field"),
+        self._timeline_start_combo = _make_field_combo(
+            timeline_start_candidates or [], cv.get("timeline_start_field")
         )
         layout.addRow("Timeline Start Field:", self._timeline_start_combo)
 
-        self._timeline_end_combo = QComboBox()
-        no_scroll_wheel(self._timeline_end_combo)
-        _populate_field_combo(
-            self._timeline_end_combo,
-            timeline_end_candidates or [],
-            cv.get("timeline_end_field"),
+        self._timeline_end_combo = _make_field_combo(
+            timeline_end_candidates or [], cv.get("timeline_end_field")
         )
         layout.addRow("Timeline End Field:", self._timeline_end_combo)
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addRow(buttons)
+        layout.addRow(make_dialog_button_box(self, "Apply"))
 
     @property
     def selected_sp_field(self) -> str | None:
@@ -213,8 +223,7 @@ class ConfigPanel(QWidget):
     ) -> tuple[QVBoxLayout, QDateEdit]:
         """Build a labelled fixed-date picker column with a clear (×) button.
 
-        Returns the column layout and the ``QDateEdit`` so the caller can store
-        the edit (``_hard_start_edit`` / ``_hard_end_edit``).
+        Returns ``(column_layout, date_edit)``.
         """
         col = QVBoxLayout()
         col.setContentsMargins(0, 0, 0, 0)
@@ -225,7 +234,7 @@ class ConfigPanel(QWidget):
 
         input_row = QHBoxLayout()
         input_row.setSpacing(4)
-        edit = QDateEdit()
+        edit = _EmptyAwareDateEdit()
         no_scroll_wheel(edit)
         edit.setCalendarPopup(True)
         edit.setDisplayFormat("yyyy-MM-dd")
@@ -261,30 +270,59 @@ class ConfigPanel(QWidget):
         )
 
         # ── Report Items (always visible, not collapsible) ──────────────
+        items_header = QHBoxLayout()
+        items_header.setContentsMargins(0, 0, 0, 0)
+        items_header.setSpacing(12)
+
+        # Title + subtitle stacked in one container so the Validate button sits
+        # beside the whole block (vertically centred) instead of floating at the
+        # top-right with a large empty gap above the subtitle.
+        header_text = QVBoxLayout()
+        header_text.setContentsMargins(0, 0, 0, 0)
+        header_text.setSpacing(0)
         lbl = QLabel("Report Items")
         lbl.setProperty("sectionTitle", "true")
-        root.addWidget(lbl)
-        root.addWidget(
+        # Anchor scrolled into view when Generate surfaces validation errors.
+        self._report_items_anchor = lbl
+        header_text.addWidget(lbl)
+        header_text.addWidget(
             self._hint(
                 "Add Jira Epics or labels to include in the report. "
                 "Labels automatically pull in all epics tagged with that label."
             )
         )
+        items_header.addLayout(header_text, 1)
+
+        self._validate_btn = QPushButton("Validate")
+        self._validate_btn.setProperty("secondary", "true")
+        self._validate_btn.setToolTip(
+            "Check every epic and label in the table against Jira"
+        )
+        self._validate_btn.clicked.connect(lambda: self.validate_items())
+        items_header.addWidget(self._validate_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        root.addLayout(items_header)
+
         self._item_table = ReportItemTable()
         root.addWidget(self._item_table)
 
-        btn_row = QHBoxLayout()
-        validate_btn = QPushButton("Validate Epics")
-        validate_btn.setProperty("secondary", "true")
-        validate_btn.setToolTip("Check each Epic key against Jira")
-        validate_btn.clicked.connect(self._validate_epics)
-        btn_row.addWidget(validate_btn)
-        btn_row.addStretch()
-        root.addLayout(btn_row)
+        # Validation summary — hidden until a validation run surfaces problems.
+        self._validation_summary = QLabel("")
+        self._validation_summary.setObjectName("validationSummary")
+        self._validation_summary.setWordWrap(True)
+        self._validation_summary.setTextFormat(Qt.TextFormat.RichText)
+        self._validation_summary.setVisible(False)
+        root.addWidget(self._validation_summary)
 
-        self._validation_label = QLabel("")
-        self._validation_label.setWordWrap(True)
-        root.addWidget(self._validation_label)
+        # ── Advanced Settings heading (labels the nested collapsible group) ─
+        advanced_settings_lbl = QLabel("Advanced Settings")
+        advanced_settings_lbl.setProperty("sectionTitle", "true")
+        root.addWidget(advanced_settings_lbl)
+        root.addWidget(
+            self._hint(
+                "Optional sections — tune the title page, progress, report "
+                "content, and Jira field mapping."
+            )
+        )
 
         # ── Title Page (collapsible, collapsed) ─────────────────────────
         self._title_section = CollapsibleSection("Title Page", expanded=False)
@@ -350,8 +388,7 @@ class ConfigPanel(QWidget):
         no_scroll_wheel(self._estimation_combo)
         self._estimation_combo.addItem("Story Points", "story_points")
         self._estimation_combo.addItem("Time — Days", "time_days")
-        # Signal connections deferred until after field widgets are created
-        # (see end of _build_ui)
+        # Signals connected after the field widgets exist (end of _build_ui).
         est.addWidget(self._estimation_combo)
         est.addWidget(
             self._hint(
@@ -595,26 +632,19 @@ class ConfigPanel(QWidget):
         self._item_table.items_changed.connect(self._persist_values)
         self._item_table.items_changed.connect(self._ensure_labels_fetched)
         self._item_table.edit_requested.connect(self._on_customize_item)
-        self._sp_field.field.textChanged.connect(lambda _: self._persist_values())
-        self._epic_link_field.field.textChanged.connect(
-            lambda _: self._persist_values()
-        )
-        self._start_date_field_input.field.textChanged.connect(
-            lambda _: self._persist_values()
-        )
-        self._due_date_field_input.field.textChanged.connect(
-            lambda _: self._persist_values()
-        )
-        self._timeline_start_field.field.textChanged.connect(
-            lambda _: self._persist_values()
-        )
-        self._timeline_end_field.field.textChanged.connect(
-            lambda _: self._persist_values()
-        )
-        self._title_field.field.textChanged.connect(lambda _: self._persist_values())
-        self._author_field.field.textChanged.connect(lambda _: self._persist_values())
-        self._company_field.field.textChanged.connect(lambda _: self._persist_values())
-        self._conf_check.stateChanged.connect(lambda _: self._persist_values())
+        for _signal in (
+            self._sp_field.field.textChanged,
+            self._epic_link_field.field.textChanged,
+            self._start_date_field_input.field.textChanged,
+            self._due_date_field_input.field.textChanged,
+            self._timeline_start_field.field.textChanged,
+            self._timeline_end_field.field.textChanged,
+            self._title_field.field.textChanged,
+            self._author_field.field.textChanged,
+            self._company_field.field.textChanged,
+            self._conf_check.stateChanged,
+        ):
+            _signal.connect(lambda *_: self._persist_values())
 
     def _hint(self, text: str) -> QLabel:
         """Create a small descriptive hint label."""
@@ -850,6 +880,11 @@ class ConfigPanel(QWidget):
 
     # -- public API -----------------------------------------------------------
 
+    @property
+    def report_items_anchor(self) -> QWidget:
+        """Widget to scroll into view when surfacing item-validation errors."""
+        return self._report_items_anchor
+
     def get_report_config(self) -> ReportConfig | None:
         """Build and return a ReportConfig, or None if validation fails."""
         items = self._item_table.get_items()
@@ -883,18 +918,15 @@ class ConfigPanel(QWidget):
 
         report_date = _qdate_to_date(self._date_edit.date())
 
-        # Attempt to pre-fill project name from Jira
+        # Project name: use the user's value if given; otherwise leave it for the
+        # background generation worker to resolve from Jira off the UI thread
+        # (see _generate_report's auto-fill, gated on "Report"/"" placeholders).
         project_name = self._project_name_field.text.strip()
-        if not project_name and project_key and self._jira.connected:
-            project_name = self._jira.get_project_name(project_key) or project_key
         logger.debug(
-            "Project name resolution: field=%r, key=%r, resolved=%r, "
-            "epic_keys=%r, connected=%s",
-            self._project_name_field.text.strip(),
-            project_key,
+            "build_config: project_name_field=%r, project_key=%r, epic_keys=%r",
             project_name,
+            project_key,
             epic_keys,
-            self._jira.connected,
         )
 
         # Timeline field overrides (fall back to the date fields used for estimation)
@@ -935,7 +967,7 @@ class ConfigPanel(QWidget):
             items=items,
             title=self._title_field.text.strip() or _DEFAULTS["default_title"],
             author=self._author_field.text.strip(),
-            project_display_name=project_name or project_key or "Report",
+            project_display_name=project_name or "Report",
             report_date=report_date,
             confidential=self._conf_check.isChecked(),
             company_name=self._company_field.text.strip(),
@@ -1014,7 +1046,7 @@ class ConfigPanel(QWidget):
         self._show_subtasks_timeline_check.setChecked(False)
         self._expand_label_details_check.setChecked(True)
         self._show_additional_metrics_check.setChecked(True)
-        self._validation_label.clear()
+        self._clear_validation_ui()
         self._on_estimation_method_changed()
         # Collapse optional sections
         self._title_section.set_expanded(False)
@@ -1062,39 +1094,205 @@ class ConfigPanel(QWidget):
             return False
         return True
 
-    def _validate_epics(self) -> None:
+    def validate_items(
+        self, on_complete: Callable[[bool, bool], None] | None = None
+    ) -> None:
+        """Validate every epic and label row against Jira.
+
+        Each non-empty row is checked: epics for key format + existence, labels
+        for existence (at least one epic carries the label), and — for rows with
+        per-child overrides — that every overridden child still exists. A label
+        with no display name raises a (non-blocking) warning, since it falls back
+        to the raw label text in the report. Problems highlight the offending row
+        (red = error, amber = warning) and are listed in row order in the summary
+        callout; no per-item success list is shown.
+
+        *on_complete* (used by the Generate flow) is invoked once the check
+        settles with ``(has_errors, has_warnings)`` so the caller can block on
+        errors while letting warnings through. It is called for every exit path,
+        including the early returns below, so callers can rely on it firing.
+        """
         if not self._require_connected():
+            if on_complete is not None:
+                on_complete(True, False)  # cannot validate offline → block
             return
-        items = self._item_table.get_items()
-        epic_keys = [it.key for it in items if it.kind == "epic"]
-        logger.info("Validating %d epic key(s) against Jira", len(epic_keys))
-        if not epic_keys:
-            self._validation_label.setText(
-                "No epic keys to validate (labels are not validated)"
+
+        # Snapshot each row's data on the UI thread; the worker never touches widgets.
+        specs: list[dict] = []
+        for row in self._item_table.rows:
+            key = row.key
+            if not key:
+                continue
+            specs.append(
+                {
+                    "row": row,
+                    "kind": row.kind,
+                    "key": key,
+                    "name": row.name_edit.text().strip(),
+                    "override_keys": list(row.get_child_overrides().keys()),
+                }
             )
+
+        self._clear_validation_ui()
+        if not specs:
+            if on_complete is not None:
+                on_complete(False, False)  # nothing to validate, nothing to block
+            else:
+                QMessageBox.information(
+                    self, "Nothing to Validate", "Add an epic or label row first."
+                )
             return
 
-        self._validation_label.setText("Validating…")
+        epic_link_field = (
+            self._epic_link_field.text.strip() or _DEFAULTS["epic_link_field"]
+        )
+        logger.info("Validating %d report item(s) against Jira", len(specs))
+        self._validate_btn.setEnabled(False)
+        self._validate_btn.setText("Validating…")
 
-        def _do_validate() -> list[str]:
-            results: list[str] = []
-            for k in epic_keys:
-                if not RE_EPIC_KEY.match(k):
-                    results.append(f"✗ {k} — invalid format")
-                elif self._jira.validate_epic_key(k):
-                    results.append(f"✓ {k}")
-                else:
-                    results.append(f"✗ {k} — not found")
-            return results
+        def _do_validate() -> list[tuple[object, str, str]]:
+            # (row, severity, message) tuples, accumulated in row order.
+            findings: list[tuple[object, str, str]] = []
+            for spec in specs:
+                kind, key, name = spec["kind"], spec["key"], spec["name"]
+                override_keys = spec["override_keys"]
+                children: set[str] | None = None
+
+                if kind == "epic":
+                    ekey = key.upper()
+                    if not RE_EPIC_KEY.match(ekey):
+                        findings.append(
+                            (
+                                spec["row"],
+                                "error",
+                                f"Epic '{key}' has an invalid key format",
+                            )
+                        )
+                        continue
+                    if not self._jira.validate_epic_key(ekey):
+                        findings.append(
+                            (spec["row"], "error", f"Epic '{ekey}' is not found")
+                        )
+                        continue
+                    display = name or ekey
+                    if override_keys:
+                        children = {
+                            k
+                            for k, _ in self._jira.fetch_child_summaries(
+                                ekey, epic_link_field
+                            )
+                        }
+                else:  # label
+                    epics = self._jira.fetch_epic_summaries_by_label(key)
+                    if not epics:
+                        findings.append(
+                            (
+                                spec["row"],
+                                "error",
+                                f"Label '{key}' is invalid (no epics carry it)",
+                            )
+                        )
+                        continue
+                    display = name or key
+                    if not name:
+                        findings.append(
+                            (
+                                spec["row"],
+                                "warning",
+                                f"Label '{key}' has no display name — it will "
+                                f"appear as '{key}' in the report",
+                            )
+                        )
+                    if override_keys:
+                        children = {k for k, _ in epics}
+
+                if override_keys and children is not None:
+                    missing = [k for k in override_keys if k not in children]
+                    if missing:
+                        verb = "exists" if len(missing) == 1 else "exist"
+                        findings.append(
+                            (
+                                spec["row"],
+                                "warning",
+                                f"{kind.capitalize()} '{display}' has stale child "
+                                f"overrides ({', '.join(missing)} no longer {verb})",
+                            )
+                        )
+            return findings
 
         def _on_validated(result: object) -> None:
+            self._validate_btn.setEnabled(True)
+            self._validate_btn.setText("Validate")
             if isinstance(result, Exception):
-                self._validation_label.setText(f"Validation error: {result}")
+                logger.warning("Validation failed: %s", result)
+                self._show_validation_message("error", f"Validation failed: {result}")
+                if on_complete is not None:
+                    on_complete(True, False)  # errored → block to be safe
                 return
-            lines: list[str] = result  # type: ignore[assignment]
-            self._validation_label.setText("<br>".join(lines))
+            findings: list[tuple[object, str, str]] = result  # type: ignore[assignment]
+            problems: list[tuple[str, str]] = []
+            state_by_row: dict[object, str] = {}
+            for row, severity, message in findings:
+                problems.append((severity, message))
+                if state_by_row.get(row) != "error":  # error outranks warning
+                    state_by_row[row] = severity
+            for row, state in state_by_row.items():
+                row.set_validation(state)  # type: ignore[attr-defined]
+            self._show_validation_summary(problems)
+            if on_complete is not None:
+                has_errors = any(sev == "error" for sev, _ in problems)
+                has_warnings = any(sev == "warning" for sev, _ in problems)
+                on_complete(has_errors, has_warnings)
 
         self._tasks.start(_do_validate, _on_validated, capture_exceptions=True)
+
+    def _clear_validation_ui(self) -> None:
+        """Reset row highlights and hide the validation summary callout."""
+        self._item_table.clear_validation()
+        self._validation_summary.clear()
+        self._validation_summary.setVisible(False)
+
+    def _show_validation_summary(self, problems: list[tuple[str, str]]) -> None:
+        """Render the validation callout from ``(severity, message)`` items.
+
+        Problems are listed in the given (row) order; with none, a brief success
+        confirmation is shown instead of any per-item list.
+        """
+        if not problems:
+            self._show_validation_message("ok", "✓ All items are valid.")
+            return
+        has_error = any(sev == "error" for sev, _ in problems)
+        count = len(problems)
+        lines = [f"<b>⚠ {count} problem{'' if count == 1 else 's'} found</b>"]
+        for severity, message in problems:
+            color = "#e53935" if severity == "error" else "#ff8f00"
+            tag = "Error" if severity == "error" else "Warning"
+            lines.append(
+                f"• <span style='color:{color};'><b>{tag}:</b></span> "
+                f"{html.escape(message)}"
+            )
+        self._apply_summary_style("error" if has_error else "warning")
+        self._validation_summary.setText("<br>".join(lines))
+        self._validation_summary.setVisible(True)
+
+    def _show_validation_message(self, severity: str, text: str) -> None:
+        """Show a single styled line in the validation callout."""
+        self._apply_summary_style(severity)
+        self._validation_summary.setText(html.escape(text))
+        self._validation_summary.setVisible(True)
+
+    def _apply_summary_style(self, severity: str) -> None:
+        """Colour the validation callout's border/background by *severity*."""
+        palette = {
+            "error": ("#e53935", "rgba(229, 57, 53, 0.08)"),
+            "warning": ("#ff8f00", "rgba(255, 143, 0, 0.10)"),
+            "ok": ("#43a047", "rgba(67, 160, 71, 0.10)"),
+        }
+        accent, background = palette.get(severity, palette["error"])
+        self._validation_summary.setStyleSheet(
+            f"#validationSummary {{ border: 1px solid {accent}; "
+            f"background: {background}; border-radius: 4px; padding: 8px 10px; }}"
+        )
 
     def _on_customize_item(self, row: object) -> None:
         """Open the per-item customize dialog (FR-13).
@@ -1250,4 +1448,6 @@ class ConfigPanel(QWidget):
                     self._timeline_end_field.text = tl_end_id
                 logger.info("Fields applied (method=%s)", method)
 
-        self._run_background(self._jira.fetch_fields, _on_fields_fetched)
+        self._tasks.start(
+            self._jira.fetch_fields, _on_fields_fetched, capture_exceptions=True
+        )

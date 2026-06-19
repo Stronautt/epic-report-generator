@@ -106,7 +106,9 @@ def qt_shades(accent: str, dark: bool) -> dict[str, str]:
     """Derive the accent shades the QSS overlay templates need.
 
     Keys: ``accent`` (text/border/icon), ``soft`` (selected background),
-    ``softer`` (hover/chip background), ``border`` (chip outline).
+    ``softer`` (hover/chip background), ``border`` (chip outline),
+    ``accent_hover`` / ``accent_pressed`` (filled-button states),
+    ``accent_on`` (readable text drawn on a filled ``accent`` fill).
     """
     accent = normalize_hex(accent)
     if dark:
@@ -116,12 +118,20 @@ def qt_shades(accent: str, dark: bool) -> dict[str, str]:
             "soft": mix(bright, _DARK_UI_BG, 0.86),
             "softer": mix(bright, _DARK_UI_BG, 0.86),
             "border": mix(bright, _DARK_UI_BG, 0.72),
+            # On dark backgrounds a filled button reads as "pressed" by
+            # getting brighter, so lighten rather than darken.
+            "accent_hover": lighten(bright, 0.12),
+            "accent_pressed": lighten(bright, 0.22),
+            "accent_on": on_color(bright),
         }
     return {
         "accent": accent,
         "soft": lighten(accent, 0.82),
         "softer": lighten(accent, 0.90),
         "border": lighten(accent, 0.62),
+        "accent_hover": darken(accent, 0.10),
+        "accent_pressed": darken(accent, 0.18),
+        "accent_on": on_color(accent),
     }
 
 

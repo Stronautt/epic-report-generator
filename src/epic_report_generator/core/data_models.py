@@ -279,6 +279,33 @@ def collect_child_timeline_dates(
             tl_ends.append(child.due_date)
 
 
+def collect_child_estimation_dates(
+    child: JiraIssue,
+    start_dates: list[date],
+    end_dates: list[date],
+) -> None:
+    """Append estimation date candidates from a child issue into the accumulators.
+
+    Cascade: explicit ``start_date`` / ``due_date`` fall back to ``created`` /
+    ``resolved`` (``resolved`` only counts when the child is Done), so every
+    child contributes a range even without explicit estimation dates.
+
+    Args:
+        child: The child issue whose estimation dates to collect.
+        start_dates: Accumulator list for start date candidates.
+        end_dates: Accumulator list for end (due) date candidates.
+    """
+    if child.start_date:
+        start_dates.append(child.start_date)
+    elif child.created:
+        start_dates.append(child.created.date())
+
+    if child.due_date:
+        end_dates.append(child.due_date)
+    elif child.resolved and child.status_category == STATUS_DONE:
+        end_dates.append(child.resolved.date())
+
+
 @dataclass
 class ReportData:
     """All data needed to render the final PDF report."""

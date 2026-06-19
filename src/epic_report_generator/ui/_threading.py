@@ -17,6 +17,7 @@ from collections.abc import Callable
 from typing import Any
 
 from PySide6.QtCore import QObject, QThread, Signal
+from shiboken6 import isValid
 
 logger = logging.getLogger(__name__)
 
@@ -128,11 +129,25 @@ class ThreadedTask(QObject):
     @property
     def is_busy(self) -> bool:
         """Return True while any started task is still running."""
-        return any(thread.isRunning() for thread, _ in self._live)
+        return any(_is_running(thread) for thread, _ in self._live)
 
     def wait(self) -> None:
         """Quit and join all running tasks (use on shutdown)."""
         for thread, _ in list(self._live):
-            if thread.isRunning():
+            if _is_running(thread):
                 thread.quit()
                 thread.wait()
+
+
+def _is_running(thread: QThread) -> bool:
+    """Return True if *thread* is alive and still running.
+
+    The ``thread.finished -> deleteLater`` connection can destroy a finished
+    thread's underlying C++ object while its ``(QThread, _Worker)`` pair is
+    briefly still in ``_live`` (the ``_live`` discard is a separate queued slot
+    that may run after the delete). Calling ``isRunning()`` on that dangling
+    wrapper raises ``RuntimeError: Internal C++ object already deleted``. A
+    deleted thread has by definition already finished, so guard with
+    ``shiboken6.isValid`` and treat it as not running.
+    """
+    return isValid(thread) and thread.isRunning()

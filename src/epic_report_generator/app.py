@@ -76,7 +76,7 @@ def run_app(argv: list[str] | None = None) -> int:
         from epic_report_generator.resources_util import get_resource_path
 
         app.setWindowIcon(QIcon(str(get_resource_path("logo.png"))))
-    except FileNotFoundError:
+    except (FileNotFoundError, ModuleNotFoundError):
         logger.warning("logo.png not found; running without a window icon")
 
     _install_signal_handlers(app)

@@ -7,7 +7,10 @@
     set text(7pt)
     grid(
       columns: (1fr, 1fr),
-      align(left)[#text(fill: c.red, weight: "bold")[CONFIDENTIAL — #f.company]],
+      align(left)[#text(
+        fill: c.red,
+        weight: "bold",
+      )[CONFIDENTIAL — #f.company]],
       align(right)[#text(fill: c.muted)[#f.right]],
     )
   }

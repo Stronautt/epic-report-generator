@@ -12,11 +12,11 @@ from dateutil.parser import parse as _dt_parse
 from jira import JIRA, JIRAError
 
 from epic_report_generator.core.data_models import (
-    STATUS_DONE,
     STATUS_TODO,
     EpicData,
     JiraIssue,
     SprintInfo,
+    collect_child_estimation_dates,
     collect_child_timeline_dates,
 )
 from epic_report_generator.services.auth_manager import AuthManager
@@ -34,8 +34,7 @@ _JQL_IN_BATCH_SIZE = 500
 # 3× the list stays well under practical JQL IN-clause limits.
 _COMBINED_BATCH_SIZE = 150
 
-# Standard (non-configurable) issue fields read by the parsers.  Used to build
-# an explicit field projection so searches don't download every custom field.
+# Explicit field projection so searches don't download every custom field.
 # ``status`` carries the nested ``statusCategory``; ``parent`` and the configured
 # epic-link field are required for client-side grouping of batched results.
 _FIXED_FIELDS: tuple[str, ...] = (
@@ -74,6 +73,9 @@ class JiraClient:
     def __init__(self, auth: AuthManager) -> None:
         self._auth = auth
         self._jira: JIRA | None = None
+        # Raw ``myself()`` payload captured during connection validation so the
+        # login flow doesn't issue a second identical request.
+        self._myself: dict[str, Any] | None = None
         self._fields_cache: list[dict[str, str]] | None = None
         self._fields_cache_time: float = 0.0
 
@@ -81,6 +83,7 @@ class JiraClient:
         """Clear all cached data (e.g. field metadata)."""
         self._fields_cache = None
         self._fields_cache_time = 0.0
+        self._myself = None
         logger.info("Jira client caches invalidated")
 
     # -- connection -----------------------------------------------------------
@@ -101,64 +104,73 @@ class JiraClient:
                 server=server,
                 options={"headers": {"Authorization": f"Bearer {token}"}},
             )
+            self._myself = None  # fetched lazily by get_myself()
             logger.info("Connected to Jira (cloud_id=%s)", self._auth.cloud_id)
             return True
-        except Exception as exc:
+        except (JIRAError, _requests.RequestException) as exc:
             logger.error("Failed to connect to Jira: %s", exc)
             return False
 
     def connect_basic(self, url: str, email: str, token: str) -> bool:
         """Connect to Jira using an API token.
 
-        Tries basic auth against the instance URL first (classic unscoped
-        tokens).  If that returns 401, resolves the site's ``cloudId`` and
-        retries against ``https://api.atlassian.com/ex/jira/{cloudId}``
-        which is required for scoped API keys.
+        A scoped API key only works against the cloud API URL
+        (``https://api.atlassian.com/ex/jira/{cloudId}``), while a classic
+        unscoped token works against the instance URL.  When the site's
+        ``cloudId`` is already known (cached from a previous connect, or an
+        OAuth login) we go straight to the cloud API URL — skipping the
+        instance-URL attempt that always 401s for scoped keys and costs two
+        wasted round trips on every launch.  Otherwise we try the instance URL
+        first and fall back to the cloud API on a 401.
 
-        A lightweight ``myself()`` call validates each attempt.
+        A lightweight ``myself()`` call validates each attempt; its payload is
+        cached on the client so the caller need not re-fetch it.
         Returns True on success.
         """
-        # 1) Classic token — basic auth against instance URL
-        logger.debug("Connecting to Jira at %s (basic auth)", url)
-        try:
-            jira = JIRA(server=url, basic_auth=(email, token))
-            jira.myself()
-            self._jira = jira
-            logger.info("Connected to Jira via basic auth (%s)", url)
-            return True
-        except JIRAError as exc:
-            if exc.status_code == 401:
-                logger.debug(
-                    "Basic auth returned 401, trying scoped token via cloud API"
-                )
-            else:
+        cloud_id = self._auth.cloud_id
+
+        # 1) No cached cloudId — try classic basic auth against the instance URL.
+        if not cloud_id:
+            logger.debug("Connecting to Jira at %s (basic auth)", url)
+            try:
+                jira = JIRA(server=url, basic_auth=(email, token))
+                self._myself = jira.myself()
+                self._jira = jira
+                logger.info("Connected to Jira via basic auth (%s)", url)
+                return True
+            except JIRAError as exc:
+                if exc.status_code == 401:
+                    logger.debug(
+                        "Basic auth returned 401, trying scoped token via cloud API"
+                    )
+                else:
+                    logger.error("Failed to connect to Jira: %s", exc)
+                    self._jira = None
+                    return False
+            except _requests.RequestException as exc:
                 logger.error("Failed to connect to Jira: %s", exc)
                 self._jira = None
                 return False
-        except Exception as exc:
-            logger.error("Failed to connect to Jira: %s", exc)
-            self._jira = None
-            return False
 
-        # 2) Scoped API key — resolve cloudId and use cloud API URL
-        cloud_id = self._auth.cloud_id or self._resolve_cloud_id(url)
-        if not cloud_id:
-            logger.error("Could not resolve cloudId for %s", url)
-            self._jira = None
-            return False
+            cloud_id = self._resolve_cloud_id(url)
+            if not cloud_id:
+                logger.error("Could not resolve cloudId for %s", url)
+                self._jira = None
+                return False
 
+        # 2) Scoped API key (or cached cloudId) — use the cloud API URL.
         cloud_url = f"https://api.atlassian.com/ex/jira/{cloud_id}"
-        logger.debug("Retrying with cloud API URL %s", cloud_url)
+        logger.debug("Connecting via cloud API URL %s", cloud_url)
         try:
             jira = JIRA(server=cloud_url, basic_auth=(email, token))
-            jira.myself()
+            self._myself = jira.myself()
             self._jira = jira
             # Cache cloud_id so subsequent reconnects skip the lookup
             if not self._auth.cloud_id:
                 self._auth.set_cloud_id(cloud_id)
             logger.info("Connected to Jira via scoped API key (cloud_id=%s)", cloud_id)
             return True
-        except Exception as exc:
+        except (JIRAError, _requests.RequestException) as exc:
             logger.error("Failed to connect to Jira (scoped token): %s", exc)
             self._jira = None
             return False
@@ -175,7 +187,7 @@ class JiraClient:
             if cloud_id:
                 logger.info("Resolved cloudId=%s from %s", cloud_id, instance_url)
             return cloud_id or None
-        except Exception as exc:
+        except (_requests.RequestException, ValueError) as exc:
             logger.warning("Failed to resolve cloudId from %s: %s", tenant_url, exc)
             return None
 
@@ -187,21 +199,28 @@ class JiraClient:
     # -- user info ------------------------------------------------------------
 
     def get_myself(self) -> dict[str, str] | None:
-        """Fetch the authenticated user's display name and avatar URL."""
+        """Return the authenticated user's display name and avatar URL.
+
+        Reuses the ``myself()`` payload captured during connection validation
+        when available, so a freshly-restored session needs no extra request.
+        """
         if not self._jira:
             return None
-        try:
-            me = self._jira.myself()
-            name = me.get("displayName", "")
-            logger.info("Authenticated as %s", name)
-            return {
-                "displayName": name,
-                "avatarUrl": me.get("avatarUrls", {}).get("48x48", ""),
-                "emailAddress": me.get("emailAddress", ""),
-            }
-        except JIRAError as exc:
-            logger.error("myself() failed: %s", exc)
-            return None
+        me = self._myself
+        if me is None:
+            try:
+                me = self._jira.myself()
+                self._myself = me
+            except JIRAError as exc:
+                logger.error("myself() failed: %s", exc)
+                return None
+        name = me.get("displayName", "")
+        logger.info("Authenticated as %s", name)
+        return {
+            "displayName": name,
+            "avatarUrl": me.get("avatarUrls", {}).get("48x48", ""),
+            "emailAddress": me.get("emailAddress", ""),
+        }
 
     # -- epic fetching --------------------------------------------------------
 
@@ -520,7 +539,9 @@ class JiraClient:
         # Try the REST label endpoint first (Jira Cloud)
         try:
             url = f"{self._jira.server_url}/rest/api/3/label"
-            session = self._jira._session
+            # getattr so a future jira-lib rename degrades to the JQL fallback
+            # explicitly rather than relying on the broad except below.
+            session = getattr(self._jira, "_session", None)
             if session is None:
                 raise RuntimeError("No active Jira session")
             resp = session.get(url, params={"maxResults": 1000})
@@ -592,17 +613,7 @@ class JiraClient:
             tl_ends.append(epic.timeline_end)
 
         for c in epic.children:
-            # Estimation start
-            if c.start_date:
-                candidate_starts.append(c.start_date)
-            elif c.created:
-                candidate_starts.append(c.created.date())
-
-            # Estimation end
-            if c.due_date:
-                candidate_ends.append(c.due_date)
-            elif c.resolved and c.status_category == STATUS_DONE:
-                candidate_ends.append(c.resolved.date())
+            collect_child_estimation_dates(c, candidate_starts, candidate_ends)
 
             # Skip subtasks for timeline dates when not included
             if c.is_subtask and not include_subtask_timeline:
@@ -940,7 +951,7 @@ class JiraClient:
                     continue
                 raise
 
-        return []  # unreachable, but satisfies type checker
+        raise RuntimeError("exhausted retries for search_issues")
 
     @staticmethod
     def _status_category(fields: Any) -> str:

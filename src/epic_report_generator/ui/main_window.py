@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import logging
 
+from PySide6.QtCore import QTimer
 from PySide6.QtGui import QCloseEvent, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QHBoxLayout,
+    QLabel,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -18,11 +20,14 @@ from PySide6.QtWidgets import (
 )
 from qt_material import apply_stylesheet
 
+from epic_report_generator import __version__
 from epic_report_generator.core import theming
 from epic_report_generator.core.jira_client import JiraClient
 from epic_report_generator.services.auth_manager import AuthManager
 from epic_report_generator.services.config_manager import ConfigManager
 from epic_report_generator.services.font_manager import FontManager
+from epic_report_generator.ui.animations import fade_in
+from epic_report_generator.ui.help_panel import HelpPanel
 from epic_report_generator.ui.log_panel import LogPanel
 from epic_report_generator.ui.login_panel import LoginPanel
 from epic_report_generator.ui.report_panel import ReportPanel
@@ -59,6 +64,12 @@ class MainWindow(QMainWindow):
         self._setup_shortcuts()
         self._apply_theme(self._config.get("theme", "light"))
 
+        # Restore the previous session *after* the window is shown and the
+        # event loop is running, so the UI paints immediately instead of
+        # blocking on keyring + the Jira handshake.  The restore itself runs
+        # on a worker thread (see LoginPanel.try_restore_session).
+        QTimer.singleShot(0, self._login_panel.try_restore_session)
+
     # -- UI construction ------------------------------------------------------
 
     def _build_ui(self) -> None:
@@ -81,7 +92,8 @@ class MainWindow(QMainWindow):
         nav_items = [
             ("Report", 0),
             ("Settings", 1),
-            ("Logs", 2),
+            ("User Guide", 2),
+            ("Logs", 3),
         ]
 
         self._nav_buttons: list[QPushButton] = []
@@ -98,6 +110,24 @@ class MainWindow(QMainWindow):
         # Sidebar user info (hidden until login)
         self._sidebar_user_info = SidebarUserInfo()
         sidebar_layout.addWidget(self._sidebar_user_info)
+
+        # Footer pinned to the bottom of the sidebar: version above a
+        # subtle author signature, grouped as one tight block.
+        footer = QWidget()
+        footer.setObjectName("sidebarFooter")
+        footer_layout = QVBoxLayout(footer)
+        footer_layout.setContentsMargins(0, 0, 0, 0)
+        footer_layout.setSpacing(1)
+
+        self._version_label = QLabel(f"v{__version__}")
+        self._version_label.setObjectName("sidebarVersion")
+        footer_layout.addWidget(self._version_label)
+
+        self._copyright_label = QLabel("© Olha & Pavlo")
+        self._copyright_label.setObjectName("sidebarCopyright")
+        footer_layout.addWidget(self._copyright_label)
+
+        sidebar_layout.addWidget(footer)
 
         layout.addWidget(self._sidebar)
 
@@ -116,11 +146,13 @@ class MainWindow(QMainWindow):
         self._settings_panel = SettingsPanel(
             self._config, self._auth, self._jira, self._font_manager
         )
+        self._help_panel = HelpPanel(self._config)
         self._log_panel = LogPanel()
 
         self._inner_stack.addWidget(self._report_panel)  # index 0
         self._inner_stack.addWidget(self._settings_panel)  # index 1
-        self._inner_stack.addWidget(self._log_panel)  # index 2
+        self._inner_stack.addWidget(self._help_panel)  # index 2
+        self._inner_stack.addWidget(self._log_panel)  # index 3
 
         self._outer_stack.addWidget(self._inner_stack)
 
@@ -141,9 +173,28 @@ class MainWindow(QMainWindow):
         self._settings_panel.appearance_changed.connect(self._on_appearance_changed)
         self._settings_panel.logout_requested.connect(self._confirm_and_logout)
         self._sidebar_user_info.logout_requested.connect(self._confirm_and_logout)
+        # Session restore is scheduled from __init__ (deferred to after show())
+        # so login_state_changed is still caught here — signals are wired above.
 
-        # Restore session AFTER signals are wired so login_state_changed is caught
-        self._login_panel.try_restore_session()
+        # Fade the destination widget in on every panel switch (sidebar nav and
+        # login↔content). Connected last, after the initial indices are set, so
+        # the first paint isn't animated.
+        self._inner_stack.currentChanged.connect(self._fade_inner)
+        self._outer_stack.currentChanged.connect(self._fade_outer)
+
+    # -- transitions ----------------------------------------------------------
+
+    def _fade_inner(self, _index: int) -> None:
+        """Fade in the newly selected sidebar panel."""
+        widget = self._inner_stack.currentWidget()
+        if widget is not None:
+            fade_in(widget)
+
+    def _fade_outer(self, _index: int) -> None:
+        """Fade in the login overlay or the main content on switch."""
+        widget = self._outer_stack.currentWidget()
+        if widget is not None:
+            fade_in(widget)
 
     # -- shortcuts ------------------------------------------------------------
 
@@ -280,22 +331,32 @@ class MainWindow(QMainWindow):
             shades = theming.qt_shades(accent, is_dark)
 
         theme_xml = self._MATERIAL_THEMES.get(theme, self._MATERIAL_THEMES["light"])
+
+        # ``apply_stylesheet`` re-polishes the entire widget tree (~0.5s on a
+        # built-out window).  Skip the whole re-apply when nothing that affects
+        # appearance changed — e.g. re-selecting the current accent/font.
+        signature = (theme_xml, accent, extra["font_family"])
+        if signature == getattr(self, "_applied_appearance", None):
+            logger.debug("Appearance unchanged; skipping theme re-apply")
+            return
+        self._applied_appearance = signature
+
         apply_stylesheet(app, theme=theme_xml, extra=extra)
 
-        # Patch the generated stylesheet to reduce QComboBox dropdown
-        # spacing — the popup is a top-level widget so window-level
-        # overrides cannot reach it.
-        css = app.styleSheet()
-        css += "\nQComboBox { padding-left: 4px; }\n"
-        app.setStyleSheet(css)
-
         # Apply app-specific overrides at the window level:
-        # structural (COMMON_THEME) first, then the color overrides.
+        # structural (COMMON_THEME) first, then the color overrides.  The
+        # QComboBox padding tweak rides along with the window overlay (it
+        # cascades to every child combo) instead of forcing a second
+        # app-wide ``setStyleSheet`` that would re-polish the whole widget
+        # tree — a ~0.5s hit at startup on a fully-built window.
         overlay = dark_theme(shades) if is_dark else light_theme(shades)
-        self.setStyleSheet(COMMON_THEME + overlay)
+        self.setStyleSheet(
+            COMMON_THEME + overlay + "\nQComboBox { padding-left: 4px; }\n"
+        )
 
         self._log_panel.set_dark(is_dark)
         self._report_panel.set_dark(is_dark)
+        self._help_panel.set_dark(is_dark)
 
     def _on_appearance_changed(self) -> None:
         """Re-apply the current theme after accent/font customization."""

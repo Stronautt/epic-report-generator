@@ -29,15 +29,24 @@
     // Floor the chart so heading + chart + legend exactly fills the standard
     // content height; measuring the fixed parts keeps the fit precise.
     let floor = page-height - 2 * page-margin
-    let legend-h = if legend != none { measure(box(width: size.width, legend)).height } else { 0pt }
+    let legend-h = if legend != none {
+      measure(box(width: size.width, legend)).height
+    } else { 0pt }
     let reserved = measure(box(width: size.width, head)).height + legend-h
     let chart-min = calc.max(floor - reserved, 0pt)
 
     head
     if t.chart != none {
-      gantt(t.chart, c, min-height: chart-min)
+      gantt(
+        t.chart,
+        c,
+        min-height: chart-min,
+        color-by-certainty: t.has-certainty,
+      )
     } else {
-      box(width: 100%, height: chart-min, align(center + horizon, text(fill: c.muted)[No timeline data available]))
+      box(width: 100%, height: chart-min, align(center + horizon, text(
+        fill: c.muted,
+      )[No timeline data available]))
     }
     if legend != none { legend }
   })

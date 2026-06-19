@@ -32,8 +32,8 @@ def render_pdf(
     """Render the report payload to PDF bytes via Typst.
 
     *extra_font_paths* are added to Typst's font search path so a custom report
-    font (NFR-05) is available alongside the bundled Inter, which stays as the
-    fallback family.
+    font (NFR-05) is available alongside the bundled Inter (Latin/Cyrillic/Greek
+    fallback) and Noto Sans CJK JP (CJK ideograph/kana/Hangul fallback).
     """
     res = resources.files(_RESOURCES)
     with resources.as_file(res) as res_dir:

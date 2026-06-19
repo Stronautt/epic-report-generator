@@ -20,6 +20,7 @@ from PySide6.QtGui import (
     QDragMoveEvent,
     QDropEvent,
     QGuiApplication,
+    QIcon,
     QMouseEvent,
     QPainter,
     QPainterPath,
@@ -32,6 +33,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFrame,
+    QGraphicsOpacityEffect,
     QGridLayout,
     QHBoxLayout,
     QInputDialog,
@@ -49,6 +51,12 @@ from epic_report_generator.core.data_models import ChildOverride, ReportItem
 from epic_report_generator.services.config_manager import (
     DEFAULT_PROFILE_NAME,
     ConfigManager,
+)
+from epic_report_generator.ui.animations import (
+    CollapseAnimator,
+    flash_highlight,
+    grow_in,
+    lifted_card_pixmap,
 )
 
 
@@ -95,6 +103,44 @@ def make_scroll_content(
     layout.setContentsMargins(*margins)
     layout.setSpacing(spacing)
     return scroll, layout
+
+
+def make_dialog_button_box(dialog: QDialog, ok_text: str) -> QDialogButtonBox:
+    """Return the app-styled Ok/Cancel button box wired to *dialog*.
+
+    *ok_text* labels the primary button (e.g. ``"Save"`` / ``"Apply"``). Icons
+    are cleared and the ``dialogPrimary``/``dialogCancel`` properties set so
+    ``styles.py`` can theme them; ``accepted``/``rejected`` drive the dialog.
+    """
+    box = QDialogButtonBox(
+        QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+    )
+    box.setObjectName("dialogButtons")
+    ok_btn = box.button(QDialogButtonBox.StandardButton.Ok)
+    ok_btn.setText(ok_text)
+    ok_btn.setIcon(QIcon())
+    ok_btn.setProperty("dialogPrimary", "true")
+    cancel_btn = box.button(QDialogButtonBox.StandardButton.Cancel)
+    cancel_btn.setIcon(QIcon())
+    cancel_btn.setProperty("dialogCancel", "true")
+    box.accepted.connect(dialog.accept)
+    box.rejected.connect(dialog.reject)
+    return box
+
+
+def _icon_btn(glyph: str, tooltip: str, hover: str, pressed: str) -> QPushButton:
+    """Return a flat 22×22 icon button (grey glyph that tints on hover/press)."""
+    btn = QPushButton(glyph)
+    btn.setFixedSize(22, 22)
+    btn.setToolTip(tooltip)
+    btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    btn.setStyleSheet(
+        "QPushButton { background: transparent; border: none; color: #999;"
+        " font-size: 14px; padding: 0; border-radius: 0; }"
+        f"QPushButton:hover {{ background: transparent; color: {hover}; }}"
+        f"QPushButton:pressed {{ background: transparent; color: {pressed}; }}"
+    )
+    return btn
 
 
 class StatusIndicator(QWidget):
@@ -237,8 +283,9 @@ class GuideStep(QWidget):
         self._body_layout = QVBoxLayout(self._body)
         self._body_layout.setContentsMargins(28, 4, 8, 12)
         self._body_layout.setSpacing(8)
-        self._body.hide()
         root.addWidget(self._body)
+        self._animator = CollapseAnimator(self._body)
+        self._animator.set_collapsed_initial()
 
         self._update_arrow()
 
@@ -277,7 +324,7 @@ class GuideStep(QWidget):
 
     def _toggle(self) -> None:
         self._expanded = not self._expanded
-        self._body.setVisible(self._expanded)
+        self._animator.animate(self._expanded)
         self._update_arrow()
 
     def _update_arrow(self) -> None:
@@ -303,28 +350,105 @@ class CollapsibleSection(QWidget):
         title: str,
         *,
         expanded: bool = False,
+        variant: str = "section",
+        number: int | None = None,
+        animate_height: bool = True,
         parent: QWidget | None = None,
     ) -> None:
+        """Create a collapsible section.
+
+        *variant* selects the visual tier: ``"step"`` renders a prominent
+        top-level banner (accent bar, optional ``number`` badge, large title);
+        ``"section"`` (default) renders a quieter, indented nested header so
+        sub-sections read as children of a step rather than peers of it.
+
+        *animate_height* drives whether the body's height is animated on
+        expand/collapse. Leave it ``True`` for content-sized bodies. Set it
+        ``False`` for a body that *fills* available space (stretch / an
+        expanding child): its final height depends on sibling and stretch
+        state, so a height animation would land on the wrong value and snap.
+        Such a body shows/hides instantly and lets an animated sibling carry
+        the motion while it fills in reactively.
+        """
         super().__init__(parent)
         self._expanded = expanded
         self._title = title
+        self._variant = variant
+        is_step = variant == "step"
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
+        # The header is a full-width checkable button. Its content — an optional
+        # number badge, the title, and a right-aligned chevron — lives in an
+        # inner layout; the child labels ignore mouse events so a click anywhere
+        # along the row still reaches the button and toggles the section.
         self._header = QPushButton()
         self._header.setCheckable(True)
         self._header.setChecked(expanded)
-        self._header.setObjectName("collapsibleHeader")
+        self._header.setObjectName(
+            "collapsibleStepHeader" if is_step else "collapsibleHeader"
+        )
+        self._header.setCursor(Qt.CursorShape.PointingHandCursor)
         self._header.clicked.connect(self._toggle)
+
+        header_layout = QHBoxLayout(self._header)
+        header_layout.setContentsMargins(
+            *((14, 8, 14, 8) if is_step else (12, 8, 8, 8))
+        )
+        header_layout.setSpacing(10)
+        vcenter = Qt.AlignmentFlag.AlignVCenter
+
+        def _passive_label(text: str, name: str) -> QLabel:
+            """A header label that lets clicks reach the button but still shows
+            the pointing-hand cursor (mouse-transparent children otherwise
+            surface their own default arrow over the clickable header)."""
+            lbl = QLabel(text)
+            lbl.setObjectName(name)
+            lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+            return lbl
+
+        if is_step and number is not None:
+            badge = _passive_label(str(number), "stepBadge")
+            badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            badge.setFixedSize(QSize(22, 22))
+            header_layout.addWidget(badge, 0, vcenter)
+
+        self._title_label = _passive_label(
+            title, "stepTitle" if is_step else "sectionLabel"
+        )
+        header_layout.addWidget(self._title_label, 0, vcenter)
+        header_layout.addStretch(1)
+
+        self._arrow = _passive_label("", "collapsibleArrow")
+        header_layout.addWidget(self._arrow, 0, vcenter)
+
         root.addWidget(self._header)
 
         self._body = QWidget()
+        if not is_step:
+            # Object name lets the QSS draw a left rail continuing the header's,
+            # reinforcing that the body belongs to a nested section.
+            self._body.setObjectName("nestedBody")
         self._body_layout = QVBoxLayout(self._body)
-        self._body_layout.setContentsMargins(0, 8, 0, 8)
+        # Nested sections indent their body so content aligns under the title
+        # and inside the left rail; steps keep a flush body.
+        self._body_layout.setContentsMargins(0 if is_step else 14, 8, 0, 8)
         self._body_layout.setSpacing(8)
         self._body.setVisible(expanded)
         root.addWidget(self._body, 1)
+
+        # Animated reveal on expand/collapse (instant height + content fade,
+        # see CollapseAnimator). Fill bodies (animate_height=False) skip it.
+        self._animator: CollapseAnimator | None
+        if animate_height:
+            self._animator = CollapseAnimator(self._body)
+            if not expanded:
+                self._animator.set_collapsed_initial()
+        else:
+            self._animator = None
+            self._body.setVisible(expanded)  # instant, no height clamp
 
         self._update_arrow()
         self._update_size_policy()
@@ -338,22 +462,25 @@ class CollapsibleSection(QWidget):
         """Programmatically expand or collapse."""
         if expanded == self._expanded:
             return
-        self._expanded = expanded
-        self._header.setChecked(expanded)
-        self._body.setVisible(expanded)
-        self._update_arrow()
-        self._update_size_policy()
-        self.toggled.emit(expanded)
+        self._apply_expanded(expanded)
 
     def is_expanded(self) -> bool:
         return self._expanded
 
     def _toggle(self) -> None:
-        self._expanded = not self._expanded
-        self._body.setVisible(self._expanded)
+        self._apply_expanded(not self._expanded)
+
+    def _apply_expanded(self, expanded: bool) -> None:
+        """Shared expand/collapse path: sync header, arrow, and animate body."""
+        self._expanded = expanded
+        self._header.setChecked(expanded)
         self._update_arrow()
         self._update_size_policy()
-        self.toggled.emit(self._expanded)
+        if self._animator is not None:
+            self._animator.animate(expanded)
+        else:
+            self._body.setVisible(expanded)
+        self.toggled.emit(expanded)
 
     def _update_size_policy(self) -> None:
         if self._expanded:
@@ -364,9 +491,7 @@ class CollapsibleSection(QWidget):
             self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
 
     def _update_arrow(self) -> None:
-        arrow = "▼" if self._expanded else "▶"
-        escaped = self._title.replace("&", "&&")
-        self._header.setText(f"{arrow}  {escaped}")
+        self._arrow.setText("▼" if self._expanded else "▶")
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +499,10 @@ class CollapsibleSection(QWidget):
 # ---------------------------------------------------------------------------
 
 RE_EPIC_KEY = re.compile(r"^[A-Z][A-Z0-9_]+-\d+$")
+
+# Scope-certainty dropdown entries: (display label, stored data value). Shared by
+# the per-row Cert. combo and the per-child override combos.
+_CERT_ITEMS = [("--", ""), ("Low", "Low"), ("Med", "Medium"), ("High", "High")]
 
 
 def _coerce_overrides(raw: dict | None) -> dict[str, ChildOverride]:
@@ -457,6 +586,9 @@ class _ReportItemRow(QWidget):
     drag_started = Signal(object)  # emits self when the drag handle is dragged
     edit_requested = Signal(object)  # emits self when the customize button is clicked
 
+    # Field-outline colours used to flag a validation problem on the row.
+    _VALIDATION_COLOR = {"error": "#e53935", "warning": "#ff8f00"}
+
     def __init__(
         self,
         kind: str = "epic",
@@ -467,11 +599,16 @@ class _ReportItemRow(QWidget):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        # Object name + styled background let the drop-highlight flash paint a
+        # tint scoped to this row (see ReportItemTable._start_drag).
+        self.setObjectName("reportItemRow")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         # Per-child overrides keyed by child Jira key (see ChildOverride).
         self._child_overrides: dict[str, ChildOverride] = _coerce_overrides(
             child_overrides
         )
         self._initialised = False
+        self._validation_state = ""
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 2, 0, 2)
         layout.setSpacing(4)
@@ -506,10 +643,8 @@ class _ReportItemRow(QWidget):
 
         self.certainty_combo = QComboBox()
         no_scroll_wheel(self.certainty_combo)
-        self.certainty_combo.addItem("--", "")
-        self.certainty_combo.addItem("Low", "Low")
-        self.certainty_combo.addItem("Med", "Medium")
-        self.certainty_combo.addItem("High", "High")
+        for label, data in _CERT_ITEMS:
+            self.certainty_combo.addItem(label, data)
         cert_idx = self.certainty_combo.findData(scope_certainty or "")
         if cert_idx >= 0:
             self.certainty_combo.setCurrentIndex(cert_idx)
@@ -517,29 +652,13 @@ class _ReportItemRow(QWidget):
         self.certainty_combo.currentIndexChanged.connect(lambda: self.changed.emit())
         layout.addWidget(self.certainty_combo)
 
-        edit_btn = QPushButton("⚙")
-        edit_btn.setFixedSize(22, 22)
-        edit_btn.setToolTip("Customize the epics/stories within this item")
-        edit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        edit_btn.setStyleSheet(
-            "QPushButton { background: transparent; border: none; color: #999;"
-            " font-size: 14px; padding: 0; border-radius: 0; }"
-            "QPushButton:hover { background: transparent; color: #0052CC; }"
-            "QPushButton:pressed { background: transparent; color: #003C99; }"
+        edit_btn = _icon_btn(
+            "⚙", "Customize the epics/stories within this item", "#0052CC", "#003C99"
         )
         edit_btn.clicked.connect(lambda: self.edit_requested.emit(self))
         layout.addWidget(edit_btn)
 
-        remove_btn = QPushButton("✕")
-        remove_btn.setFixedSize(22, 22)
-        remove_btn.setToolTip("Remove this row")
-        remove_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        remove_btn.setStyleSheet(
-            "QPushButton { background: transparent; border: none; color: #999;"
-            " font-size: 14px; padding: 0; border-radius: 0; }"
-            "QPushButton:hover { background: transparent; color: #DE350B; }"
-            "QPushButton:pressed { background: transparent; color: #BF2600; }"
-        )
+        remove_btn = _icon_btn("✕", "Remove this row", "#DE350B", "#BF2600")
         remove_btn.clicked.connect(lambda: self.removed.emit(self))
         layout.addWidget(remove_btn)
 
@@ -547,6 +666,11 @@ class _ReportItemRow(QWidget):
 
         # Drop stale per-child overrides when the user switches epic↔label.
         self.kind_combo.currentIndexChanged.connect(self._on_kind_toggled)
+
+        # Editing the identifying fields clears any stale validation highlight.
+        self.key_edit.textChanged.connect(self._clear_validation)
+        self.name_edit.textChanged.connect(self._clear_validation)
+        self.kind_combo.currentIndexChanged.connect(self._clear_validation)
 
         # Apply initial kind-based state
         self._on_kind_changed()
@@ -570,7 +694,7 @@ class _ReportItemRow(QWidget):
         is_label = self.kind_combo.currentData() == "label"
         if is_label:
             self.name_edit.setEnabled(True)
-            self.name_edit.setPlaceholderText("Display name (required)")
+            self.name_edit.setPlaceholderText("Display name (recommended)")
             self.key_edit.setPlaceholderText("label-name")
             if self._label_completions:
                 self._apply_completer(self._label_completions)
@@ -590,6 +714,26 @@ class _ReportItemRow(QWidget):
         """
         if self._initialised and self._child_overrides:
             self._child_overrides = {}
+
+    def set_validation(self, state: str) -> None:
+        """Flag (or clear) a validation problem on this row.
+
+        *state* is ``""`` to clear, ``"error"`` (red) or ``"warning"`` (amber).
+        The colour outlines the key/label field so the offending row stands out.
+        """
+        self._validation_state = state
+        color = self._VALIDATION_COLOR.get(state)
+        if color:
+            self.key_edit.setStyleSheet(
+                f"QLineEdit {{ border: 1px solid {color}; border-radius: 2px; }}"
+            )
+        else:
+            self.key_edit.setStyleSheet("")
+
+    def _clear_validation(self) -> None:
+        """Drop the validation highlight as soon as the user edits the row."""
+        if self._validation_state:
+            self.set_validation("")
 
     @property
     def kind(self) -> str:
@@ -725,6 +869,10 @@ class ReportItemTable(QWidget):
         row.edit_requested.connect(self.edit_requested.emit)
         self._rows.append(row)
         self._rows_layout.addWidget(row)
+        # Animate a grow-in for interactive "+ Add Row" insertions, but not
+        # during bulk restore (signals blocked) where many rows appear at once.
+        if not self.signalsBlocked():
+            grow_in(row)
         self.items_changed.emit()
         return row
 
@@ -777,11 +925,25 @@ class ReportItemTable(QWidget):
         mime = QMimeData()
         mime.setData(self._MIME_TYPE, b"row")
         drag.setMimeData(mime)
+
+        # Grab the row at full opacity first, then render it as a lifted card
+        # (rounded, accent-bordered, translucent) for the floating drag cursor.
+        accent = row.palette().highlight().color()
         pixmap = row.grab()
-        drag.setPixmap(pixmap)
+        drag.setPixmap(lifted_card_pixmap(pixmap, accent))
         drag.setHotSpot(QPoint(12, pixmap.height() // 2))
 
+        # Dim the in-list row to a ghost placeholder while it is carried around;
+        # the live reposition (dragMoveEvent) slides this faint row into place.
+        ghost = QGraphicsOpacityEffect(row)
+        ghost.setOpacity(0.4)
+        row.setGraphicsEffect(ghost)
+
         drag.exec(Qt.DropAction.MoveAction)  # blocks until the drop completes
+
+        # Restore the row and flash a fading highlight where it landed.
+        row.setGraphicsEffect(None)
+        flash_highlight(row, accent, selector="#reportItemRow")
 
         self._drag_row = None
         # Persist once, covering both in-widget drops and drops released
@@ -820,6 +982,16 @@ class ReportItemTable(QWidget):
             if item:
                 items.append(item)
         return items
+
+    @property
+    def rows(self) -> list[_ReportItemRow]:
+        """The row widgets in display order (read-only snapshot)."""
+        return list(self._rows)
+
+    def clear_validation(self) -> None:
+        """Remove validation highlighting from every row."""
+        for row in self._rows:
+            row.set_validation("")
 
     def get_items_as_dicts(self) -> list[dict]:
         """Return all rows serialized as dicts for config persistence."""
@@ -874,8 +1046,6 @@ class ChildCustomizeDialog(QDialog):
     their own certainty and the report shows the average (FR-13, consolidated).
     """
 
-    _CERT_ITEMS = [("--", ""), ("Low", "Low"), ("Med", "Medium"), ("High", "High")]
-
     def __init__(
         self,
         *,
@@ -921,12 +1091,7 @@ class ChildCustomizeDialog(QDialog):
                 self._build_grid(child_noun, children, overrides, parent_certainty)
             )
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        root.addWidget(buttons)
+        root.addWidget(make_dialog_button_box(self, "Save"))
 
     def _build_grid(
         self,
@@ -938,6 +1103,7 @@ class ChildCustomizeDialog(QDialog):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         content = QWidget()
         grid = QGridLayout(content)
         grid.setContentsMargins(0, 0, 0, 0)
@@ -947,8 +1113,9 @@ class ChildCustomizeDialog(QDialog):
         for col, text in enumerate((child_noun, "Summary", "Display Name", "Cert.")):
             lbl = QLabel(f"<b>{text}</b>")
             grid.addWidget(lbl, 0, col)
-        grid.setColumnStretch(1, 3)
-        grid.setColumnStretch(2, 2)
+        # Summary and Display Name share the free width equally.
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 1)
 
         for r, (key, summary) in enumerate(children, start=1):
             ov = overrides.get(key)
@@ -960,7 +1127,16 @@ class ChildCustomizeDialog(QDialog):
             grid.addWidget(key_lbl, r, 0)
 
             sum_lbl = QLabel(summary or "")
-            sum_lbl.setWordWrap(True)
+            # Single line, no word wrap: a wrapped summary makes the grid's height
+            # depend on width (heightForWidth), which over-sizes the dialog for
+            # epics whose stories/tasks have long summaries and leaves dead space
+            # below the list. The Ignored horizontal policy lets the cell clip to
+            # its column instead of widening the dialog; the full text stays
+            # available via tooltip and the Display Name placeholder.
+            sum_lbl.setToolTip(summary or "")
+            sum_lbl.setSizePolicy(
+                QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+            )
             # Selectable so the summary can be copied when crafting a display name.
             sum_lbl.setTextInteractionFlags(
                 Qt.TextInteractionFlag.TextSelectableByMouse
@@ -976,7 +1152,7 @@ class ChildCustomizeDialog(QDialog):
 
             cert_combo = QComboBox()
             no_scroll_wheel(cert_combo)
-            for label, data in self._CERT_ITEMS:
+            for label, data in _CERT_ITEMS:
                 cert_combo.addItem(label, data)
             cert_combo.setFixedWidth(70)
             if self._cert_locked:
@@ -989,6 +1165,12 @@ class ChildCustomizeDialog(QDialog):
                     cert_combo.setCurrentIndex(idx)
             grid.addWidget(cert_combo, r, 3)
             self._cert_combos[key] = cert_combo
+
+        # The scroll area is widget-resizable, so the content fills the viewport.
+        # Without a trailing stretch row the grid would distribute any surplus
+        # height evenly between the data rows (big gaps when there are few
+        # children); this collects it at the bottom and keeps rows packed.
+        grid.setRowStretch(len(children) + 1, 1)
 
         scroll.setWidget(content)
         return scroll

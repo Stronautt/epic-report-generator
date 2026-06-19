@@ -12,12 +12,17 @@ def test_default_overlays_have_no_unresolved_tokens() -> None:
         assert not any(tok in css for tok in _TOKENS)
 
 
-def test_default_overlays_preserve_stock_blue() -> None:
-    # Historical hand-tuned blues — guards against accidental palette drift.
+def test_default_overlays_embed_stock_palette() -> None:
+    # The default overlays embed the stock palette derived from the accent
+    # maths; the exact hex values are pinned by test_theming's snapshot test.
+    from epic_report_generator.core import theming
+
     light = styles.light_theme()
-    assert "#2979ff" in light and "#d4e4ff" in light and "#b3d4ff" in light
+    light_shades = theming.qt_shades(theming.DEFAULT_ACCENT, dark=False)
+    assert all(light_shades[k] in light for k in ("accent", "soft", "border"))
     dark = styles.dark_theme()
-    assert "#448aff" in dark and "#1a2744" in dark and "#1e3a5f" in dark
+    dark_shades = theming.qt_shades(theming.DEFAULT_ACCENT, dark=True)
+    assert all(dark_shades[k] in dark for k in ("accent", "soft", "border"))
 
 
 def test_custom_shades_substitute_tokens() -> None:

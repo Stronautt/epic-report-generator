@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
-from PySide6.QtCore import QUrl, Signal
+from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
@@ -30,6 +31,9 @@ from epic_report_generator.ui.widgets import (
 logger = logging.getLogger(__name__)
 
 _API_TOKEN_URL = "https://id.atlassian.com/manage-profile/security/api-tokens"
+
+# Height of the primary call-to-action buttons (Connect / Login with Atlassian).
+_PRIMARY_BTN_HEIGHT = 44
 
 
 class LoginPanel(QWidget):
@@ -68,6 +72,9 @@ class LoginPanel(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
 
         scroll, root = make_scroll_content()
+        # Reserve the scrollbar gutter so expanding/collapsing the guide steps
+        # never reflows the page width (see CollapseAnimator._capture_scroll).
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         outer.addWidget(scroll)
 
         title = QLabel("Jira Connection")
@@ -189,7 +196,7 @@ class LoginPanel(QWidget):
         layout.addWidget(self._token_field)
 
         self._connect_btn = QPushButton("Connect")
-        self._connect_btn.setFixedHeight(44)
+        self._connect_btn.setFixedHeight(_PRIMARY_BTN_HEIGHT)
         self._connect_btn.clicked.connect(self._connect_api_token)
         layout.addWidget(self._connect_btn)
 
@@ -308,7 +315,7 @@ class LoginPanel(QWidget):
 
         # Login button
         self._login_btn = QPushButton("Login with Atlassian")
-        self._login_btn.setFixedHeight(44)
+        self._login_btn.setFixedHeight(_PRIMARY_BTN_HEIGHT)
         self._login_btn.clicked.connect(self._start_login)
         layout.addWidget(self._login_btn)
 
@@ -317,19 +324,22 @@ class LoginPanel(QWidget):
 
     def _toggle_guide(self) -> None:
         """Show or hide the inline OAuth setup guide."""
-        visible = not self._guide.isVisible()
-        self._guide.setVisible(visible)
-        self._guide_toggle_btn.setText(
-            "Hide guide" if visible else "How do I create an OAuth app?"
+        self._toggle_widget(
+            self._guide, self._guide_toggle_btn, "How do I create an OAuth app?"
         )
 
     def _toggle_api_guide(self) -> None:
         """Show or hide the inline API token guide."""
-        visible = not self._api_guide.isVisible()
-        self._api_guide.setVisible(visible)
-        self._api_guide_btn.setText(
-            "Hide guide" if visible else "How do I get an API token?"
+        self._toggle_widget(
+            self._api_guide, self._api_guide_btn, "How do I get an API token?"
         )
+
+    @staticmethod
+    def _toggle_widget(body: QWidget, btn: QPushButton, show_text: str) -> None:
+        """Toggle *body*'s visibility and flip *btn* between Hide / *show_text*."""
+        visible = not body.isVisible()
+        body.setVisible(visible)
+        btn.setText("Hide guide" if visible else show_text)
 
     # -- session restore ------------------------------------------------------
 
@@ -357,24 +367,19 @@ class LoginPanel(QWidget):
 
         if method == "api_token":
             logger.debug("Restoring API-token session")
-            api_token = self._auth.get_api_token()
-            if api_token and self._jira.connect_basic(
-                saved_url, saved_email, api_token
-            ):
-                logger.info("API-token session restored successfully")
-                self._on_login_success()
-                return
-            # Token likely expired or revoked
-            logger.warning("API-token session restore failed")
-            self._status.set_connected(
-                False,
-                "Token expired or revoked — please generate a new one",
+            self._status.set_connected(False, "Restoring session…")
+
+            def _restore_api() -> bool:
+                # keyring read + Jira handshake — both blocking, run off the
+                # UI thread so the window stays responsive during restore.
+                api_token = self._auth.get_api_token()
+                return bool(api_token) and self._jira.connect_basic(
+                    saved_url, saved_email, api_token
+                )
+
+            self._tasks.start(
+                _restore_api, self._on_api_restore_done, capture_exceptions=True
             )
-            self._show_api_token_error(
-                "Your API token has expired or been revoked. "
-                f'<a href="{_API_TOKEN_URL}">Generate a new token</a> and reconnect.'
-            )
-            self._tabs.setCurrentIndex(0)
             return
 
         if method == "oauth":
@@ -387,21 +392,68 @@ class LoginPanel(QWidget):
                 return
 
             self._setup_section.hide()
-            token = self._auth.get_access_token()
-            if token and self._jira.connect():
-                logger.info("OAuth session restored successfully")
-                self._on_login_success()
-            else:
-                logger.warning("OAuth session expired — user must log in again")
-                self._status.set_connected(
-                    False,
-                    "Session expired — please log in again",
-                )
-                self._tabs.setCurrentIndex(1)
+            self._status.set_connected(False, "Restoring session…")
+
+            def _restore_oauth() -> bool:
+                # Token refresh + handshake are blocking network calls.
+                token = self._auth.get_access_token()
+                return bool(token) and self._jira.connect()
+
+            self._tasks.start(
+                _restore_oauth, self._on_oauth_restore_done, capture_exceptions=True
+            )
             return
 
         # No auth_method set — fresh install, show tabs
         logger.debug("No previous session found")
+
+    def _on_api_restore_done(self, result: object) -> None:
+        """Handle the threaded API-token restore result (on the UI thread)."""
+        self._handle_restore_result(
+            result,
+            method="API-token",
+            fail_log="API-token session restore failed",
+            status_text="Token expired or revoked — please generate a new one",
+            tab_index=0,
+            on_failure=lambda: self._show_api_token_error(
+                "Your API token has expired or been revoked. "
+                f'<a href="{_API_TOKEN_URL}">Generate a new token</a> and reconnect.'
+            ),
+        )
+
+    def _on_oauth_restore_done(self, result: object) -> None:
+        """Handle the threaded OAuth restore result (on the UI thread)."""
+        self._handle_restore_result(
+            result,
+            method="OAuth",
+            fail_log="OAuth session expired — user must log in again",
+            status_text="Session expired — please log in again",
+            tab_index=1,
+        )
+
+    def _handle_restore_result(
+        self,
+        result: object,
+        *,
+        method: str,
+        fail_log: str,
+        status_text: str,
+        tab_index: int,
+        on_failure: Callable[[], None] | None = None,
+    ) -> None:
+        """Shared session-restore result handler for both auth methods."""
+        if result is True:
+            logger.info("%s session restored successfully", method)
+            self._on_login_success()
+            return
+        if isinstance(result, Exception):
+            logger.warning("%s session restore errored: %s", method, result)
+        else:
+            logger.warning(fail_log)
+        self._status.set_connected(False, status_text)
+        if on_failure is not None:
+            on_failure()
+        self._tabs.setCurrentIndex(tab_index)
 
     # -- public API -----------------------------------------------------------
 
@@ -451,21 +503,33 @@ class LoginPanel(QWidget):
         self._connect_btn.setEnabled(False)
         self._connect_btn.setText("Connecting…")
 
-        # Store credentials first
-        self._auth.login_api_token(url, email, token)
+        # Validate the credentials with a live handshake off the UI thread so the
+        # window stays responsive; persist them only once it actually succeeds.
+        self._tasks.start(
+            lambda: self._jira.connect_basic(url, email, token),
+            lambda result: self._on_api_connect_done(result, url, email, token),
+            capture_exceptions=True,
+        )
 
-        # Try to connect (validates credentials internally via myself())
-        if not self._jira.connect_basic(url, email, token):
-            self._connect_btn.setEnabled(True)
-            self._connect_btn.setText("Connect")
-            self._show_api_token_error(
-                "Could not connect to Jira. Check your URL, email, "
-                "and API token and try again."
-            )
+    def _on_api_connect_done(
+        self, result: object, url: str, email: str, token: str
+    ) -> None:
+        """Finish API-token login on the UI thread once the handshake returns."""
+        if result is True:
+            # Persist credentials only after a confirmed connection so a failed
+            # attempt never leaves bad creds in keyring/config.
+            self._auth.login_api_token(url, email, token)
+            logger.info("API-token login successful")
+            self._on_login_success()
             return
-
-        logger.info("API-token login successful")
-        self._on_login_success()
+        if isinstance(result, Exception):
+            logger.warning("API-token connection errored: %s", result)
+        self._connect_btn.setEnabled(True)
+        self._connect_btn.setText("Connect")
+        self._show_api_token_error(
+            "Could not connect to Jira. Check your URL, email, "
+            "and API token and try again."
+        )
 
     def _show_api_token_error(self, message: str) -> None:
         """Display an error message below the API Token connect button."""
@@ -522,7 +586,16 @@ class LoginPanel(QWidget):
         # Handle multiple sites
         if "sites" in result:
             sites = result["sites"]
-            # For now, pick the first site; a future enhancement can show a picker
+            if not sites:
+                logger.error("OAuth succeeded but no accessible Jira sites returned")
+                QMessageBox.warning(
+                    self,
+                    "No Jira Sites",
+                    "Your Atlassian account has no Jira sites accessible to this app.",
+                )
+                return
+            # Use the first accessible site — single-site is the common case and a
+            # multi-site picker is out of scope.
             self._auth.select_site(sites[0])
 
         if self._jira.connect():

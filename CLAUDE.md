@@ -74,6 +74,7 @@ src/epic_report_generator/
 │   ├── preview_panel.py           # PDF generation worker, QPdfDocument preview, export
 │   ├── settings_panel.py          # Connection info, theme + accent/font customization, logout, defaults
 │   ├── log_panel.py               # Live log viewer with level filtering
+│   ├── help_panel.py              # User Guide: bundled user-guide.md → HTML (Python-Markdown) in a themed QTextBrowser; native banner header
 │   ├── widgets.py                 # Reusable: StatusIndicator, LabelledField, GuideStep,
 │   │                              #   CollapsibleSection, ReportItemTable (drag-to-reorder,
 │   │                              #   per-row customize button), ChildCustomizeDialog,
@@ -81,7 +82,8 @@ src/epic_report_generator/
 │   └── styles.py                  # App-specific QSS overlays on top of qt-material base themes
 └── resources/
     ├── typst/                     # Templates: theme, components (gantt, trend_chart, progress_bar, …), pages
-    ├── fonts/                     # Bundled Inter (deterministic cross-OS rendering)
+    ├── fonts/                     # Bundled Inter (deterministic cross-OS rendering) + Noto Sans CJK JP (CJK fallback)
+    ├── user-guide.md              # End-user guide, rendered in-app by help_panel (bundled as package data)
     └── logo.png
 ```
 
@@ -133,6 +135,31 @@ overwrite `JiraIssue.summary` (epic items) or `EpicData.summary` (label items),
 and certainty flows to `EpicMetrics.scope_certainty` per source epic / group.
 Switching a row's kind (epic↔label) drops its now-stale child overrides.
 
+### Report Item Validation
+
+A **Validate** action sits in the "Report Items" section header (right of the
+title). It checks **every** non-empty row — both epics and labels — against Jira
+in a background task (`config_panel._validate_items`):
+
+- **Epics**: invalid key format or not found → **error**.
+- **Labels**: no epic carries the label → **error**.
+- **Child overrides** (rows with `child_overrides`): each overridden child key is
+  re-fetched (`fetch_child_summaries` for epics, `fetch_epic_summaries_by_label`
+  for labels); any key that no longer exists → **warning**.
+
+Results are surfaced two ways instead of the old per-epic success list: the
+offending row's key field is outlined (red for error, amber for warning, via
+`_ReportItemRow.set_validation`, cleared automatically on the next edit), and a
+`#validationSummary` callout below the table lists the problems in **row order**
+("Error: …" / "Warning: …"). With no problems it shows a brief confirmation only.
+
+`validate_items(on_complete)` is also the gate for **Generate Report**
+(`report_panel._on_generate`): generation runs the same check first and, via the
+`(has_errors, has_warnings)` callback, **blocks on any error** — keeping Step 1
+expanded and scrolling back to the flagged rows (`report_items_anchor`) — while
+**warnings never block** (generation proceeds, with Step 1 left open so the
+warning callout stays visible).
+
 ### Subtask Fetching
 
 When `include_subtasks` is enabled (default `True`), `_fetch_children()` performs a second paginated JQL query (`parent in (CHILD-1, CHILD-2, ...)`) after fetching direct epic children. Subtasks are merged into the children list with key-based deduplication. Child keys are batched in groups of 100 to respect JQL `IN` clause limits. The option is exposed as a checkbox in the Config panel under "Custom Field Mapping" and stored in `ReportConfig.include_subtasks`.
@@ -182,13 +209,19 @@ For **label-group merges** (`merge_metrics`), progress is the weighted average o
 
 ### PDF Layout
 
-Landscape pages 406mm wide. The title and per-epic pages are a fixed 16:9 (406mm x 228.4mm). Page 1: title page. Page 2: summary table with progress bars (label-group header rows show aggregated statistics) and optional scope-certainty legend; the aggregate KPI strip shows Epics / Overall / Issues / Total {unit} / Done {unit}. Page 3 (optional): Gantt-style timeline chart with optional scope-certainty legend — included by default but can be excluded via `ReportConfig.show_timeline_chart`. Remaining pages: per-epic detail with trend chart + metrics sidebar.
+Landscape pages 406mm wide. The title and per-epic pages are a fixed 16:9 (406mm x 228.4mm). Page 1: title page. Page 2: summary table with progress bars (label-group header rows show aggregated statistics) and a Scope Certainty column + legend that appear **only when at least one item sets a certainty** (`summary.has-certainty`); the aggregate KPI strip shows Epics / Overall / Issues / Total {unit} / Done {unit}. Page 3 (optional): Gantt-style timeline chart with optional scope-certainty legend — included by default but can be excluded via `ReportConfig.show_timeline_chart`. Remaining pages: per-epic detail with trend chart + metrics sidebar.
 
 **Adaptive height (summary + timeline only).** These two pages render on `#page(height: auto)` (`main.typ`) so a large table or Gantt grows the sheet taller instead of paginating onto a second page. The floor is the standard 228.4mm height: `summary.typ` measures its body and pads up to the floor; `timeline.typ` measures the heading/legend and hands the Gantt a `min-height` so it fills to the floor, then grows beyond it. The Gantt (`gantt.typ`) therefore computes its own intrinsic height from a fixed per-row height (floored to `min-height`) rather than reading the page height. Epic detail and title pages keep their fixed 16:9 height; the epic loop uses `pagebreak(weak: true)` so the auto-height pages introduce no blank pages.
 
-Progress bars in the summary table use a 10-character bar where each character represents 10%. Filled squares (`■`) are coloured by threshold (green >= 75%, yellow >= 25%, red < 25%) and empty squares (`□`) render in a muted/grey colour. The label uses a space before the percent sign. Example: `■■■■■■□□□□ 60 %`.
+**Progress vs. certainty colour separation.** Whenever a scope certainty is in play, the two axes are kept on *different visual channels* so they never read as the same thing: **colour means certainty, length/threshold means progress**. The rule is conditional on whether any certainty is set, and is applied consistently on both the summary and the timeline.
+
+On the **summary table** the Scope Certainty cell (`cert-meter`/`certainty-cell` in `pill.typ`) is a 3-segment confidence meter whose filled-segment **count** encodes the level (High=3 / Medium=2 / Low=1) and whose **colour** carries the certainty (green/amber/red via `certainty-color`). The progress bar (`progress_bar.typ`, `neutral:` flag driven by `show-cert`) is then a neutral **grey** fill so colour is reserved for the meter. When no item sets a certainty the column is dropped and the bar reclaims the informative `progress-color` threshold (green >= 75%, yellow >= 25%, red < 25%), since there is no longer any collision to avoid.
+
+On the **timeline** (`gantt.typ`) the same principle is driven by `color-by-certainty` (from `timeline.has-certainty`): when any item has a certainty the epic bars **and** the group roll-up bar are tinted by `certainty-color` (the group by its aggregate, `average_certainty` over its member epics — matching the summary group row); otherwise both fall back to `progress-color`.
 
 When `confidential` is enabled and `company_name` is set, a repeating footer appears on all pages except the title page: "CONFIDENTIAL — {company_name}" on the left, report date and author on the right.
+
+**Export location.** The "Export as PDF" dialog (`preview_panel._export_pdf` / `_initial_export_dir`) opens in the directory of the user's last export, persisted as the global config key `last_export_dir`. When that key is unset or its directory no longer exists, it falls back to the cross-platform Downloads folder (`platformdirs.user_downloads_dir()`), then to the home directory. The chosen folder is saved after every successful export.
 
 ### Theming
 
@@ -233,8 +266,10 @@ preferring the variable-font file) and its TTFs are downloaded. The repo is used
 the Fonts CSS API only serves woff2 for modern variable families (e.g. Manrope), which
 Typst cannot read. The resolved family is registered with `QFontDatabase` and prepended to the
 qt-material font stack for the UI; for the PDF the cache dir is added to Typst's
-`font_paths` and `main.typ` sets `font: (custom, "Inter")` so bundled Inter stays the
-fallback. `report_panel` resolves accent + font onto `ReportConfig`
+`font_paths` and `main.typ` sets `font: (custom, "Inter", "Noto Sans CJK JP")` so
+bundled Inter stays the primary fallback (Latin/Cyrillic/Greek, real variable weights)
+and bundled **Noto Sans CJK JP** is the last fallback for CJK ideographs/kana/Hangul
+that Inter lacks. `report_panel` resolves accent + font onto `ReportConfig`
 (`report_accent`/`report_font_family`/`report_font_dir`) just before generation, the same
 place `dark_mode` is set.
 

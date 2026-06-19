@@ -56,5 +56,9 @@
   children.push(chart-block)
   rows.push(1fr)
 
-  block(width: 100%, height: 100%, grid(rows: rows, row-gutter: 10pt, ..children))
+  block(
+    width: 100%,
+    height: 100%,
+    grid(rows: rows, row-gutter: 10pt, ..children),
+  )
 }

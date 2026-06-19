@@ -28,6 +28,7 @@ from epic_report_generator.core.data_models import (
     ReportData,
     ReportItem,
     TimelineItem,
+    average_certainty,
     collect_child_timeline_dates,
     fmt_date_en,
 )
@@ -176,7 +177,7 @@ def build_report(report: ReportData) -> dict[str, Any]:
 def _iter_items(
     report: ReportData,
 ) -> Iterator[tuple[ReportItem | None, EpicData, EpicMetrics]]:
-    """Yield ``(item, epic, metrics)`` triples, mirroring the old renderer."""
+    """Yield ``(item, epic, metrics)`` triples in report order."""
     if report.resolved_items:
         yield from report.resolved_items
     else:
@@ -632,6 +633,7 @@ def _timeline_data(report: ReportData) -> dict[str, Any] | None:
     g_prog_num = 0.0
     g_prog_den = 0.0
     g_epics = 0
+    g_certs: list[str | None] = []
 
     def close_group(end_idx: int) -> None:
         prog = int(round(g_prog_num / g_prog_den)) if g_prog_den else 0
@@ -642,6 +644,9 @@ def _timeline_data(report: ReportData) -> dict[str, Any] | None:
                 "count": end_idx - group_start,
                 "n-epics": g_epics,
                 "progress": prog,
+                # Aggregate certainty (same rounded-average rule as the summary
+                # group row) so the roll-up bar can be tinted by certainty too.
+                "certainty": average_certainty(g_certs),
             }
         )
 
@@ -655,6 +660,7 @@ def _timeline_data(report: ReportData) -> dict[str, Any] | None:
             g_prog_num = 0.0
             g_prog_den = 0.0
             g_epics = 0
+            g_certs = []
         dated = it.start_date is not None and it.end_date is not None
         rows.append(
             {
@@ -669,6 +675,7 @@ def _timeline_data(report: ReportData) -> dict[str, Any] | None:
         )
         if not it.is_child:
             g_epics += 1
+            g_certs.append(it.scope_certainty)
             w = it.weight if it.weight else 1.0
             g_prog_num += it.progress * w
             g_prog_den += w

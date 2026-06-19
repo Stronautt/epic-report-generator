@@ -76,6 +76,9 @@ _DEFAULTS: dict[str, Any] = {
     "font_source": "",
     "font_value": "",
     "font_family": "",
+    # Last directory the user exported a PDF to. "" = none yet; the export
+    # dialog falls back to the cross-platform Downloads folder.
+    "last_export_dir": "",
     # Profile infrastructure
     "active_profile": DEFAULT_PROFILE_NAME,
     "profiles": {},

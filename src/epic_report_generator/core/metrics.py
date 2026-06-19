@@ -10,18 +10,15 @@ from epic_report_generator.core.data_models import (
     EpicData,
     EpicMetrics,
     JiraIssue,
+    collect_child_estimation_dates,
     collect_child_timeline_dates,
 )
 
 logger = logging.getLogger(__name__)
 
-# -- Named constants ----------------------------------------------------------
-
 PROGRESS_COMBINED = "combined"
 PROGRESS_ISSUES_ONLY = "issues_only"
 PROGRESS_ESTIMATES_ONLY = "estimates_only"
-
-__all__ = ["calculate_metrics", "merge_metrics"]
 
 DEFAULT_WEIGHT = 1.0
 PROGRESS_MIN = 0.0
@@ -104,7 +101,6 @@ def calculate_metrics(
         children, direct_estimates, parent_to_subs, use_estimates, omit_unestimated
     )
 
-    # Single pass: compute epic progress (direct children only) and count done issues
     weighted_sum = 0.0
     weight_total = 0.0
     completed_issues = 0
@@ -151,9 +147,9 @@ def calculate_metrics(
         if any(e is not None for e in sub_ests):
             effective_est[c.key] = sum(e for e in sub_ests if e is not None)
             effective_done[c.key] = sum(
-                float(direct_estimates[s.key])  # type: ignore[arg-type]
+                est
                 for s in subs
-                if direct_estimates.get(s.key) is not None
+                if (est := direct_estimates.get(s.key)) is not None
                 and s.status_category == STATUS_DONE
             )
         else:
@@ -163,7 +159,6 @@ def calculate_metrics(
             )
         accounted_keys.update(s.key for s in subs)
 
-    # Single pass over non-accounted children for SP totals
     unestimated = 0
     total_sp = 0.0
     completed_sp = 0.0
@@ -259,18 +254,9 @@ def merge_metrics(
                 merged_children.append(child)
 
     keys = [e.key for e in epics]
-    # Expand date ranges to cover all merged children.  For estimation dates
-    # prefer start_date/due_date and fall back to created/resolved so every
-    # child contributes.  Timeline dates use collect_child_timeline_dates.
+    # Expand date ranges to cover all merged children (estimation + timeline).
     for c in merged_children:
-        if c.start_date:
-            start_dates.append(c.start_date)
-        elif c.created:
-            start_dates.append(c.created.date())
-        if c.due_date:
-            due_dates.append(c.due_date)
-        elif c.resolved and c.status_category == STATUS_DONE:
-            due_dates.append(c.resolved.date())
+        collect_child_estimation_dates(c, start_dates, due_dates)
         # Skip subtasks for timeline dates when not included
         if c.is_subtask and not include_subtask_timeline:
             continue

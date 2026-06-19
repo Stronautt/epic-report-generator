@@ -12,7 +12,7 @@
     green: rgb("#36B37E"),
     yellow: rgb("#FFAB00"),
     red: rgb("#DE350B"),
-    info: rgb("#0052CC"),  // in-progress status — fixed blue, independent of accent
+    info: rgb("#0052CC"), // in-progress status — fixed blue, independent of accent
     row-alt: rgb("#F8F9FA"),
     grid: rgb("#DFE1E6"),
     header-text: white,
@@ -38,7 +38,7 @@
     green: rgb("#66BB6A"),
     yellow: rgb("#FFA726"),
     red: rgb("#EF5350"),
-    info: rgb("#2979FF"),  // in-progress status — fixed blue, independent of accent
+    info: rgb("#2979FF"), // in-progress status — fixed blue, independent of accent
     row-alt: rgb("#252525"),
     grid: rgb("#37474F"),
     header-text: white,
@@ -64,12 +64,16 @@
 #let progress-high = 75
 #let progress-low = 25
 #let progress-color(pct, c) = {
-  if pct >= progress-high { c.green } else if pct >= progress-low { c.yellow } else { c.red }
+  if pct >= progress-high { c.green } else if pct >= progress-low {
+    c.yellow
+  } else { c.red }
 }
 
 // Scope-certainty colour mapping.
 #let certainty-color(s, c) = {
-  if s == "High" { c.green } else if s == "Medium" { c.yellow } else if s == "Low" { c.red } else { c.muted }
+  if s == "High" { c.green } else if s == "Medium" { c.yellow } else if (
+    s == "Low"
+  ) { c.red } else { c.muted }
 }
 
 // Page geometry — landscape 16:9.

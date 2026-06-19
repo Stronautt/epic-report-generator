@@ -6,10 +6,20 @@
 // `d` is the trend chart-data dict, `c` the theme palette.
 
 #let _at(x, y, body) = place(top + left, dx: x, dy: y, body)
-#let _ctext(x, y, w, body) = place(top + left, dx: x - w / 2, dy: y, box(width: w, align(center, body)))
-#let _hline(x, y, len, stroke) = place(top + left, dx: x, dy: y, line(start: (0pt, 0pt), end: (len, 0pt), stroke: stroke))
-#let _polyline(pts, stroke) = place(top + left, curve(stroke: stroke,
-  curve.move(pts.at(0)), ..pts.slice(1).map(p => curve.line(p))))
+#let _ctext(x, y, w, body) = place(top + left, dx: x - w / 2, dy: y, box(
+  width: w,
+  align(center, body),
+))
+#let _hline(x, y, len, stroke) = place(top + left, dx: x, dy: y, line(
+  start: (0pt, 0pt),
+  end: (len, 0pt),
+  stroke: stroke,
+))
+#let _polyline(pts, stroke) = place(top + left, curve(
+  stroke: stroke,
+  curve.move(pts.at(0)),
+  ..pts.slice(1).map(p => curve.line(p)),
+))
 
 #let trend-chart(d, c) = layout(sz => {
   let cw = sz.width
@@ -38,11 +48,17 @@
     for tk in d.sp-ticks {
       let y = ysp(tk)
       _hline(px0, y, pw, 0.4pt + c.grid)
-      place(top + left, dx: 0pt, dy: y - 4pt, box(width: gl - 2mm, align(right, text(7pt, fill: c.muted)[#tk])))
+      place(top + left, dx: 0pt, dy: y - 4pt, box(width: gl - 2mm, align(
+        right,
+        text(7pt, fill: c.muted)[#tk],
+      )))
     }
     // right (issues) axis labels
     for tk in d.iss-ticks {
-      place(top + left, dx: px0 + pw + 2mm, dy: yiss(tk) - 4pt, text(7pt, fill: c.muted)[#tk])
+      place(top + left, dx: px0 + pw + 2mm, dy: yiss(tk) - 4pt, text(
+        7pt,
+        fill: c.muted,
+      )[#tk])
     }
 
     // areas: total then completed on top
@@ -55,9 +71,15 @@
     area(d.done-sp, done-fill)
 
     // right-axis lines
-    _polyline(range(n).map(i => (xof(i), yiss(d.cum-iss.at(i)))), 1.6pt + iss-line)
-    _polyline(range(n).map(i => (xof(i), yiss(d.cum-unest.at(i)))),
-      (paint: unest-line, thickness: 1.4pt, dash: "dashed"))
+    _polyline(
+      range(n).map(i => (xof(i), yiss(d.cum-iss.at(i)))),
+      1.6pt + iss-line,
+    )
+    _polyline(range(n).map(i => (xof(i), yiss(d.cum-unest.at(i)))), (
+      paint: unest-line,
+      thickness: 1.4pt,
+      dash: "dashed",
+    ))
 
     // x baseline + tick labels
     _hline(px0, ybase, pw, 0.6pt + c.grid)
@@ -66,18 +88,39 @@
     }
 
     // axis titles
-    place(top + left, dx: 0pt, dy: py0 - 6mm, text(7pt, weight: "bold", fill: c.muted)[SP])
-    place(top + left, dx: px0 + pw + 1mm, dy: py0 - 6mm, text(7pt, weight: "bold", fill: c.muted)[Issues])
+    place(top + left, dx: 0pt, dy: py0 - 6mm, text(
+      7pt,
+      weight: "bold",
+      fill: c.muted,
+    )[SP])
+    place(top + left, dx: px0 + pw + 1mm, dy: py0 - 6mm, text(
+      7pt,
+      weight: "bold",
+      fill: c.muted,
+    )[Issues])
 
     // legend
     let sw(col, label, dashed: false) = box(baseline: 25%)[
-      #box(width: 10pt, height: 7pt, fill: if dashed { none } else { col },
-        stroke: if dashed { (paint: col, thickness: 1.2pt, dash: "dashed") } else { none })
+      #box(
+        width: 10pt,
+        height: 7pt,
+        fill: if dashed { none } else { col },
+        stroke: if dashed {
+          (paint: col, thickness: 1.2pt, dash: "dashed")
+        } else { none },
+      )
       #h(3pt) #text(7pt, fill: c.muted)[#label]
     ]
     place(top + center, dy: 0pt)[
-      #sw(total-fill, "Total " + d.unit) #h(8pt) #sw(done-fill, "Completed " + d.unit) #h(8pt)
-      #sw(iss-line, "Cumulative Issues") #h(8pt) #sw(unest-line, "Unestimated", dashed: true)
+      #sw(total-fill, "Total " + d.unit) #h(8pt) #sw(
+        done-fill,
+        "Completed " + d.unit,
+      ) #h(8pt)
+      #sw(iss-line, "Cumulative Issues") #h(8pt) #sw(
+        unest-line,
+        "Unestimated",
+        dashed: true,
+      )
     ]
   })
 })
