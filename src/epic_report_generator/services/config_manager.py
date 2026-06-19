@@ -79,6 +79,11 @@ _DEFAULTS: dict[str, Any] = {
     # Last directory the user exported a PDF to. "" = none yet; the export
     # dialog falls back to the cross-platform Downloads folder.
     "last_export_dir": "",
+    # Last window size (global). Restored on launch, clamped to a safe range
+    # (see MainWindow._safe_window_size) so a stale value can't strand the
+    # window off-screen or too small to use.
+    "window_width": 1280,
+    "window_height": 900,
     # Profile infrastructure
     "active_profile": DEFAULT_PROFILE_NAME,
     "profiles": {},

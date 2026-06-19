@@ -24,8 +24,17 @@ from epic_report_generator.services.auth_manager import AuthManager
 logger = logging.getLogger(__name__)
 
 _MAX_RESULTS = 100
-_MAX_RETRIES = 4
-_BACKOFF_BASE = 1.0  # seconds
+_BACKOFF_BASE = 1.0  # seconds — exponential backoff base for 429 rate-limit retries
+# Progressive per-attempt request timeouts for searches: fail fast on a stale /
+# idle-reaped keep-alive socket (1s), then grant a genuinely slow server more
+# headroom on retry (3s, 5s). Each value is a scalar applied to both connect and
+# read. The tuple length is also the number of search attempts.
+_PROGRESSIVE_TIMEOUTS = (1, 3, 5)  # seconds
+_TRANSPORT_RETRY_DELAY = 0.25  # seconds — short pause before a fresh-socket retry
+# Baseline timeout for one-shot, non-search calls (myself / fields / project /
+# the raw label endpoint). Searches override this per attempt (see
+# ``_search_with_retry``); everything else inherits this ceiling.
+_DEFAULT_TIMEOUT = _PROGRESSIVE_TIMEOUTS[-1]
 # Maximum number of keys in a single JQL IN clause for subtask batching.
 # JQL supports much larger IN clauses than the pagination page size.
 _JQL_IN_BATCH_SIZE = 500
@@ -73,6 +82,9 @@ class JiraClient:
     def __init__(self, auth: AuthManager) -> None:
         self._auth = auth
         self._jira: JIRA | None = None
+        # Which auth path built the live client ("oauth" / "api_token" / None).
+        # Drives whether a 401 can self-heal via :meth:`reauthenticate`.
+        self._auth_method: str | None = None
         # Raw ``myself()`` payload captured during connection validation so the
         # login flow doesn't issue a second identical request.
         self._myself: dict[str, Any] | None = None
@@ -103,7 +115,9 @@ class JiraClient:
             self._jira = JIRA(
                 server=server,
                 options={"headers": {"Authorization": f"Bearer {token}"}},
+                timeout=_DEFAULT_TIMEOUT,
             )
+            self._auth_method = "oauth"
             self._myself = None  # fetched lazily by get_myself()
             logger.info("Connected to Jira (cloud_id=%s)", self._auth.cloud_id)
             return True
@@ -133,9 +147,12 @@ class JiraClient:
         if not cloud_id:
             logger.debug("Connecting to Jira at %s (basic auth)", url)
             try:
-                jira = JIRA(server=url, basic_auth=(email, token))
+                jira = JIRA(
+                    server=url, basic_auth=(email, token), timeout=_DEFAULT_TIMEOUT
+                )
                 self._myself = jira.myself()
                 self._jira = jira
+                self._auth_method = "api_token"
                 logger.info("Connected to Jira via basic auth (%s)", url)
                 return True
             except JIRAError as exc:
@@ -162,9 +179,12 @@ class JiraClient:
         cloud_url = f"https://api.atlassian.com/ex/jira/{cloud_id}"
         logger.debug("Connecting via cloud API URL %s", cloud_url)
         try:
-            jira = JIRA(server=cloud_url, basic_auth=(email, token))
+            jira = JIRA(
+                server=cloud_url, basic_auth=(email, token), timeout=_DEFAULT_TIMEOUT
+            )
             self._myself = jira.myself()
             self._jira = jira
+            self._auth_method = "api_token"
             # Cache cloud_id so subsequent reconnects skip the lookup
             if not self._auth.cloud_id:
                 self._auth.set_cloud_id(cloud_id)
@@ -174,6 +194,19 @@ class JiraClient:
             logger.error("Failed to connect to Jira (scoped token): %s", exc)
             self._jira = None
             return False
+
+    def reauthenticate(self) -> bool:
+        """Refresh credentials and rebuild the client after an auth failure.
+
+        Only OAuth sessions can self-heal: :meth:`connect` fetches a fresh
+        access token (the auth manager refreshes it if expired) and rebuilds the
+        client with it. API-token sessions cannot — a 401 there means a revoked
+        or invalid token — so this returns False without retrying.
+        """
+        if self._auth_method != "oauth":
+            return False
+        logger.info("Re-authenticating OAuth session after an auth failure")
+        return self.connect()
 
     @staticmethod
     def _resolve_cloud_id(instance_url: str) -> str | None:
@@ -923,7 +956,15 @@ class JiraClient:
         fields: list[str] | None = None,
         use_post: bool = False,
     ) -> list[Any]:
-        """Execute a JQL search with exponential backoff on 429.
+        """Execute a JQL search with a progressive timeout and retry policy.
+
+        Each attempt uses a longer request timeout (``_PROGRESSIVE_TIMEOUTS``):
+        the first fails fast on a stale / idle-reaped keep-alive socket, later
+        attempts grant a slow server more headroom. Retries cover transient
+        transport errors (``Timeout`` / ``ConnectionError`` — notably the
+        stalled-body read the underlying session does *not* retry), 429 rate
+        limits (exponential backoff), and a single 401 re-authentication for
+        OAuth sessions.
 
         *fields* restricts the returned field set (a projection); ``None`` keeps
         the library default of every field.  Passing a falsy *max_results* lets
@@ -934,24 +975,60 @@ class JiraClient:
         """
         if self._jira is None:
             raise RuntimeError("call connect() first")
-        for attempt in range(_MAX_RETRIES):
-            try:
-                return self._jira.search_issues(
-                    jql,
-                    startAt=start_at,
-                    maxResults=max_results,
-                    fields=fields,
-                    use_post=use_post,
-                )
-            except JIRAError as exc:
-                if exc.status_code == 429 and attempt < _MAX_RETRIES - 1:
-                    delay = _BACKOFF_BASE * (2**attempt)
-                    logger.warning("Rate limited, retrying in %.1fs", delay)
-                    time.sleep(delay)
-                    continue
-                raise
 
-        raise RuntimeError("exhausted retries for search_issues")
+        # Progressive timeout is applied by mutating the shared ResilientSession
+        # (the library hardcodes ``timeout=self.timeout`` per request and rejects
+        # a per-call override), restoring the baseline in ``finally`` so other
+        # call sites aren't left on a short timeout.
+        session = getattr(self._jira, "_session", None)
+        baseline = getattr(session, "timeout", None)
+        reauthed = False
+        attempt = 0
+        last_attempt = len(_PROGRESSIVE_TIMEOUTS) - 1
+        try:
+            while True:
+                if session is not None:
+                    session.timeout = _PROGRESSIVE_TIMEOUTS[attempt]
+                try:
+                    return self._jira.search_issues(
+                        jql,
+                        startAt=start_at,
+                        maxResults=max_results,
+                        fields=fields,
+                        use_post=use_post,
+                    )
+                except (
+                    _requests.exceptions.Timeout,
+                    _requests.exceptions.ConnectionError,
+                ) as exc:
+                    if attempt >= last_attempt:
+                        raise
+                    logger.warning(
+                        "Transport error (%s), retrying on a fresh connection",
+                        type(exc).__name__,
+                    )
+                    time.sleep(_TRANSPORT_RETRY_DELAY)
+                    attempt += 1
+                except JIRAError as exc:
+                    if exc.status_code == 429 and attempt < last_attempt:
+                        delay = _BACKOFF_BASE * (2**attempt)
+                        logger.warning("Rate limited, retrying in %.1fs", delay)
+                        time.sleep(delay)
+                        attempt += 1
+                        continue
+                    if exc.status_code == 401 and not reauthed:
+                        reauthed = True
+                        logger.warning("Auth rejected (401), re-authenticating")
+                        if self.reauthenticate():
+                            # connect() rebuilt the client — refresh our handles
+                            # and retry without consuming the timeout budget.
+                            session = getattr(self._jira, "_session", None)
+                            baseline = getattr(session, "timeout", None)
+                            continue
+                    raise
+        finally:
+            if session is not None:
+                session.timeout = baseline
 
     @staticmethod
     def _status_category(fields: Any) -> str:

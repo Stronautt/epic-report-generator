@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 from jira import JIRAError
 
 from epic_report_generator.core.jira_client import JiraClient
@@ -298,6 +299,165 @@ class TestRetryLogic:
 
         with pytest.raises(JIRAError):
             client._search_with_retry("key = X-1")
+
+
+class _RecordingSession:
+    """Stand-in for jira's ResilientSession that records timeout values.
+
+    ``_search_with_retry`` mutates ``session.timeout`` per attempt, so the
+    recorded sequence proves the progressive 1→3→5 escalation and the baseline
+    restore.
+    """
+
+    def __init__(self) -> None:
+        self.timeout: object = 5  # the baseline our JIRA(...) constructor sets
+        self.seen: list[object] = []
+
+
+def _client_with_recording_session(
+    tmp_path: Path, outcomes: list[object]
+) -> tuple[JiraClient, _RecordingSession]:
+    """Build a connected client whose ``search_issues`` plays *outcomes* in order.
+
+    Each outcome is either an ``Exception`` to raise or a value to return; the
+    session's current ``timeout`` is recorded immediately before each call.
+    """
+    client = JiraClient(_make_auth(tmp_path))
+    jira = MagicMock()
+    session = _RecordingSession()
+    jira._session = session
+    outcomes_iter = iter(outcomes)
+
+    def _search(*_args: object, **_kwargs: object) -> object:
+        session.seen.append(session.timeout)
+        outcome = next(outcomes_iter)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    jira.search_issues.side_effect = _search
+    client._jira = jira
+    return client, session
+
+
+class TestProgressiveTimeout:
+    def test_retries_on_read_timeout_and_escalates(self, tmp_path: Path) -> None:
+        """A stalled-body ReadTimeout retries on a longer timeout, then succeeds."""
+        timeout_exc = requests.exceptions.ReadTimeout("stalled body read")
+        client, session = _client_with_recording_session(
+            tmp_path, [timeout_exc, [_make_raw_issue()]]
+        )
+
+        with patch("epic_report_generator.core.jira_client.time.sleep"):
+            results = client._search_with_retry("key = X-1")
+
+        assert len(results) == 1
+        assert client._jira.search_issues.call_count == 2
+        assert session.seen == [1, 3]  # progressive 1s → 3s
+        assert session.timeout == 5  # baseline restored after success
+
+    def test_exhausts_progressive_timeouts_then_raises(self, tmp_path: Path) -> None:
+        """Persistent transport failure walks 1→3→5 then re-raises."""
+        exc = requests.exceptions.ReadTimeout("dead socket")
+        client, session = _client_with_recording_session(tmp_path, [exc, exc, exc])
+
+        with patch("epic_report_generator.core.jira_client.time.sleep"):
+            with pytest.raises(requests.exceptions.Timeout):
+                client._search_with_retry("key = X-1")
+
+        assert session.seen == [1, 3, 5]
+        assert session.timeout == 5  # baseline restored even on failure
+
+
+class TestReauthOn401:
+    def test_oauth_reauthenticates_once_then_retries(self, tmp_path: Path) -> None:
+        client = JiraClient(_make_auth(tmp_path))
+        client._jira = MagicMock()
+        client._auth_method = "oauth"
+        exc = JIRAError(status_code=401, text="Unauthorized")
+        client._jira.search_issues.side_effect = [exc, [_make_raw_issue()]]
+
+        with (
+            patch.object(client, "reauthenticate", return_value=True) as reauth,
+            patch("epic_report_generator.core.jira_client.time.sleep"),
+        ):
+            results = client._search_with_retry("key = X-1")
+
+        assert len(results) == 1
+        reauth.assert_called_once()
+        assert client._jira.search_issues.call_count == 2
+
+    def test_api_token_401_does_not_loop(self, tmp_path: Path) -> None:
+        """An API-token 401 can't self-heal — single attempt, then re-raise."""
+        client = JiraClient(_make_auth(tmp_path))
+        client._jira = MagicMock()
+        client._auth_method = "api_token"
+        client._jira.search_issues.side_effect = JIRAError(
+            status_code=401, text="Unauthorized"
+        )
+
+        with pytest.raises(JIRAError):
+            client._search_with_retry("key = X-1")
+
+        assert client._jira.search_issues.call_count == 1
+
+    def test_reauthenticate_returns_false_for_api_token(self, tmp_path: Path) -> None:
+        client = JiraClient(_make_auth(tmp_path))
+        client._auth_method = "api_token"
+        assert client.reauthenticate() is False
+
+    def test_oauth_401_on_final_attempt_still_retries(self, tmp_path: Path) -> None:
+        """A 401 surfacing only on the final attempt must still reauth and retry."""
+        from epic_report_generator.core import jira_client as jc
+
+        client = JiraClient(_make_auth(tmp_path))
+        client._jira = MagicMock()
+        client._auth_method = "oauth"
+        timeout = requests.exceptions.ReadTimeout("slow")
+        exc = JIRAError(status_code=401, text="Unauthorized")
+        # Burn every retryable attempt, then 401 on the last one before success.
+        client._jira.search_issues.side_effect = [
+            *([timeout] * (len(jc._PROGRESSIVE_TIMEOUTS) - 1)),
+            exc,
+            [_make_raw_issue()],
+        ]
+
+        with (
+            patch.object(client, "reauthenticate", return_value=True) as reauth,
+            patch("epic_report_generator.core.jira_client.time.sleep"),
+        ):
+            results = client._search_with_retry("key = X-1")
+
+        assert len(results) == 1
+        reauth.assert_called_once()
+
+
+class TestConnectTimeout:
+    def test_connect_basic_passes_timeout(self, tmp_path: Path) -> None:
+        from epic_report_generator.core import jira_client as jc
+
+        client = JiraClient(_make_auth(tmp_path))
+        fake = MagicMock()
+        fake.myself.return_value = {"displayName": "X"}
+        with patch.object(jc, "JIRA", return_value=fake) as ctor:
+            ok = client.connect_basic("https://x.atlassian.net", "e@x.com", "tok")
+
+        assert ok is True
+        assert ctor.call_args.kwargs.get("timeout") == jc._PROGRESSIVE_TIMEOUTS[-1]
+        assert client._auth_method == "api_token"
+
+    def test_connect_oauth_passes_timeout(self, tmp_path: Path) -> None:
+        from epic_report_generator.core import jira_client as jc
+
+        client = JiraClient(_make_auth(tmp_path))
+        client._auth.get_access_token = MagicMock(return_value="tok")  # type: ignore[method-assign]
+        client._auth.set_cloud_id("cid")
+        with patch.object(jc, "JIRA", return_value=MagicMock()) as ctor:
+            ok = client.connect()
+
+        assert ok is True
+        assert ctor.call_args.kwargs.get("timeout") == jc._PROGRESSIVE_TIMEOUTS[-1]
+        assert client._auth_method == "oauth"
 
 
 # ---------------------------------------------------------------------------

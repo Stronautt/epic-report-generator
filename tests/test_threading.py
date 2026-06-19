@@ -56,6 +56,43 @@ def test_progress_callback_runs_on_main_thread(qtbot):
     task.wait()
 
 
+def test_widget_building_in_callback_does_not_deadlock(qtbot):
+    """Building widgets in the result callback must not deadlock the GUI thread.
+
+    Regression for the GIL ⇄ Qt signal-slot-mutex inversion: the worker thread
+    destroying a shiboken QObject (``~QObject`` → ``PyGILState_Ensure``) while
+    the main thread held the GIL and created QLabels (``QObject::connectImpl``)
+    froze the whole app. Many rapid rounds, each constructing QLabels (which
+    build a QWidgetTextControl and run connectImpl) in the callback, exercise the
+    window where worker teardown overlaps main-thread widget creation. With the
+    fix nothing is destroyed on the worker thread, so this always completes; a
+    regression would hang and trip the timeout.
+    """
+    from PySide6.QtWidgets import QLabel
+
+    task = ThreadedTask()
+    done = {"n": 0}
+    rounds = 40
+
+    def work() -> str:
+        return "<b>payload</b>"
+
+    def on_result(result: object) -> None:
+        # QLabel(text) → QWidgetTextControl ctor → QObject::connectImpl: the exact
+        # main-thread side of the deadlock.
+        holder = [QLabel(str(result)) for _ in range(8)]
+        for lbl in holder:
+            qtbot.addWidget(lbl)
+        done["n"] += 1
+        if done["n"] < rounds:
+            task.start(work, on_result)
+
+    task.start(work, on_result)
+    qtbot.waitUntil(lambda: done["n"] >= rounds, timeout=10000)
+    assert done["n"] == rounds
+    task.wait()
+
+
 def test_capture_exceptions_delivers_exception(qtbot):
     task = ThreadedTask()
     seen: dict = {}

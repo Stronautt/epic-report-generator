@@ -49,6 +49,8 @@ def calculate_metrics(
     progress_method: str = PROGRESS_COMBINED,
     *,
     reference_date: date | None = None,
+    window_start: date | None = None,
+    window_end: date | None = None,
 ) -> EpicMetrics:
     """Compute all metrics for a single Epic from its child issues.
 
@@ -66,12 +68,26 @@ def calculate_metrics(
       weights (like combined) but without the issue-count ratio multiplier.
       Unestimated items are excluded (weight = 0.0).
 
+    *window_start* / *window_end* are the report's fixed (hard) timeline dates.
+    When set, the **time-based** metrics are capped to that window so the
+    per-epic page never reflects activity outside it: ``window_end`` caps the
+    "as of" point for velocity, forecasting, and the trend chart, while both
+    bounds scope ``avg_cycle_time`` (by resolution date) and ``scope_change``
+    (by creation date) and clip the trend chart's start.  Progress and the
+    estimate roll-ups are *not* windowed — they always reflect the full epic.
+    Leaving both ``None`` keeps the historical, unbounded behaviour exactly.
+
     Progress is computed **bottom-up**: leaf issues get 100% if Done else 0%.
     Parents aggregate their subtasks' progress via weighted average.  The epic
     progress is the weighted average of its direct children's progress.
     """
     progress_method = _normalise_progress_method(progress_method)
     reference_date = reference_date or date.today()
+    # A fixed end date caps the "as of" instant for every time-based metric
+    # (velocity lookback, forecast origin, trend-chart end) so they line up with
+    # the Gantt's fixed axis instead of running on to today.
+    if window_end is not None and window_end < reference_date:
+        reference_date = window_end
     children = epic.children
     m = EpicMetrics()
     m.estimation_unit = "Days" if estimation_method == "time_days" else "SP"
@@ -176,11 +192,19 @@ def calculate_metrics(
     m.completed_sp = completed_sp
     m.remaining_sp = total_sp - completed_sp
 
-    m.avg_cycle_time_days = _avg_cycle_time(children)
-    m.velocity_sp_per_week = _velocity(
-        children, estimation_method, weeks=4, reference_date=reference_date
+    m.avg_cycle_time_days = _avg_cycle_time(
+        children, window_start=window_start, window_end=window_end
     )
-    m.scope_change_pct = _scope_change(children)
+    m.velocity_sp_per_week = _velocity(
+        children,
+        estimation_method,
+        weeks=4,
+        reference_date=reference_date,
+        window_start=window_start,
+    )
+    m.scope_change_pct = _scope_change(
+        children, window_start=window_start, window_end=window_end
+    )
     m.blocked_issues = sum(
         1
         for c in children
@@ -191,7 +215,13 @@ def calculate_metrics(
     )
 
     # Build time-series
-    _build_time_series(m, children, estimation_method, reference_date=reference_date)
+    _build_time_series(
+        m,
+        children,
+        estimation_method,
+        reference_date=reference_date,
+        window_start=window_start,
+    )
 
     logger.debug(
         "Metrics for %s: progress=%.1f%%, %d/%d issues done, %.0f/%.0f %s",
@@ -214,6 +244,8 @@ def merge_metrics(
     include_subtask_timeline: bool = True,
     source_metrics_out: list[EpicMetrics] | None = None,
     reference_date: date | None = None,
+    window_start: date | None = None,
+    window_end: date | None = None,
 ) -> tuple[EpicData, EpicMetrics]:
     """Merge multiple epics into a single synthetic epic and compute metrics.
 
@@ -225,6 +257,11 @@ def merge_metrics(
     If *source_metrics_out* is provided (an empty list), it will be populated
     with the per-epic metrics computed during merging — one entry per epic in
     the same order as *epics*.  This avoids callers needing to recompute them.
+
+    *window_start* / *window_end* (the report's fixed timeline dates) are passed
+    through to every underlying :func:`calculate_metrics` call so both the
+    per-epic source metrics and the merged label-group metrics cap their
+    time-based figures to the fixed window.
     """
     progress_method = _normalise_progress_method(progress_method)
     reference_date = reference_date or date.today()
@@ -288,7 +325,12 @@ def merge_metrics(
     for epic in epics:
         epic_metrics_list.append(
             calculate_metrics(
-                epic, estimation_method, progress_method, reference_date=reference_date
+                epic,
+                estimation_method,
+                progress_method,
+                reference_date=reference_date,
+                window_start=window_start,
+                window_end=window_end,
             )
         )
     if source_metrics_out is not None:
@@ -296,7 +338,12 @@ def merge_metrics(
 
     # Compute the label-group metrics from the merged synthetic epic
     m = calculate_metrics(
-        synthetic, estimation_method, progress_method, reference_date=reference_date
+        synthetic,
+        estimation_method,
+        progress_method,
+        reference_date=reference_date,
+        window_start=window_start,
+        window_end=window_end,
     )
 
     # Override progress: weighted average of per-epic progress values.
@@ -436,10 +483,27 @@ def _compute_all_issue_progress(
         _compute(c)
 
 
-def _avg_cycle_time(children: list[JiraIssue]) -> float | None:
+def _avg_cycle_time(
+    children: list[JiraIssue],
+    *,
+    window_start: date | None = None,
+    window_end: date | None = None,
+) -> float | None:
+    """Average created→resolved duration (days) over Done issues.
+
+    When a fixed window is given, only issues **resolved inside** it count, so
+    the figure reflects work completed during the report period (the full
+    created→resolved span is still measured, even if it begins before the
+    window).
+    """
     durations: list[float] = []
     for c in children:
         if c.status_category == STATUS_DONE and c.created and c.resolved:
+            resolved_day = c.resolved.date()
+            if window_start is not None and resolved_day < window_start:
+                continue
+            if window_end is not None and resolved_day > window_end:
+                continue
             delta = c.resolved - c.created
             durations.append(delta.total_seconds() / _SECONDS_PER_DAY)
     return sum(durations) / len(durations) if durations else None
@@ -451,32 +515,66 @@ def _velocity(
     weeks: int = 4,
     *,
     reference_date: date | None = None,
+    window_start: date | None = None,
 ) -> float | None:
-    """Estimate completed per week over the last *weeks* weeks."""
-    cutoff_date = (reference_date or date.today()) - timedelta(weeks=weeks)
+    """Estimate completed per week over the last *weeks* weeks.
+
+    The lookback ends at *reference_date* (already capped to the fixed window
+    end by the caller) and only counts work resolved on or before it.  When
+    *window_start* falls inside the lookback, the period is clamped to it and
+    the per-week divisor shrinks to match, so a window narrower than *weeks*
+    still yields a meaningful rate rather than dividing by a period that
+    reaches outside the report.
+    """
+    ref = reference_date or date.today()
+    cutoff_date = ref - timedelta(weeks=weeks)
+    if window_start is not None and window_start > cutoff_date:
+        cutoff_date = window_start
+    period_weeks = (ref - cutoff_date).days / 7
+    if period_weeks <= 0:
+        return None
     sp = sum(
         est
         for c in children
         if (est := _get_estimate(c, estimation_method)) is not None
         and c.status_category == STATUS_DONE
         and c.resolved
-        and c.resolved.date() >= cutoff_date
+        and cutoff_date <= c.resolved.date() <= ref
     )
-    return sp / weeks if sp else None
+    return sp / period_weeks if sp else None
 
 
-def _scope_change(children: list[JiraIssue]) -> float | None:
-    """Percentage of issues added after the earliest issue."""
-    if len(children) < 2:
+def _scope_change(
+    children: list[JiraIssue],
+    *,
+    window_start: date | None = None,
+    window_end: date | None = None,
+) -> float | None:
+    """Percentage of issues added after the earliest issue.
+
+    With a fixed window, only issues **created inside** it are considered, and
+    they alone form the denominator — scope churn outside the report period is
+    neither counted nor used as the baseline.  Without a window the denominator
+    stays the full child count (legacy behaviour, undated issues included).
+    """
+    windowed = window_start is not None or window_end is not None
+    in_window = [
+        c
+        for c in children
+        if c.created is not None
+        and (window_start is None or c.created.date() >= window_start)
+        and (window_end is None or c.created.date() <= window_end)
+    ]
+    total = len(in_window) if windowed else len(children)
+    if total < 2:
         return None
-    dated = [(c, c.created) for c in children if c.created is not None]
-    dated.sort(key=lambda pair: pair[1])
+    dated = sorted(c.created for c in in_window)
     if len(dated) < 2:
         return None
-    first_created = dated[0][1]
+    first_created = dated[0]
     threshold = first_created + timedelta(days=_SCOPE_CHANGE_THRESHOLD_DAYS)
-    added_later = sum(1 for _, dt in dated if dt > threshold)
-    return (added_later / len(children)) * 100
+    added_later = sum(1 for dt in dated if dt > threshold)
+    return (added_later / total) * 100
 
 
 def _forecast(
@@ -497,17 +595,27 @@ def _build_time_series(
     estimation_method: str = "story_points",
     *,
     reference_date: date | None = None,
+    window_start: date | None = None,
 ) -> None:
     """Build daily time-series arrays for the trend chart.
 
     Uses an O(n log n + d) algorithm with sorted event lists and incremental
     pointers instead of the previous O(n × d) approach.
+
+    *window_start* clips the chart's first day to the fixed start date (the end
+    is clipped by the caller capping *reference_date* to the fixed end).  The
+    cumulative running totals carry over: because the per-day pointer admits
+    every event dated on or before the current day, the first emitted day still
+    reflects all issues created before the window — the series is zoomed to the
+    window, not recomputed as if earlier work never happened.
     """
     dated = [(c, c.created) for c in children if c.created is not None]
     if not dated:
         return
 
     min_date = min(dt for _, dt in dated).date()
+    if window_start is not None and window_start > min_date:
+        min_date = window_start
     max_date = reference_date or date.today()
     if min_date >= max_date:
         return

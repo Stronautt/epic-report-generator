@@ -4,8 +4,14 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import QTimer
-from PySide6.QtGui import QCloseEvent, QKeySequence, QPixmap, QShortcut
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import (
+    QCloseEvent,
+    QKeySequence,
+    QPixmap,
+    QResizeEvent,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -23,10 +29,17 @@ from qt_material import apply_stylesheet
 from epic_report_generator import __version__
 from epic_report_generator.core import theming
 from epic_report_generator.core.jira_client import JiraClient
+from epic_report_generator.services import install_source
 from epic_report_generator.services.auth_manager import AuthManager
 from epic_report_generator.services.config_manager import ConfigManager
 from epic_report_generator.services.font_manager import FontManager
-from epic_report_generator.ui.animations import fade_in
+from epic_report_generator.services.update_checker import (
+    RELEASES_URL,
+    UpdateChecker,
+    UpdateInfo,
+)
+from epic_report_generator.ui._threading import ThreadedTask
+from epic_report_generator.ui.animations import fade_in, pulse, stop_pulse
 from epic_report_generator.ui.help_panel import HelpPanel
 from epic_report_generator.ui.log_panel import LogPanel
 from epic_report_generator.ui.login_panel import LoginPanel
@@ -40,6 +53,21 @@ logger = logging.getLogger(__name__)
 
 class MainWindow(QMainWindow):
     """Single-window application with login overlay and sidebar navigation."""
+
+    # Window-size safety net (see _safe_window_size / resizeEvent). A restored
+    # size is clamped to at least the minimum usable layout and at most the
+    # current screen, so a stale/oversized saved value can never strand the
+    # window off-screen (title bar + resize handles unreachable) or shrink it
+    # below the point where it can be operated — an unrecoverable state.
+    _MIN_WINDOW_WIDTH = 480
+    _MIN_WINDOW_HEIGHT = 300
+    _DEFAULT_WINDOW_WIDTH = 1280
+    _DEFAULT_WINDOW_HEIGHT = 900
+    # Coalesce the burst of resizeEvents during a drag into a single disk write.
+    _GEOMETRY_SAVE_DEBOUNCE_MS = 400
+    # Class default so a resizeEvent fired before __init__ completes (e.g. from
+    # setMinimumSize) is a safe no-op rather than an AttributeError.
+    _geometry_restored: bool = False
 
     def __init__(
         self,
@@ -55,14 +83,27 @@ class MainWindow(QMainWindow):
         self._logged_in = False
         self._user_display_name = ""
         self._user_site_name = ""
+        # Update-notification state (see _setup_update_check). The accent hex is
+        # refreshed by _apply_theme and embedded in the hyperlink's inline style.
+        self._update_info: UpdateInfo | None = None
+        self._accent_hex = theming.DEFAULT_ACCENT
 
         self.setWindowTitle("Epic Report Generator")
-        self.setMinimumSize(960, 600)
-        self.resize(1280, 900)
+        self.setMinimumSize(self._MIN_WINDOW_WIDTH, self._MIN_WINDOW_HEIGHT)
+
+        # Remember the user's last window size across launches. Resizes are
+        # debounced (a drag fires many resizeEvents) into one config write; the
+        # restore runs before show() and is clamped by _safe_window_size.
+        self._geometry_save_timer = QTimer(self)
+        self._geometry_save_timer.setSingleShot(True)
+        self._geometry_save_timer.setInterval(self._GEOMETRY_SAVE_DEBOUNCE_MS)
+        self._geometry_save_timer.timeout.connect(self._persist_window_size)
+        self._restore_window_size()
 
         self._build_ui()
         self._setup_shortcuts()
         self._apply_theme(self._config.get("theme", "light"))
+        self._setup_update_check()
 
         # Restore the previous session *after* the window is shown and the
         # event loop is running, so the UI paints immediately instead of
@@ -122,6 +163,22 @@ class MainWindow(QMainWindow):
         self._version_label = QLabel(f"v{__version__}")
         self._version_label.setObjectName("sidebarVersion")
         footer_layout.addWidget(self._version_label)
+
+        # Update CTA, directly below the version — a blinking accent hyperlink
+        # (not a button) hidden until the hourly check finds a newer GitHub
+        # release. Rich text so the <a> reads as a real link (accent colour +
+        # underline come from its inline style); clicking opens the latest-
+        # release page in the browser (setOpenExternalLinks). See
+        # _render_update_link for the show/blink logic.
+        self._update_link = QLabel()
+        self._update_link.setObjectName("sidebarUpdateLink")
+        self._update_link.setTextFormat(Qt.TextFormat.RichText)
+        self._update_link.setOpenExternalLinks(True)
+        self._update_link.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._update_link.setToolTip("A newer version is available — click to download")
+        self._update_link.hide()
+        self._update_url = RELEASES_URL
+        footer_layout.addWidget(self._update_link)
 
         self._copyright_label = QLabel("© Olha & Pavlo")
         self._copyright_label.setObjectName("sidebarCopyright")
@@ -283,10 +340,80 @@ class MainWindow(QMainWindow):
         for btn in self._nav_buttons:
             btn.setEnabled(enabled)
 
+    # -- window geometry ------------------------------------------------------
+
+    def _restore_window_size(self) -> None:
+        """Restore the last saved window size, clamped to a safe range."""
+        width = self._config.get("window_width", self._DEFAULT_WINDOW_WIDTH)
+        height = self._config.get("window_height", self._DEFAULT_WINDOW_HEIGHT)
+        width, height = self._safe_window_size(width, height)
+        self.resize(width, height)
+        self._geometry_restored = True
+
+    def _safe_window_size(self, width: object, height: object) -> tuple[int, int]:
+        """Clamp a (possibly stale or corrupt) size to a usable, on-screen range.
+
+        The safety net against an unrecoverable window: the lower bound is the
+        minimum usable layout, the upper bound is the current screen's available
+        area. A non-numeric or otherwise unusable value falls back to the
+        defaults. This catches both a saved size larger than the screen (e.g.
+        after moving from a big external monitor to a laptop, which would leave
+        the title bar and resize handles off-screen) and one too small to
+        operate.
+        """
+        try:
+            safe_width = int(width)
+            safe_height = int(height)
+        except (TypeError, ValueError):
+            return self._DEFAULT_WINDOW_WIDTH, self._DEFAULT_WINDOW_HEIGHT
+
+        safe_width = max(safe_width, self._MIN_WINDOW_WIDTH)
+        safe_height = max(safe_height, self._MIN_WINDOW_HEIGHT)
+
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            safe_width = min(safe_width, available.width())
+            safe_height = min(safe_height, available.height())
+
+        return safe_width, safe_height
+
+    def _persist_window_size(self) -> None:
+        """Save the current windowed size as the size to restore next launch."""
+        size = self.size()
+        self._config.update(
+            {"window_width": size.width(), "window_height": size.height()}
+        )
+
+    def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802
+        """Remember genuine user resizes (debounced); ignore programmatic ones.
+
+        Only spontaneous, windowed resizes are persisted: the programmatic
+        restore in ``__init__`` and any maximized/fullscreen state are skipped so
+        the remembered value is always a real, restorable windowed size.
+        """
+        super().resizeEvent(event)
+        if (
+            self._geometry_restored
+            and event.spontaneous()
+            and not self.isMaximized()
+            and not self.isFullScreen()
+        ):
+            self._geometry_save_timer.start()
+
     # -- cleanup --------------------------------------------------------------
 
     def closeEvent(self, event: QCloseEvent) -> None:
         """Shut down background threads before the window is destroyed."""
+        # Flush a window size that was resized within the debounce window just
+        # before closing, so the very last size is still remembered.
+        if self._geometry_save_timer.isActive():
+            self._geometry_save_timer.stop()
+            self._persist_window_size()
+        if self._update_timer is not None:
+            self._update_timer.stop()
+        if self._update_task is not None:
+            self._update_task.wait()
         self._login_panel.shutdown()
         self._report_panel.preview_panel.shutdown()
         self._report_panel.config_panel.shutdown()
@@ -330,6 +457,13 @@ class MainWindow(QMainWindow):
             extra.update(theming.qt_material_extra(accent, is_dark))
             shades = theming.qt_shades(accent, is_dark)
 
+        # The accent hex used by the update hyperlink's inline <a> colour — the
+        # same shade the QSS @ACCENT@ token resolves to, so the link matches the
+        # rest of the accented UI under both stock and custom accents.
+        self._accent_hex = (
+            shades or theming.qt_shades(theming.DEFAULT_ACCENT, is_dark)
+        )["accent"]
+
         theme_xml = self._MATERIAL_THEMES.get(theme, self._MATERIAL_THEMES["light"])
 
         # ``apply_stylesheet`` re-polishes the entire widget tree (~0.5s on a
@@ -358,6 +492,104 @@ class MainWindow(QMainWindow):
         self._report_panel.set_dark(is_dark)
         self._help_panel.set_dark(is_dark)
 
+        # Re-tint the update hyperlink (if shown) for the new accent — its colour
+        # lives in inline HTML, so a QSS re-apply alone wouldn't update it.
+        self._render_update_link()
+
     def _on_appearance_changed(self) -> None:
         """Re-apply the current theme after accent/font customization."""
         self._apply_theme(self._config.get("theme", "light"))
+
+    # -- update check ---------------------------------------------------------
+
+    # Poll GitHub for a newer release once an hour. Each check hits GitHub
+    # fresh — there is no local cache.
+    _UPDATE_CHECK_INTERVAL_MS = 60 * 60 * 1000
+    # Hold the first network check until well after the window has painted and
+    # session restore is under way, so the background poll never adds to startup
+    # latency. (The work is already off-thread; this just keeps t=0 quiet.)
+    _UPDATE_CHECK_STARTUP_DELAY_MS = 3000
+
+    def _setup_update_check(self) -> None:
+        """Check for updates shortly after launch, then hourly — never blocking.
+
+        There is no cache: the only network call (``UpdateChecker.fetch``) runs
+        on a worker thread, kicked off via a delayed timer after the UI is
+        interactive, so every launch reflects GitHub's current state.
+
+        Skipped entirely for store installs (Mac App Store / Microsoft Store /
+        Snap / Flatpak), which manage updates themselves — no checker, no timer,
+        no link. The attributes stay ``None`` so the lifecycle hooks no-op.
+        """
+        self._update_checker: UpdateChecker | None = None
+        self._update_task: ThreadedTask | None = None
+        self._update_timer: QTimer | None = None
+
+        store = install_source.store_source()
+        if store:
+            logger.info("Installed via %s — self-update check disabled", store)
+            return
+
+        self._update_checker = UpdateChecker(__version__)
+        self._update_task = ThreadedTask(self)
+        self._update_timer = QTimer(self)
+        self._update_timer.setInterval(self._UPDATE_CHECK_INTERVAL_MS)
+        self._update_timer.timeout.connect(self._check_for_updates)
+
+        # Defer the first check so it never competes with the first paint /
+        # session restore, then repeat hourly. Each call hits GitHub fresh.
+        QTimer.singleShot(self._UPDATE_CHECK_STARTUP_DELAY_MS, self._check_for_updates)
+        self._update_timer.start()
+
+    def _check_for_updates(self) -> None:
+        """Run a fresh update check on a worker thread (no caching, no blocking)."""
+        if self._update_checker is None or self._update_task is None:
+            return  # store install — update checks disabled
+        self._update_task.start(
+            self._update_checker.fetch,
+            self._on_update_fetched,
+            capture_exceptions=True,
+        )
+
+    def _on_update_fetched(self, info: object) -> None:
+        """Apply a finished fetch on the main thread.
+
+        A definitive :class:`UpdateInfo` updates the UI — showing the link when
+        an update is available, hiding it otherwise (incl. the 404 "no published
+        release" case). A transient failure (``None`` / an exception) is ignored
+        so the link doesn't flap; the next check (hourly or next launch) retries.
+        """
+        if isinstance(info, UpdateInfo):
+            self._apply_update_info(info)
+
+    def _apply_update_info(self, info: UpdateInfo) -> None:
+        """Store a finished update check and refresh the hyperlink."""
+        self._update_info = info
+        self._render_update_link()
+
+    def _render_update_link(self) -> None:
+        """Show (and slowly blink) or hide the Update hyperlink for the state.
+
+        The link text carries the accent colour and the release URL inline, so
+        this is also the single place that re-tints it after an accent change.
+        The blink is started only on the hidden→shown transition so a theme
+        re-apply doesn't restart it.
+        """
+        info = self._update_info
+        if info is not None and info.update_available and info.html_url:
+            self._update_url = info.html_url
+            self._update_link.setText(
+                f'<a href="{info.html_url}" '
+                f'style="color:{self._accent_hex}; text-decoration:underline;">'
+                f"Update available</a>"
+            )
+            self._update_link.setToolTip(
+                f"Version {info.latest_version} is available — click to download"
+            )
+            if self._update_link.isHidden():
+                self._update_link.show()
+                # Slow, gentle pulse so it draws the eye without nagging.
+                pulse(self._update_link, duration=2200, min_opacity=0.2)
+        elif not self._update_link.isHidden():
+            stop_pulse(self._update_link)
+            self._update_link.hide()

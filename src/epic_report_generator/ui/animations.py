@@ -8,6 +8,8 @@ shared by any widget.  The motion primitives cover the whole app:
   and :class:`~epic_report_generator.ui.widgets.GuideStep`.
 * :func:`fade_in` / :func:`grow_in` — one-shot transitions for panel switches
   and freshly inserted rows.
+* :func:`pulse` / :func:`stop_pulse` — a looping opacity blink that draws
+  attention to a control (e.g. the sidebar "Update available" button).
 * :func:`flash_highlight` / :func:`lifted_card_pixmap` — drag-and-drop feedback:
   a fading highlight when a row settles, and a lifted "card" image under the
   cursor while it is being dragged.
@@ -156,6 +158,50 @@ def fade_in(widget: QWidget, *, duration: int = 180) -> QPropertyAnimation:
     widget._fade_anim = anim  # type: ignore[attr-defined]
     anim.start()
     return anim
+
+
+def pulse(
+    widget: QWidget,
+    *,
+    duration: int = 850,
+    min_opacity: float = 0.3,
+) -> QPropertyAnimation:
+    """Make *widget* blink by looping its opacity, to draw attention.
+
+    A persistent :class:`QGraphicsOpacityEffect` fades the widget between full
+    and *min_opacity* and back, forever (``setLoopCount(-1)``). The animation is
+    stored on the widget so it survives garbage collection; call
+    :func:`stop_pulse` to end it and restore full opacity. Calling ``pulse``
+    again first stops any existing pulse, so it is idempotent.
+    """
+    stop_pulse(widget)
+
+    effect = QGraphicsOpacityEffect(widget)
+    widget.setGraphicsEffect(effect)
+
+    anim = QPropertyAnimation(effect, b"opacity", widget)
+    anim.setDuration(duration)
+    anim.setStartValue(1.0)
+    anim.setKeyValueAt(0.5, min_opacity)
+    anim.setEndValue(1.0)
+    anim.setEasingCurve(QEasingCurve.Type.InOutSine)
+    anim.setLoopCount(-1)
+    # Keep references so neither the animation nor its effect is collected.
+    widget._pulse_anim = anim  # type: ignore[attr-defined]
+    widget._pulse_effect = effect  # type: ignore[attr-defined]
+    anim.start()
+    return anim
+
+
+def stop_pulse(widget: QWidget) -> None:
+    """Stop a running :func:`pulse` on *widget* and restore full opacity."""
+    anim = getattr(widget, "_pulse_anim", None)
+    if anim is not None:
+        anim.stop()
+        widget._pulse_anim = None  # type: ignore[attr-defined]
+    if getattr(widget, "_pulse_effect", None) is not None:
+        widget.setGraphicsEffect(None)
+        widget._pulse_effect = None  # type: ignore[attr-defined]
 
 
 def grow_in(

@@ -397,7 +397,12 @@ class LoginPanel(QWidget):
             def _restore_oauth() -> bool:
                 # Token refresh + handshake are blocking network calls.
                 token = self._auth.get_access_token()
-                return bool(token) and self._jira.connect()
+                if not token or not self._jira.connect():
+                    return False
+                # Warm the myself() cache here so the main-thread success path
+                # (which reuses it) issues no further network call.
+                self._jira.get_myself()
+                return True
 
             self._tasks.start(
                 _restore_oauth, self._on_oauth_restore_done, capture_exceptions=True
@@ -571,10 +576,8 @@ class LoginPanel(QWidget):
         self._tasks.wait()
 
     def _on_login_finished(self, result: dict | None) -> None:
-        self._login_btn.setEnabled(True)
-        self._login_btn.setText("Login with Atlassian")
-
         if result is None:
+            self._reset_login_button()
             logger.error("Login failed — authorization timed out or was denied")
             QMessageBox.warning(
                 self,
@@ -587,6 +590,7 @@ class LoginPanel(QWidget):
         if "sites" in result:
             sites = result["sites"]
             if not sites:
+                self._reset_login_button()
                 logger.error("OAuth succeeded but no accessible Jira sites returned")
                 QMessageBox.warning(
                     self,
@@ -598,17 +602,48 @@ class LoginPanel(QWidget):
             # multi-site picker is out of scope.
             self._auth.select_site(sites[0])
 
-        if self._jira.connect():
-            logger.info("OAuth login successful")
-            self._on_login_success()
-        else:
+        # Establish the connection and fetch the profile off the UI thread — both
+        # are blocking network calls and must never run on the main loop.
+        self._login_btn.setText("Connecting…")
+
+        def _connect_and_identify() -> tuple[bool, dict | None]:
+            if not self._jira.connect():
+                return (False, None)
+            return (True, self._jira.get_myself())
+
+        self._tasks.start(
+            _connect_and_identify, self._on_oauth_connected, capture_exceptions=True
+        )
+
+    def _on_oauth_connected(self, result: object) -> None:
+        """Finish OAuth login on the UI thread once the handshake returns."""
+        self._reset_login_button()
+        if isinstance(result, Exception):
+            logger.error("Jira connection failed after OAuth login: %s", result)
+            QMessageBox.warning(self, "Connection Failed", "Could not connect to Jira.")
+            return
+        ok, me = result  # type: ignore[misc]
+        if not ok:
             logger.error("Jira connection failed after OAuth login")
             QMessageBox.warning(self, "Connection Failed", "Could not connect to Jira.")
+            return
+        logger.info("OAuth login successful")
+        self._on_login_success(me)
+
+    def _reset_login_button(self) -> None:
+        """Restore the OAuth login button to its idle state."""
+        self._login_btn.setEnabled(True)
+        self._login_btn.setText("Login with Atlassian")
 
     # -- shared success path --------------------------------------------------
 
-    def _on_login_success(self) -> None:
-        me = self._jira.get_myself()
+    def _on_login_success(self, me: dict | None = None) -> None:
+        # *me* is the pre-fetched profile from a worker thread (OAuth login). The
+        # API-token and session-restore callers pass nothing; for them
+        # get_myself() returns the payload cached during the (threaded) connect,
+        # so this stays off the network on the main loop.
+        if me is None:
+            me = self._jira.get_myself()
         display_name = me.get("displayName", "User") if me else "User"
         avatar_url = me.get("avatarUrl", "") if me else ""
         site = self._auth.site_name or "Jira Cloud"

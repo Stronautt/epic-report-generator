@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
-from epic_report_generator.core.data_models import EpicData, JiraIssue
+from epic_report_generator.core.data_models import EpicData, EpicMetrics, JiraIssue
 from epic_report_generator.core.metrics import (
     PROGRESS_COMBINED,
     PROGRESS_ESTIMATES_ONLY,
@@ -655,3 +655,193 @@ class TestEstimatesOnlyProgress:
         # Estimates Only: 50.0 (no issue ratio)
         assert m_combined.progress == pytest.approx(25.0)
         assert m_estimates.progress == pytest.approx(50.0)
+
+
+class TestFixedDateWindow:
+    """Fixed (hard) timeline dates cap the per-epic time-based metrics.
+
+    ``window_start`` / ``window_end`` mirror ``ReportConfig.timeline_hard_start``
+    / ``timeline_hard_end``.  They must bound velocity, cycle time, scope change,
+    the forecast origin, and the trend chart — without touching progress or the
+    estimate roll-ups, which always reflect the whole epic.
+    """
+
+    REF = date(2024, 6, 15)
+    WIN_START = date(2024, 5, 1)
+    WIN_END = date(2024, 6, 1)
+
+    @staticmethod
+    def _dt(d: date) -> datetime:
+        return datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+
+    def test_velocity_excludes_resolutions_past_window_end(self) -> None:
+        children = [
+            _make_issue(
+                "IN",
+                "Done",
+                8.0,
+                created=self._dt(date(2024, 5, 10)),
+                resolved=self._dt(date(2024, 5, 20)),  # inside window
+            ),
+            _make_issue(
+                "OUT",
+                "Done",
+                4.0,
+                created=self._dt(date(2024, 5, 10)),
+                resolved=self._dt(date(2024, 6, 10)),  # after window end (6-1)
+            ),
+        ]
+        epic = _make_epic(children)
+        unbounded = calculate_metrics(epic, reference_date=self.REF)
+        bounded = calculate_metrics(
+            epic,
+            reference_date=self.REF,
+            window_start=self.WIN_START,
+            window_end=self.WIN_END,
+        )
+        # Unbounded: both resolved within 4wk of 6-15 → 12 SP / 4wk = 3.0.
+        assert unbounded.velocity_sp_per_week == pytest.approx(3.0)
+        # Bounded: "as of" 6-1, cutoff 5-4 (window_start 5-1 is earlier) → only
+        # the 8 SP resolved 5-20 counts; OUT resolved 6-10 is past the end.
+        # 8 SP / 4wk = 2.0.
+        assert bounded.velocity_sp_per_week == pytest.approx(2.0)
+
+    def test_cycle_time_counts_only_resolutions_in_window(self) -> None:
+        children = [
+            _make_issue(
+                "IN",
+                "Done",
+                3.0,
+                created=self._dt(date(2024, 5, 10)),
+                resolved=self._dt(date(2024, 5, 20)),  # 10d cycle, inside window
+            ),
+            _make_issue(
+                "OUT",
+                "Done",
+                3.0,
+                created=self._dt(date(2024, 6, 1)),
+                resolved=self._dt(date(2024, 6, 10)),  # resolved after window end
+            ),
+        ]
+        epic = _make_epic(children)
+        bounded = calculate_metrics(
+            epic,
+            reference_date=self.REF,
+            window_start=self.WIN_START,
+            window_end=self.WIN_END,
+        )
+        # Only IN's 10-day cycle is in scope.
+        assert bounded.avg_cycle_time_days == pytest.approx(10.0, abs=0.1)
+
+    def test_trend_chart_clipped_to_window_with_carryover(self) -> None:
+        children = [
+            _make_issue(
+                "EARLY",
+                "To Do",
+                5.0,
+                created=self._dt(date(2024, 4, 1)),  # before window start (5-1)
+            ),
+            _make_issue(
+                "MID",
+                "To Do",
+                3.0,
+                created=self._dt(date(2024, 5, 15)),  # inside window
+            ),
+        ]
+        epic = _make_epic(children)
+        bounded = calculate_metrics(
+            epic,
+            reference_date=self.REF,
+            window_start=self.WIN_START,
+            window_end=self.WIN_END,
+        )
+        # Series is zoomed to [window_start, window_end].
+        assert bounded.dates[0] == self.WIN_START
+        assert bounded.dates[-1] == self.WIN_END
+        # Carry-over: the pre-window EARLY issue is already counted on day one.
+        assert bounded.total_sp_over_time[0] == pytest.approx(5.0)
+        # MID joins by the window end → both issues counted.
+        assert bounded.total_sp_over_time[-1] == pytest.approx(8.0)
+
+    def test_scope_change_windowed(self) -> None:
+        children = [
+            _make_issue("A", "To Do", 1.0, created=self._dt(date(2024, 5, 1))),
+            _make_issue(
+                "B", "To Do", 1.0, created=self._dt(date(2024, 5, 20))
+            ),  # added well after A, inside window
+            _make_issue(
+                "C", "To Do", 1.0, created=self._dt(date(2024, 7, 1))
+            ),  # created after window end → out of scope
+        ]
+        epic = _make_epic(children)
+        bounded = calculate_metrics(
+            epic,
+            reference_date=self.REF,
+            window_start=self.WIN_START,
+            window_end=self.WIN_END,
+        )
+        # In-window set = {A, B}; B is >7d after A → 1/2 = 50%.
+        assert bounded.scope_change_pct == pytest.approx(50.0)
+
+    def test_no_window_matches_unbounded(self) -> None:
+        """Passing ``None`` windows is identical to omitting them entirely."""
+        children = [
+            _make_issue(
+                "T-1",
+                "Done",
+                8.0,
+                created=self._dt(date(2024, 5, 1)),
+                resolved=self._dt(date(2024, 6, 1)),
+            ),
+            _make_issue("T-2", "To Do", 4.0, created=self._dt(date(2024, 5, 1))),
+        ]
+        epic = _make_epic(children)
+        base = calculate_metrics(epic, reference_date=self.REF)
+        explicit_none = calculate_metrics(
+            epic, reference_date=self.REF, window_start=None, window_end=None
+        )
+        assert explicit_none.velocity_sp_per_week == base.velocity_sp_per_week
+        assert explicit_none.avg_cycle_time_days == base.avg_cycle_time_days
+        assert explicit_none.scope_change_pct == base.scope_change_pct
+        assert explicit_none.dates == base.dates
+        assert explicit_none.total_sp_over_time == base.total_sp_over_time
+
+    def test_merge_metrics_threads_window(self) -> None:
+        """``merge_metrics`` caps both source and merged metrics to the window."""
+        epic_a = EpicData(
+            key="A-1",
+            summary="Epic A",
+            status="In Progress",
+            priority=None,
+            assignee=None,
+            reporter=None,
+            created=self._dt(date(2024, 4, 1)),
+            updated=self._dt(self.REF),
+            children=[
+                _make_issue(
+                    "A-IN",
+                    "Done",
+                    8.0,
+                    created=self._dt(date(2024, 5, 10)),
+                    resolved=self._dt(date(2024, 5, 20)),
+                ),
+                _make_issue(
+                    "A-OUT",
+                    "Done",
+                    4.0,
+                    created=self._dt(date(2024, 5, 10)),
+                    resolved=self._dt(date(2024, 6, 10)),  # past window end
+                ),
+            ],
+        )
+        per_epic: list[EpicMetrics] = []
+        _, merged = merge_metrics(
+            [epic_a],
+            reference_date=self.REF,
+            window_start=self.WIN_START,
+            window_end=self.WIN_END,
+            source_metrics_out=per_epic,
+        )
+        # Source-epic and merged velocity both exclude the past-window resolution.
+        assert per_epic[0].velocity_sp_per_week == pytest.approx(2.0)
+        assert merged.velocity_sp_per_week == pytest.approx(2.0)

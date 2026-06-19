@@ -28,13 +28,13 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QCompleter,
     QDialog,
     QDialogButtonBox,
     QFrame,
     QGraphicsOpacityEffect,
-    QGridLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -509,22 +509,57 @@ def _coerce_overrides(raw: dict | None) -> dict[str, ChildOverride]:
     """Normalise persisted/in-memory override data into ``ChildOverride`` objects.
 
     Accepts either a mapping of key → ``ChildOverride`` or key → plain dict
-    (as stored in config JSON), dropping entries with no actual override.
+    (as stored in config JSON), dropping entries with no actual override. Nested
+    ``child_overrides`` (an epic child's own story/task customisation) are
+    coerced recursively. ``include`` defaults to ``True`` for older configs.
     """
     result: dict[str, ChildOverride] = {}
     for key, value in (raw or {}).items():
         if isinstance(value, ChildOverride):
             display_name = value.display_name
             certainty = value.scope_certainty
+            include = value.include
+            nested = _coerce_overrides(value.child_overrides)
+            order = list(value.child_order)
         else:
-            display_name = (value or {}).get("display_name", "")
-            certainty = (value or {}).get("scope_certainty") or None
+            value = value or {}
+            display_name = value.get("display_name", "")
+            certainty = value.get("scope_certainty") or None
+            include = bool(value.get("include", True))
+            nested = _coerce_overrides(value.get("child_overrides"))
+            order = list(value.get("child_order") or [])
         display_name = (display_name or "").strip()
-        if display_name or certainty:
+        if display_name or certainty or not include or nested or order:
             result[key] = ChildOverride(
-                display_name=display_name, scope_certainty=certainty
+                display_name=display_name,
+                scope_certainty=certainty,
+                include=include,
+                child_overrides=nested,
+                child_order=order,
             )
     return result
+
+
+def _serialize_override(ov: ChildOverride) -> dict:
+    """Serialize a ``ChildOverride`` to a compact JSON-able dict for persistence.
+
+    Default-valued fields are omitted so the stored shape stays minimal (and
+    backward-compatible with the original ``display_name``/``scope_certainty``
+    pair). Nested overrides are serialized recursively.
+    """
+    d: dict = {
+        "display_name": ov.display_name,
+        "scope_certainty": ov.scope_certainty or "",
+    }
+    if not ov.include:
+        d["include"] = False
+    if ov.child_overrides:
+        d["child_overrides"] = {
+            k: _serialize_override(v) for k, v in ov.child_overrides.items()
+        }
+    if ov.child_order:
+        d["child_order"] = list(ov.child_order)
+    return d
 
 
 # ---------------------------------------------------------------------------
@@ -596,6 +631,7 @@ class _ReportItemRow(QWidget):
         display_name: str = "",
         scope_certainty: str = "",
         child_overrides: dict | None = None,
+        child_order: list[str] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -607,6 +643,8 @@ class _ReportItemRow(QWidget):
         self._child_overrides: dict[str, ChildOverride] = _coerce_overrides(
             child_overrides
         )
+        # User-chosen child display order (child keys); see ReportItem.child_order.
+        self._child_order: list[str] = list(child_order or [])
         self._initialised = False
         self._validation_state = ""
         layout = QHBoxLayout(self)
@@ -712,8 +750,9 @@ class _ReportItemRow(QWidget):
         match the new kind's children, so clear them on a genuine user toggle
         (skipped during construction/restore where kind is set silently).
         """
-        if self._initialised and self._child_overrides:
+        if self._initialised and (self._child_overrides or self._child_order):
             self._child_overrides = {}
+            self._child_order = []
 
     def set_validation(self, state: str) -> None:
         """Flag (or clear) a validation problem on this row.
@@ -751,15 +790,21 @@ class _ReportItemRow(QWidget):
         return self.certainty_combo.currentData() or ""
 
     def get_child_overrides(self) -> dict[str, ChildOverride]:
-        """Return a copy of the per-child overrides."""
-        return {
-            k: ChildOverride(v.display_name, v.scope_certainty)
-            for k, v in self._child_overrides.items()
-        }
+        """Return a deep copy of the per-child overrides (incl. include + nested)."""
+        return _coerce_overrides(self._child_overrides)
 
     def set_child_overrides(self, overrides: dict[str, ChildOverride]) -> None:
         """Replace the per-child overrides and signal a change for persistence."""
         self._child_overrides = _coerce_overrides(overrides)
+        self.changed.emit()
+
+    def get_child_order(self) -> list[str]:
+        """Return a copy of the user-chosen child display order (child keys)."""
+        return list(self._child_order)
+
+    def set_child_order(self, order: list[str]) -> None:
+        """Replace the child display order and signal a change for persistence."""
+        self._child_order = list(order)
         self.changed.emit()
 
     def to_report_item(self) -> ReportItem | None:
@@ -778,6 +823,7 @@ class _ReportItemRow(QWidget):
             display_name=display_name,
             scope_certainty=certainty,
             child_overrides=self.get_child_overrides(),
+            child_order=list(self._child_order),
         )
 
     def to_dict(self) -> dict:
@@ -789,12 +835,9 @@ class _ReportItemRow(QWidget):
             "display_name": self.name_edit.text().strip() if kind == "label" else "",
             "scope_certainty": self.certainty_combo.currentData() or "",
             "child_overrides": {
-                k: {
-                    "display_name": ov.display_name,
-                    "scope_certainty": ov.scope_certainty or "",
-                }
-                for k, ov in self._child_overrides.items()
+                k: _serialize_override(ov) for k, ov in self._child_overrides.items()
             },
+            "child_order": list(self._child_order),
         }
 
 
@@ -858,9 +901,12 @@ class ReportItemTable(QWidget):
         display_name: str = "",
         scope_certainty: str = "",
         child_overrides: dict | None = None,
+        child_order: list[str] | None = None,
     ) -> _ReportItemRow:
         """Add a new row to the table."""
-        row = _ReportItemRow(kind, key, display_name, scope_certainty, child_overrides)
+        row = _ReportItemRow(
+            kind, key, display_name, scope_certainty, child_overrides, child_order
+        )
         if self._label_completions:
             row.set_label_completions(self._label_completions)
         row.removed.connect(self._remove_row)
@@ -1008,6 +1054,7 @@ class ReportItemTable(QWidget):
                 display_name=d.get("display_name", ""),
                 scope_certainty=d.get("scope_certainty", ""),
                 child_overrides=d.get("child_overrides"),
+                child_order=d.get("child_order"),
             )
         self.blockSignals(False)
         self.items_changed.emit()
@@ -1036,6 +1083,330 @@ class ReportItemTable(QWidget):
 # ---------------------------------------------------------------------------
 
 
+# Per-row column geometry, shared by the header and every _ChildRow so they line
+# up: drag-handle width, key min-width, include-checkbox width, certainty combo
+# width, settings (gear) button width.
+_CHILD_HANDLE_W = 18
+_CHILD_KEY_W = 90
+_CHILD_INCL_W = 44
+_CHILD_CERT_W = 70
+_CHILD_SETTINGS_W = 22
+
+
+def _order_children(
+    children: list[tuple[str, str]], child_order: list[str]
+) -> list[tuple[str, str]]:
+    """Return *children* sorted by *child_order* (saved drag order).
+
+    Children whose key appears in *child_order* come first, in that order; any
+    child not listed (e.g. newly added in Jira since the order was saved) keeps
+    its fetched position and is appended after the ordered ones. An empty
+    *child_order* leaves the fetched order untouched.
+    """
+    if not child_order:
+        return list(children)
+    rank = {key: i for i, key in enumerate(child_order)}
+    known = sorted((c for c in children if c[0] in rank), key=lambda c: rank[c[0]])
+    unknown = [c for c in children if c[0] not in rank]
+    return [*known, *unknown]
+
+
+class _ChildRow(QWidget):
+    """A single reorderable row in :class:`ChildCustomizeDialog`.
+
+    Carries a drag handle, the child's key + summary (read-only), an always-
+    visible display-name editor (placeholder = the Jira summary), an **Include**
+    checkbox (default on; unchecking excludes the child from the report) and a
+    certainty combo. When *show_settings* is set (epic children of a label item)
+    a **gear** button opens a nested customize dialog for that epic's own
+    stories/tasks; the nested overrides ride along on this row. Drag initiation
+    is confined to the handle so the line edit and combo stay interactive.
+    """
+
+    drag_started = Signal(object)  # emits self when the drag handle is dragged
+    settings_requested = Signal(object)  # emits self when the gear is clicked
+
+    def __init__(
+        self,
+        key: str,
+        summary: str,
+        override: ChildOverride | None,
+        *,
+        cert_locked: bool,
+        parent_certainty: str,
+        show_settings: bool = False,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.key = key
+        self.summary = summary
+        self._cert_locked = cert_locked
+        self._parent_certainty = parent_certainty
+        # Nested per-story/task customisation for an epic child (see ChildOverride).
+        self._nested_overrides: dict[str, ChildOverride] = (
+            _coerce_overrides(override.child_overrides) if override else {}
+        )
+        self._nested_order: list[str] = list(override.child_order) if override else []
+        self.setObjectName("childRow")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 2, 0, 2)
+        layout.setSpacing(8)
+
+        self.drag_handle = _DragHandle()
+        self.drag_handle.drag_requested.connect(lambda: self.drag_started.emit(self))
+        layout.addWidget(self.drag_handle)
+
+        self._key_lbl = QLabel(key)
+        self._key_lbl.setMinimumWidth(_CHILD_KEY_W)
+        self._key_lbl.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        layout.addWidget(self._key_lbl)
+
+        self._sum_lbl = QLabel(summary or "")
+        self._sum_lbl.setToolTip(summary or "")
+        # Ignored width lets a long summary clip to its column instead of widening
+        # the dialog; the full text stays available via tooltip + the placeholder.
+        self._sum_lbl.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        self._sum_lbl.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        layout.addWidget(self._sum_lbl, 1)
+
+        self.name_edit = QLineEdit(override.display_name if override else "")
+        self.name_edit.setPlaceholderText(summary or "Display name")
+        layout.addWidget(self.name_edit, 1)
+
+        # Include checkbox — on by default; unchecking excludes this child.
+        self.include_check = QCheckBox()
+        self.include_check.setChecked(override.include if override else True)
+        self.include_check.setToolTip("Include this item in the report")
+        self.include_check.setFixedWidth(_CHILD_INCL_W)
+        self.include_check.toggled.connect(self._sync_enabled)
+        layout.addWidget(self.include_check, 0, Qt.AlignmentFlag.AlignCenter)
+
+        self.cert_combo = QComboBox()
+        no_scroll_wheel(self.cert_combo)
+        for label, data in _CERT_ITEMS:
+            self.cert_combo.addItem(label, data)
+        self.cert_combo.setFixedWidth(_CHILD_CERT_W)
+        if cert_locked:
+            idx = self.cert_combo.findData(parent_certainty)
+            self.cert_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            self.cert_combo.setEnabled(False)
+        elif override and override.scope_certainty:
+            idx = self.cert_combo.findData(override.scope_certainty)
+            if idx >= 0:
+                self.cert_combo.setCurrentIndex(idx)
+        layout.addWidget(self.cert_combo)
+
+        # Per-epic settings gear (label items only) — opens a nested dialog for
+        # this epic's stories/tasks, mirroring the main item's customize button.
+        self.settings_btn: QPushButton | None = None
+        if show_settings:
+            self.settings_btn = _icon_btn(
+                "⚙",
+                "Customize the stories/tasks within this epic",
+                "#0052CC",
+                "#003C99",
+            )
+            self.settings_btn.clicked.connect(
+                lambda: self.settings_requested.emit(self)
+            )
+            layout.addWidget(self.settings_btn)
+
+        self._sync_enabled(self.include_check.isChecked())
+
+    def _sync_enabled(self, included: bool) -> None:
+        """Mute the row and lock its controls when it is excluded from the report."""
+        self.name_edit.setEnabled(included)
+        if not self._cert_locked:
+            self.cert_combo.setEnabled(included)
+        if self.settings_btn is not None:
+            self.settings_btn.setEnabled(included)
+        # Mute the key/summary text and disable dragging so an excluded row reads
+        # plainly as "left out" rather than as a normal, reorderable entry.
+        muted = "QLabel { color: #999; }" if not included else ""
+        self._key_lbl.setStyleSheet(muted)
+        self._sum_lbl.setStyleSheet(muted)
+        self.drag_handle.setEnabled(included)
+
+    def effective_certainty(self) -> str:
+        """Certainty that governs this row's own children (for a nested dialog).
+
+        A locked row hands down the parent's value; otherwise its own combo
+        selection wins (``""`` when left at "--", i.e. consolidated).
+        """
+        if self._cert_locked:
+            return self._parent_certainty
+        return self.cert_combo.currentData() or ""
+
+    def get_nested_overrides(self) -> dict[str, ChildOverride]:
+        """Return a copy of this epic child's per-story/task overrides."""
+        return _coerce_overrides(self._nested_overrides)
+
+    def nested_order(self) -> list[str]:
+        """Return this epic child's chosen story/task display order."""
+        return list(self._nested_order)
+
+    def set_nested(self, overrides: dict[str, ChildOverride], order: list[str]) -> None:
+        """Store nested story/task overrides + order from the nested dialog."""
+        self._nested_overrides = _coerce_overrides(overrides)
+        self._nested_order = list(order)
+
+    def override(self) -> ChildOverride | None:
+        """The row's override, or None when it carries no customisation at all."""
+        name = self.name_edit.text().strip()
+        # When certainty is locked by the parent it is not a per-child override.
+        certainty = (
+            None if self._cert_locked else (self.cert_combo.currentData() or None)
+        )
+        include = self.include_check.isChecked()
+        nested = _coerce_overrides(self._nested_overrides)
+        order = list(self._nested_order)
+        if name or certainty or not include or nested or order:
+            return ChildOverride(
+                display_name=name,
+                scope_certainty=certainty,
+                include=include,
+                child_overrides=nested,
+                child_order=order,
+            )
+        return None
+
+
+class _ChildRowList(QWidget):
+    """Vertical list of :class:`_ChildRow`s with drag-to-reorder.
+
+    Mirrors :class:`ReportItemTable`'s internal-move drag: a row's drag handle
+    starts a ``QDrag`` and ``dragMoveEvent`` slides rows live via ``_reposition``
+    while the dragged row shows as a ghost. The chosen order is read on Save via
+    :meth:`order`.
+    """
+
+    _MIME_TYPE = "application/x-erg-child-row"
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self._rows: list[_ChildRow] = []
+        self._drag_row: _ChildRow | None = None
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(6)
+        self._layout.addStretch(1)  # trailing stretch keeps rows packed at top
+
+    def add_row(self, row: _ChildRow) -> None:
+        """Append *row* before the trailing stretch and wire its drag handle."""
+        row.drag_started.connect(self._start_drag)
+        self._rows.append(row)
+        self._layout.insertWidget(self._layout.count() - 1, row)
+
+    @property
+    def rows(self) -> list[_ChildRow]:
+        """The rows in current (possibly reordered) display order."""
+        return list(self._rows)
+
+    def order(self) -> list[str]:
+        """Child keys in current display order."""
+        return [row.key for row in self._rows]
+
+    def _reposition(self, from_index: int, to_index: int) -> None:
+        """Move a row to a new index and re-lay out (the stretch stays last)."""
+        if not 0 <= from_index < len(self._rows):
+            return
+        to_index = max(0, min(to_index, len(self._rows) - 1))
+        if from_index == to_index:
+            return
+        row = self._rows.pop(from_index)
+        self._rows.insert(to_index, row)
+        self._layout.removeWidget(row)
+        self._layout.insertWidget(to_index, row)
+
+    def _row_insertion_index(self, y: int) -> int:
+        """Insertion index for a drop at vertical position *y* (list coords)."""
+        for i, row in enumerate(self._rows):
+            top = row.mapTo(self, row.rect().topLeft()).y()
+            if y < top + row.height() / 2:
+                return i
+        return len(self._rows)
+
+    def _start_drag(self, row: _ChildRow) -> None:
+        if row not in self._rows:
+            return
+        self._drag_row = row
+
+        drag = QDrag(row)
+        mime = QMimeData()
+        mime.setData(self._MIME_TYPE, b"row")
+        drag.setMimeData(mime)
+
+        accent = row.palette().highlight().color()
+        pixmap = row.grab()
+        drag.setPixmap(lifted_card_pixmap(pixmap, accent))
+        drag.setHotSpot(QPoint(12, pixmap.height() // 2))
+
+        ghost = QGraphicsOpacityEffect(row)
+        ghost.setOpacity(0.4)
+        row.setGraphicsEffect(ghost)
+
+        drag.exec(Qt.DropAction.MoveAction)  # blocks until the drop completes
+
+        row.setGraphicsEffect(None)
+        flash_highlight(row, accent, selector="#childRow")
+        self._drag_row = None
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802
+        if self._drag_row is not None and event.mimeData().hasFormat(self._MIME_TYPE):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:  # noqa: N802
+        if self._drag_row is None:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        current = self._rows.index(self._drag_row)
+        insert_at = self._row_insertion_index(event.position().toPoint().y())
+        target = insert_at - 1 if insert_at > current else insert_at
+        if target != current:
+            self._reposition(current, target)  # live feedback
+
+    def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802
+        if self._drag_row is not None:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+
+class _AutoSizeScrollArea(QScrollArea):
+    """Scroll area whose size hint tracks its content up to a maximum height.
+
+    A plain ``QScrollArea``'s size hint stops following the content past a small
+    default, so a dialog around it never grows to fit more rows. Reporting the
+    content's own height (clamped to *max_height*) lets the dialog auto-size with
+    the number of children and only start scrolling once it would exceed the cap.
+    """
+
+    def __init__(self, max_height: int, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._max_height = max_height
+        self.setMaximumHeight(max_height)
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        widget = self.widget()
+        if widget is None:
+            return super().sizeHint()
+        frame = 2 * self.frameWidth()
+        hint = widget.sizeHint()
+        return QSize(hint.width() + frame, min(hint.height() + frame, self._max_height))
+
+
 class ChildCustomizeDialog(QDialog):
     """Modal for overriding display name & scope certainty of an item's children.
 
@@ -1044,7 +1415,17 @@ class ChildCustomizeDialog(QDialog):
     per-child certainty selectors are disabled (the parent value wins for all
     children).  When the parent is left at ``"--"`` the children may each set
     their own certainty and the report shows the average (FR-13, consolidated).
+
+    Each child also carries an **Include** checkbox (default on) — unchecking it
+    drops the child from the report. For a label item every child is an epic, so
+    each row gets a **gear** button (``child_settings_requested``) that opens a
+    nested dialog for that epic's own stories/tasks.
     """
+
+    # Emits the _ChildRow whose per-epic settings gear was clicked. The owner
+    # (config panel) fetches the epic's stories/tasks, opens a nested dialog, and
+    # writes the result back via _ChildRow.set_nested().
+    child_settings_requested = Signal(object)
 
     def __init__(
         self,
@@ -1054,29 +1435,49 @@ class ChildCustomizeDialog(QDialog):
         parent_certainty: str,
         children: list[tuple[str, str]],
         overrides: dict[str, ChildOverride],
+        child_order: list[str] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        # A label's children are epics (drillable via the gear); an epic's
+        # children are stories/tasks (leaf, no gear).
+        self._show_settings = kind == "label"
         child_noun = "Epic" if kind == "label" else "Story / Task"
         self.setWindowTitle(f"Customize “{parent_key}”")
-        self.setMinimumWidth(640)
+        # Modal dialog — only show a title bar + close button. CustomizeWindowHint
+        # is required for the absence of the minimize/maximize hints to take effect
+        # (without it Qt keeps default decorations and the WM adds min/max itself).
+        self.setWindowFlags(
+            Qt.WindowType.Dialog
+            | Qt.WindowType.CustomizeWindowHint
+            | Qt.WindowType.WindowTitleHint
+            | Qt.WindowType.WindowCloseButtonHint
+            | Qt.WindowType.WindowSystemMenuHint
+        )
+        self.setMinimumWidth(740 if self._show_settings else 700)
         self._cert_locked = bool(parent_certainty)
-        self._name_edits: dict[str, QLineEdit] = {}
-        self._cert_combos: dict[str, QComboBox] = {}
+        self._parent_certainty = parent_certainty
+        self._list: _ChildRowList | None = None
 
         root = QVBoxLayout(self)
         root.setSpacing(10)
 
+        include_hint = " Untick <b>Include</b> to leave an item out of the report" + (
+            "; use the gear to customise an epic's own stories/tasks."
+            if self._show_settings
+            else "."
+        )
         if self._cert_locked:
             note = QLabel(
                 f"Scope certainty is fixed to <b>{parent_certainty}</b> on the parent "
                 "item, so per-child certainty is disabled. Set the parent certainty "
-                "to “--” to edit each child and show their average."
+                "to “--” to edit each child and show their average." + include_hint
             )
         else:
             note = QLabel(
-                "Override the display name and scope certainty for each child. "
-                "Leave certainty at “--” to exclude it from the average."
+                "Override the display name and scope certainty for each child, and "
+                "drag the handle to reorder. Leave certainty at “--” to exclude it "
+                "from the average." + include_hint
             )
         note.setWordWrap(True)
         note.setProperty("hint", "true")
@@ -1088,109 +1489,97 @@ class ChildCustomizeDialog(QDialog):
             root.addWidget(empty)
         else:
             root.addWidget(
-                self._build_grid(child_noun, children, overrides, parent_certainty)
+                self._build_body(child_noun, children, overrides, child_order)
             )
 
         root.addWidget(make_dialog_button_box(self, "Save"))
 
-    def _build_grid(
+    def _build_body(
         self,
         child_noun: str,
         children: list[tuple[str, str]],
         overrides: dict[str, ChildOverride],
-        parent_certainty: str,
+        child_order: list[str] | None,
     ) -> QScrollArea:
-        scroll = QScrollArea()
+        # Header + reorderable rows share one vertical layout inside the scroll
+        # content, so the column headings stay aligned with the row widgets (and
+        # scroll together) regardless of any vertical scrollbar.
+        content = QWidget()
+        body = QVBoxLayout(content)
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(6)
+        body.addWidget(self._build_header(child_noun))
+
+        self._list = _ChildRowList()
+        for key, summary in _order_children(children, child_order or []):
+            child_row = _ChildRow(
+                key,
+                summary,
+                overrides.get(key),
+                cert_locked=self._cert_locked,
+                parent_certainty=self._parent_certainty,
+                show_settings=self._show_settings,
+            )
+            child_row.settings_requested.connect(self.child_settings_requested.emit)
+            self._list.add_row(child_row)
+        body.addWidget(self._list)
+
+        # No minimum: a short list keeps the dialog compact. The scroll area's
+        # size hint follows its content (see _AutoSizeScrollArea), so the dialog
+        # auto-grows with the number of children — capped to most of the screen
+        # so a long list scrolls instead of overflowing the display.
+        screen = self.screen() or QApplication.primaryScreen()
+        avail = screen.availableGeometry().height() if screen is not None else 900
+        scroll = _AutoSizeScrollArea(max(240, avail - 180))
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        content = QWidget()
-        grid = QGridLayout(content)
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(6)
-
-        for col, text in enumerate((child_noun, "Summary", "Display Name", "Cert.")):
-            lbl = QLabel(f"<b>{text}</b>")
-            grid.addWidget(lbl, 0, col)
-        # Summary and Display Name share the free width equally.
-        grid.setColumnStretch(1, 1)
-        grid.setColumnStretch(2, 1)
-
-        for r, (key, summary) in enumerate(children, start=1):
-            ov = overrides.get(key)
-
-            key_lbl = QLabel(key)
-            key_lbl.setTextInteractionFlags(
-                Qt.TextInteractionFlag.TextSelectableByMouse
-            )
-            grid.addWidget(key_lbl, r, 0)
-
-            sum_lbl = QLabel(summary or "")
-            # Single line, no word wrap: a wrapped summary makes the grid's height
-            # depend on width (heightForWidth), which over-sizes the dialog for
-            # epics whose stories/tasks have long summaries and leaves dead space
-            # below the list. The Ignored horizontal policy lets the cell clip to
-            # its column instead of widening the dialog; the full text stays
-            # available via tooltip and the Display Name placeholder.
-            sum_lbl.setToolTip(summary or "")
-            sum_lbl.setSizePolicy(
-                QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
-            )
-            # Selectable so the summary can be copied when crafting a display name.
-            sum_lbl.setTextInteractionFlags(
-                Qt.TextInteractionFlag.TextSelectableByMouse
-                | Qt.TextInteractionFlag.TextSelectableByKeyboard
-            )
-            sum_lbl.setCursor(Qt.CursorShape.IBeamCursor)
-            grid.addWidget(sum_lbl, r, 1)
-
-            name_edit = QLineEdit(ov.display_name if ov else "")
-            name_edit.setPlaceholderText(summary or "Display name")
-            grid.addWidget(name_edit, r, 2)
-            self._name_edits[key] = name_edit
-
-            cert_combo = QComboBox()
-            no_scroll_wheel(cert_combo)
-            for label, data in _CERT_ITEMS:
-                cert_combo.addItem(label, data)
-            cert_combo.setFixedWidth(70)
-            if self._cert_locked:
-                idx = cert_combo.findData(parent_certainty)
-                cert_combo.setCurrentIndex(idx if idx >= 0 else 0)
-                cert_combo.setEnabled(False)
-            elif ov and ov.scope_certainty:
-                idx = cert_combo.findData(ov.scope_certainty)
-                if idx >= 0:
-                    cert_combo.setCurrentIndex(idx)
-            grid.addWidget(cert_combo, r, 3)
-            self._cert_combos[key] = cert_combo
-
-        # The scroll area is widget-resizable, so the content fills the viewport.
-        # Without a trailing stretch row the grid would distribute any surplus
-        # height evenly between the data rows (big gaps when there are few
-        # children); this collects it at the bottom and keeps rows packed.
-        grid.setRowStretch(len(children) + 1, 1)
-
         scroll.setWidget(content)
         return scroll
 
+    def _build_header(self, child_noun: str) -> QWidget:
+        """A non-scrolling-away column header aligned with the _ChildRow columns."""
+        header = QWidget()
+        row = QHBoxLayout(header)
+        row.setContentsMargins(0, 2, 0, 2)
+        row.setSpacing(8)
+        spacer = QLabel("")
+        spacer.setFixedWidth(_CHILD_HANDLE_W)  # aligns under the drag handles
+        row.addWidget(spacer)
+        key_lbl = QLabel(f"<b>{child_noun}</b>")
+        key_lbl.setMinimumWidth(_CHILD_KEY_W)
+        row.addWidget(key_lbl)
+        sum_lbl = QLabel("<b>Summary</b>")
+        sum_lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        row.addWidget(sum_lbl, 1)
+        row.addWidget(QLabel("<b>Display Name</b>"), 1)
+        incl_lbl = QLabel("<b>Incl.</b>")
+        incl_lbl.setFixedWidth(_CHILD_INCL_W)
+        incl_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        row.addWidget(incl_lbl)
+        cert_lbl = QLabel("<b>Cert.</b>")
+        cert_lbl.setFixedWidth(_CHILD_CERT_W)
+        row.addWidget(cert_lbl)
+        if self._show_settings:
+            settings_spacer = QLabel("")
+            settings_spacer.setFixedWidth(_CHILD_SETTINGS_W)
+            row.addWidget(settings_spacer)
+        return header
+
     def get_overrides(self) -> dict[str, ChildOverride]:
         """Return the per-child overrides, omitting children with no override."""
+        if self._list is None:
+            return {}
         result: dict[str, ChildOverride] = {}
-        for key, name_edit in self._name_edits.items():
-            display_name = name_edit.text().strip()
-            # When certainty is locked by the parent it isn't a child override.
-            certainty = (
-                None
-                if self._cert_locked
-                else (self._cert_combos[key].currentData() or None)
-            )
-            if display_name or certainty:
-                result[key] = ChildOverride(
-                    display_name=display_name, scope_certainty=certainty
-                )
+        for row in self._list.rows:
+            ov = row.override()
+            if ov is not None:
+                result[row.key] = ov
         return result
+
+    def get_child_order(self) -> list[str]:
+        """Return the child keys in the user's chosen (dragged) order."""
+        return self._list.order() if self._list is not None else []
 
 
 # ---------------------------------------------------------------------------

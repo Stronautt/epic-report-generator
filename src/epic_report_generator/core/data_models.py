@@ -134,12 +134,22 @@ class ChildOverride:
     """Per-child customisation for a report item (FR-13).
 
     For an epic item the "children" are its stories/tasks; for a label item the
-    children are the epics tagged with that label.  Either field may be empty to
-    leave the corresponding value unchanged.
+    children are the epics tagged with that label.  Any field may be left at its
+    default to leave the corresponding value unchanged.
+
+    ``include`` (default ``True``) controls whether the child is part of the
+    report at all — unchecking it drops the child from metrics, the timeline and
+    any detail page.  For an *epic* child of a label item the nested
+    ``child_overrides`` / ``child_order`` carry that epic's own per-story/task
+    customisation (the recursive analogue of :class:`ReportItem`'s fields); they
+    stay empty for story/task children, which have no further children.
     """
 
     display_name: str = ""
     scope_certainty: str | None = None  # None, "Low", "Medium", "High"
+    include: bool = True
+    child_overrides: dict[str, ChildOverride] = field(default_factory=dict)
+    child_order: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -154,6 +164,11 @@ class ReportItem:
     # story/task key for epic items).  Only used when scope_certainty is unset
     # ("--" / consolidated): the report then shows the average of child values.
     child_overrides: dict[str, ChildOverride] = field(default_factory=dict)
+    # User-chosen display order of children (child Jira keys), set by dragging rows
+    # in the customize dialog. Drives the order epics appear within a label group and
+    # child bars on the timeline. Listed keys are applied first; unlisted children
+    # (e.g. newly added in Jira) keep their fetched order. Empty = Jira order.
+    child_order: list[str] = field(default_factory=list)
 
 
 @dataclass

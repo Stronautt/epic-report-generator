@@ -54,7 +54,7 @@ src/epic_report_generator/
 ├── __main__.py                    # Entry point
 ├── app.py                         # QApplication setup, signal handlers
 ├── core/
-│   ├── data_models.py             # Dataclasses: JiraIssue (with parent_key, progress, effective_weight), EpicData, EpicMetrics, ReportConfig, ReportData, ReportItem (with child_overrides), ChildOverride, TimelineItem; average_certainty() helper
+│   ├── data_models.py             # Dataclasses: JiraIssue (with parent_key, progress, effective_weight), EpicData, EpicMetrics, ReportConfig, ReportData, ReportItem (with child_overrides + child_order), ChildOverride, TimelineItem; average_certainty() helper
 │   ├── jira_client.py             # JIRA library wrapper, API-token + OAuth connection, pagination, retry, date expansion
 │   ├── metrics.py                 # Bottom-up hierarchical progress, velocity, cycle time, scope change, forecasting, time-series
 │   ├── theming.py                 # Accent-colour maths shared by app + report: hex/mix/lighten, qt_shades(), report_overrides()
@@ -65,7 +65,9 @@ src/epic_report_generator/
 │   ├── auth_manager.py            # OAuth 2.0 (3LO) flow + API-token auth + keyring token storage
 │   ├── config_manager.py          # JSON config via platformdirs
 │   ├── font_manager.py            # Provision custom fonts (file copy / Google Fonts download) for UI + report
-│   └── oauth_server.py            # Local HTTP callback server for OAuth redirect
+│   ├── install_source.py          # Detect store installs (Mac App Store / MS Store / Snap / Flatpak) to gate self-update
+│   ├── oauth_server.py            # Local HTTP callback server for OAuth redirect
+│   └── update_checker.py          # GitHub latest-release check (no cache; 404=no stable release) + version compare
 ├── ui/
 │   ├── main_window.py             # Login overlay → sidebar/stacked-panel layout
 │   ├── login_panel.py             # Dual-auth login: API Token tab + OAuth tab, session restore
@@ -117,9 +119,34 @@ Each report item (epic or label) carries an optional scope certainty
 (gear icon, left of the remove button) that opens `ChildCustomizeDialog`, listing
 the item's children — the epics under a label, or the stories/tasks under an epic
 (fetched fresh on every open via `JiraClient.fetch_epic_summaries_by_label` /
-`fetch_child_summaries`). Per child the user can override the **display name** and
-**scope certainty**, persisted in `ReportItem.child_overrides`
+`fetch_child_summaries`). Per child the user can override the **display name**,
+**scope certainty**, and **include** flag (checkbox, default on — unticking it
+drops the child from the report entirely), persisted in `ReportItem.child_overrides`
 (`dict[str, ChildOverride]`, keyed by child Jira key) inside `last_report_items`.
+
+`ChildOverride` is **recursive**: for an *epic* child of a label item it also
+carries nested `child_overrides`/`child_order` for that epic's own stories/tasks.
+Each epic row in the dialog (`kind == "label"`) has its own **gear** that emits
+`ChildCustomizeDialog.child_settings_requested`; `config_panel._on_child_epic_settings`
+fetches that epic's children fresh and opens a nested `ChildCustomizeDialog`
+(`kind="epic"`), writing the result back via `_ChildRow.set_nested`. Story/task
+children (leaf) get no gear. Persistence is compact (`_serialize_override` omits the
+default `include` and empty nested fields, so simple rows keep the historical
+`display_name`/`scope_certainty` shape); `_coerce_overrides` reads it back recursively.
+
+The dialog is a per-row widget grid (`_ChildRow` in `_ChildRowList`): always-
+visible display-name editor (placeholder = the Jira summary) + **Include** checkbox +
+certainty combo (+ gear for epic children), with a **drag handle** per row to
+**reorder** children (mirrors `ReportItemTable`'s internal-move drag). The chosen
+order persists as `ReportItem.child_order` (`list[str]` of child keys) in
+`last_report_items`. In `preview_panel._generate_report` the helper
+`_resolve_children` applies all per-child overrides together — it **drops excluded
+children** (removing them from the metrics, timeline, and any detail page), reorders
+the survivors by `child_order` (mirrors `widgets._order_children` / `_apply_child_order`;
+unknown keys keep Jira's fetched order, appended after; empty = Jira order), and
+applies display-name overrides. It runs on a top-level epic's stories, on each label
+epic's stories (via the nested override), and the epic-level include filter drops
+excluded epics from the label group.
 
 Parent vs. child precedence:
 
@@ -129,11 +156,14 @@ Parent vs. child precedence:
   and the report shows the **average** (`average_certainty()` maps Low/Med/High →
   1/2/3, averages set values, rounds, maps back). This is FR-13's "Consolidated"
   behaviour, triggered by the default `"--"` rather than a separate dropdown entry.
+  This applies recursively: a label epic left at `"--"` consolidates the certainties
+  of its own (included) stories/tasks set via the nested gear dialog.
 
 Overrides are applied in `preview_panel._generate_report`: child display names
 overwrite `JiraIssue.summary` (epic items) or `EpicData.summary` (label items),
 and certainty flows to `EpicMetrics.scope_certainty` per source epic / group.
-Switching a row's kind (epic↔label) drops its now-stale child overrides.
+Switching a row's kind (epic↔label) drops its now-stale child overrides **and
+child order**.
 
 ### Report Item Validation
 
@@ -180,6 +210,40 @@ Epic-level date expansion (`_fill_epic_dates_from_children`) pools dates from th
 - **Timeline dates**: cascade `timeline_start`/`timeline_end` → sprint start/end dates → `start_date`/`due_date`. The sprint fallback matches Jira Cloud Timeline behaviour, which derives epic ranges from child sprint assignments when no explicit date fields are set.
 
 The same cascade is applied in `merge_metrics()` when building synthetic label-group epics.
+
+### Fixed Timeline Window
+
+The Config panel's **Fixed Start Date** / **Fixed End Date** pickers (under the
+Report Content section; a min 5-day gap is enforced) store
+`ReportConfig.timeline_hard_start` / `timeline_hard_end` (`date | None`). When
+set they **cap** the report to that window on two surfaces that must stay
+consistent:
+
+1. **Gantt timeline axis** (Page 3): `report_view_model._build_timeline` /
+   `_timeline_data` lock `range_start`/`range_end` to the hard dates instead of
+   auto-scaling from the data.
+
+2. **Per-epic/label detail page** (chart + sidebar stats): `preview_panel`
+   threads `timeline_hard_start`/`timeline_hard_end` into `calculate_metrics` /
+   `merge_metrics` as `window_start` / `window_end`, so the page never reflects
+   activity outside the fixed window:
+   - `window_end` caps the effective "as of" instant (`reference_date`), which
+     bounds the **velocity** lookback, the **forecast** origin, and the **trend
+     chart**'s last day.
+   - **velocity** counts only resolutions `≤ reference_date`, with its lookback
+     clamped up to `window_start` (and the per-week divisor shrunk to match a
+     narrow window).
+   - **avg cycle time** counts only issues *resolved* inside the window (the
+     full created→resolved span is still measured).
+   - **scope change** considers only issues *created* inside the window, which
+     alone form its denominator and baseline.
+   - the **trend time-series** is clipped to `[window_start, reference_date]`;
+     cumulative totals carry over (the first emitted day still includes all
+     issues created before the window — the chart is zoomed, not recomputed).
+
+   Progress and the estimate roll-ups are deliberately **not** windowed — they
+   always reflect the whole epic. Leaving both dates unset (`None`) keeps the
+   historical unbounded behaviour byte-for-byte.
 
 ### Progress Calculation
 
@@ -272,6 +336,85 @@ and bundled **Noto Sans CJK JP** is the last fallback for CJK ideographs/kana/Ha
 that Inter lacks. `report_panel` resolves accent + font onto `ReportConfig`
 (`report_accent`/`report_font_family`/`report_font_dir`) just before generation, the same
 place `dark_mode` is set.
+
+### Update Notification
+
+`services/update_checker.py` (`UpdateChecker`) queries the GitHub Releases API
+(`releases/latest`, which **excludes pre-releases and drafts**) for the project's
+latest *full* release and compares its tag with the running `__version__`. There
+is **no caching** — the original on-disk cache was dropped because it kept
+resurfacing stale data; every check hits GitHub fresh. At ~1 call/launch +
+1 call/hour this stays far inside GitHub's unauthenticated 60/hour-per-IP limit.
+Tags are normalised (`v1.2.0` → `1.2.0`); `is_newer()` does numeric,
+length-tolerant comparison.
+
+`fetch()` is the **single networked call** and the **worker-thread** entry point:
+it holds no shared state, carries an explicit connect+read timeout (a missing one
+lets a stale socket hang forever), and never raises. It returns one of two
+things, and the **distinction matters**:
+
+- a **definitive** `UpdateInfo` — HTTP 200 with a tag, *or* a **404** meaning the
+  repo has no published full release (e.g. only pre-releases/drafts), which is
+  reported as `update_available=False` (an empty `latest_version`), i.e. "you are
+  up to date" — **not** a failure; and
+- a **transient** failure (timeout, connection error, 5xx, rate-limit, bad JSON)
+  → `None`, which the UI **ignores** (leaving the link as-is) so it never flaps or
+  shows wrong data.
+
+Because nothing is persisted, the worker shares no mutable state with the main
+thread — complementing the `ThreadedTask` QThread-subclass design that fixed the
+earlier GIL ⇄ signal-slot deadlock.
+
+**Store installs disable it.** `services/install_source.py` (`store_source()` /
+`is_store_install()`) detects a managed-store install — Mac App Store (a
+`Contents/_MASReceipt/receipt` in the `.app`), Microsoft Store/MSIX
+(`GetCurrentPackageFullName` package identity, `WindowsApps` path fallback),
+Snap (`$SNAP`) or Flatpak (`$FLATPAK_ID` / `/.flatpak-info`). AppImage is
+deliberately *not* matched — it is the GH installer. Detection is best-effort
+and never raises. When a store is detected, `_setup_update_check` returns early:
+no checker, task, timer, network, or link (stores own updates, and self-update
+prompts violate their policies). The `_update_checker`/`_update_task`/
+`_update_timer` attributes stay `None`, and `_check_for_updates`/`closeEvent`
+no-op on them.
+
+`MainWindow._setup_update_check` owns the lifecycle: `_check_for_updates` runs
+`fetch` on a `ThreadedTask` worker once at startup — deferred ~3 s
+(`_UPDATE_CHECK_STARTUP_DELAY_MS`) so it never competes with the first paint /
+session restore — and again hourly via a `QTimer`. The completed
+`_on_update_fetched` callback runs on the main thread: a definitive `UpdateInfo`
+shows the link (update available) or hides it (up to date / 404), while a
+transient `None` is ignored so the link doesn't flap. When an update is available
+it reveals a
+**blinking accent "Update available" hyperlink** in the sidebar footer, directly
+below the version label and at the same font size. It is a `QLabel` rich-text
+`<a>` (not a button): the accent colour + underline are set inline in the anchor
+(`_render_update_link`, since QSS can't colour an anchor — `_apply_theme` tracks
+`self._accent_hex` so the link re-tints with a custom accent), and
+`setOpenExternalLinks` opens the latest-release page in the browser on click.
+`animations.pulse`/`stop_pulse` loop its opacity slowly (~2.2s) to draw the eye;
+the blink starts only on the hidden→shown transition. `#sidebarUpdateLink` holds
+only structural rules (font size/alignment) in `COMMON_THEME`. `closeEvent`
+stops the timer and joins the worker.
+
+### Window Size Persistence
+
+The main window remembers its last size across launches via the **global**
+config keys `window_width`/`window_height` (defaults 1280×900).
+`MainWindow.resizeEvent` persists the size on a **debounced** timer
+(`_GEOMETRY_SAVE_DEBOUNCE_MS = 400`) so a drag-resize coalesces into one disk
+write; only **spontaneous, windowed** resizes are saved (`event.spontaneous()`
+and not maximized/fullscreen), so programmatic resizes and screen-filling states
+never overwrite the remembered windowed size. `closeEvent` flushes a still-
+pending save so the final size survives an immediate close.
+
+`_restore_window_size` runs in `__init__` (before `show()`) and routes the saved
+value through `_safe_window_size` — the **safety net** against an unrecoverable
+window. It clamps to a lower bound (`_MIN_WINDOW_*`, the `setMinimumSize` floor)
+and an upper bound (`QApplication.primaryScreen().availableGeometry()`), and
+falls back to `_DEFAULT_WINDOW_*` on a non-numeric value. This prevents a stale
+or oversized saved size — e.g. one captured on a large external monitor then
+restored on a laptop display — from stranding the title bar and resize handles
+off-screen, or shrinking the window below the point where it can be operated.
 
 ## Code Standards
 

@@ -271,6 +271,17 @@ QLabel[status="connected"] {
     background: transparent;
     qproperty-alignment: 'AlignCenter';
 }
+/* Update CTA — a blinking hyperlink (QLabel rich text) shown only when a newer
+   release exists. Same font size as the version label above it; the accent
+   colour and underline come from the inline <a> style (an anchor's colour is
+   not stylable via QSS), so only structural rules live here. */
+#sidebarUpdateLink {
+    font-size: 12px;
+    font-weight: 600;
+    padding: 2px 10px 0 10px;
+    background: transparent;
+    qproperty-alignment: 'AlignCenter';
+}
 """
 
 # ---------------------------------------------------------------------------

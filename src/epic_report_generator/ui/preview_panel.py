@@ -27,8 +27,10 @@ from PySide6.QtWidgets import (
 
 from epic_report_generator.core.data_models import (
     MONTHS_ABBR,
+    ChildOverride,
     EpicData,
     EpicMetrics,
+    JiraIssue,
     ReportConfig,
     ReportData,
     ReportItem,
@@ -59,6 +61,50 @@ _PIXMAP_CACHE_MAX_ENTRIES = 2
 def _project_prefix(key: str) -> str | None:
     """Return the Jira project prefix (text before the last '-'), or None."""
     return key.rsplit("-", 1)[0] if "-" in key else None
+
+
+def _apply_child_order(
+    child_order: list[str],
+    items: list,
+    *,
+    key: Callable[[object], str] = lambda x: x,  # type: ignore[assignment,return-value]
+) -> list:
+    """Reorder *items* by *child_order* (the user's dragged child-key order).
+
+    Items whose key appears in *child_order* come first, in that order; the rest
+    keep their original relative position, appended after (stable). *key* extracts
+    the child key from each item — identity for a plain key list, ``.key`` for
+    issues/epics. Mirrors ``widgets._order_children`` so the report matches the
+    customize dialog.
+    """
+    if not child_order:
+        return list(items)
+    rank = {k: i for i, k in enumerate(child_order)}
+    fallback = len(rank)
+    return sorted(items, key=lambda x: rank.get(key(x), fallback))
+
+
+def _resolve_children(
+    children: list[JiraIssue],
+    child_order: list[str],
+    overrides: dict[str, ChildOverride],
+) -> list[JiraIssue]:
+    """Apply per-child overrides to an epic's children for report generation.
+
+    Drops children whose override sets ``include=False`` (so they don't count
+    toward metrics or appear on the timeline), reorders the survivors by
+    *child_order* (the user's dragged order), and writes any display-name
+    override onto each kept child's ``summary``. Kept children are mutated in
+    place; a new ordered list is returned. Mirrors the customize dialog so the
+    generated report matches what the user arranged.
+    """
+    kept = [c for c in children if (ov := overrides.get(c.key)) is None or ov.include]
+    kept = _apply_child_order(child_order, kept, key=lambda c: c.key)
+    for c in kept:
+        ov = overrides.get(c.key)
+        if ov and ov.display_name:
+            c.summary = ov.display_name
+    return kept
 
 
 def _generate_report(
@@ -116,19 +162,21 @@ def _generate_report(
                 report.errors.append(f"Epic {item.key} not found.")
                 continue
             epic = copy.deepcopy(epic)
+            # Apply per-child (story/task) overrides — drop excluded children,
+            # reorder, and rename — before metrics so excluded items don't count
+            # and the timeline child-bar order matches the customize dialog.
+            epic.children = _resolve_children(
+                epic.children, item.child_order, item.child_overrides
+            )
             metrics = calculate_metrics(
                 epic,
                 estimation_method=config.estimation_method,
                 progress_method=config.progress_method,
+                window_start=config.timeline_hard_start,
+                window_end=config.timeline_hard_end,
             )
-            # Per-child (story/task) display-name overrides — visible on the
-            # timeline when child bars are shown.
-            for child in epic.children:
-                ov = item.child_overrides.get(child.key)
-                if ov and ov.display_name:
-                    child.summary = ov.display_name
             # Scope certainty: explicit parent value wins; otherwise consolidate
-            # the per-child overrides into an average (FR-13).
+            # the included children's overrides into an average (FR-13).
             if item.scope_certainty:
                 metrics.scope_certainty = item.scope_certainty
             else:
@@ -150,13 +198,29 @@ def _generate_report(
                 project_keys.add(prefix)
 
         elif item.kind == "label":
-            keys = label_to_keys.get(item.key, [])
+            # Apply the user's epic order within the label group, then drop any
+            # epic excluded via its Include checkbox. Timeline + group roll-up
+            # follow this instead of Jira's default order.
+            keys = _apply_child_order(item.child_order, label_to_keys.get(item.key, []))
+            keys = [
+                k
+                for k in keys
+                if (ov := item.child_overrides.get(k)) is None or ov.include
+            ]
             label_epics = [
                 copy.deepcopy(epics_by_key[k]) for k in keys if k in epics_by_key
             ]
             if not label_epics:
                 report.errors.append(f"No epics found for label '{item.key}'.")
                 continue
+            # Apply each epic's own nested per-story/task overrides (drop excluded,
+            # reorder, rename) before merging so they flow into the merged metrics.
+            for e in label_epics:
+                ov = item.child_overrides.get(e.key)
+                if ov and (ov.child_overrides or ov.child_order):
+                    e.children = _resolve_children(
+                        e.children, ov.child_order, ov.child_overrides
+                    )
             # Collect per-epic metrics during merge to avoid recomputing
             per_epic_metrics: list[EpicMetrics] = []
             synthetic, metrics = merge_metrics(
@@ -165,6 +229,8 @@ def _generate_report(
                 progress_method=config.progress_method,
                 include_subtask_timeline=config.include_subtasks_in_timeline,
                 source_metrics_out=per_epic_metrics,
+                window_start=config.timeline_hard_start,
+                window_end=config.timeline_hard_end,
             )
             # Set display name for label group
             display = item.display_name or item.key
@@ -182,8 +248,20 @@ def _generate_report(
                     e.summary = ov.display_name
                 if item.scope_certainty:
                     em.scope_certainty = item.scope_certainty
+                elif ov and ov.scope_certainty:
+                    em.scope_certainty = ov.scope_certainty
+                elif ov and ov.child_overrides:
+                    # Consolidate this epic's own (included) story/task certainties
+                    # set via the nested per-epic settings dialog (FR-13).
+                    em.scope_certainty = average_certainty(
+                        [
+                            nov.scope_certainty
+                            for c in e.children
+                            if (nov := ov.child_overrides.get(c.key)) is not None
+                        ]
+                    )
                 else:
-                    em.scope_certainty = ov.scope_certainty if ov else None
+                    em.scope_certainty = None
                 source_pairs.append((e, em))
                 if (prefix := _project_prefix(e.key)) is not None:
                     project_keys.add(prefix)

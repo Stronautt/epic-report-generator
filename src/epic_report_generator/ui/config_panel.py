@@ -121,6 +121,13 @@ class FieldPickerDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Select Jira Fields")
+        self.setWindowFlags(
+            Qt.WindowType.Dialog
+            | Qt.WindowType.CustomizeWindowHint
+            | Qt.WindowType.WindowTitleHint
+            | Qt.WindowType.WindowCloseButtonHint
+            | Qt.WindowType.WindowSystemMenuHint
+        )
         self.setMinimumWidth(420)
 
         layout = QFormLayout(self)
@@ -604,11 +611,11 @@ class ConfigPanel(QWidget):
         )
         fm.addWidget(self._epic_link_field)
 
-        detect_btn = QPushButton("Detect Fields")
-        detect_btn.setProperty("secondary", "true")
-        detect_btn.setToolTip("Query Jira for available fields")
-        detect_btn.clicked.connect(self._detect_fields)
-        fm.addWidget(detect_btn)
+        self._detect_btn = QPushButton("Detect Fields")
+        self._detect_btn.setProperty("secondary", "true")
+        self._detect_btn.setToolTip("Query Jira for available fields")
+        self._detect_btn.clicked.connect(self._detect_fields)
+        fm.addWidget(self._detect_btn)
         fm.addWidget(
             self._hint(
                 "Scan your Jira instance to find and auto-fill the correct field IDs"
@@ -631,6 +638,8 @@ class ConfigPanel(QWidget):
         # Auto-save on any change + lazy label fetch
         self._item_table.items_changed.connect(self._persist_values)
         self._item_table.items_changed.connect(self._ensure_labels_fetched)
+        self._customize_busy = False  # guards against stacked customize fetches
+        self._child_settings_busy = False  # guards nested per-epic settings fetches
         self._item_table.edit_requested.connect(self._on_customize_item)
         for _signal in (
             self._sp_field.field.textChanged,
@@ -1317,8 +1326,12 @@ class ConfigPanel(QWidget):
             )
             return
 
+        if self._customize_busy:
+            logger.debug("Customize already in progress; ignoring repeat click")
+            return
         parent_certainty = row.scope_certainty  # type: ignore[attr-defined]
         overrides = row.get_child_overrides()  # type: ignore[attr-defined]
+        child_order = row.get_child_order()  # type: ignore[attr-defined]
         epic_link_field = (
             self._epic_link_field.text.strip() or _DEFAULTS["epic_link_field"]
         )
@@ -1330,6 +1343,7 @@ class ConfigPanel(QWidget):
             return self._jira.fetch_child_summaries(key.upper(), epic_link_field)
 
         def _on_fetched(result: object) -> None:
+            self._customize_busy = False
             if isinstance(result, Exception):
                 QMessageBox.warning(
                     self, "Error", f"Failed to load child items: {result}"
@@ -1342,23 +1356,94 @@ class ConfigPanel(QWidget):
                 parent_certainty=parent_certainty,
                 children=children,
                 overrides=overrides,
+                child_order=child_order,
                 parent=self,
+            )
+            # For label items the children are epics — wire the per-epic gear so
+            # the user can drill into each epic's own stories/tasks.
+            dialog.child_settings_requested.connect(
+                lambda child_row: self._on_child_epic_settings(dialog, child_row)
             )
             if dialog.exec() == QDialog.DialogCode.Accepted:
                 new_overrides = dialog.get_overrides()
                 row.set_child_overrides(new_overrides)  # type: ignore[attr-defined]
+                row.set_child_order(dialog.get_child_order())  # type: ignore[attr-defined]
                 logger.info(
                     "Saved %d child override(s) for %s", len(new_overrides), key
                 )
 
+        self._customize_busy = True
+        self._tasks.start(_fetch, _on_fetched, capture_exceptions=True)
+
+    def _on_child_epic_settings(
+        self, parent_dialog: QDialog, child_row: object
+    ) -> None:
+        """Open a nested customize dialog for an epic child's stories/tasks.
+
+        Reached from the gear on an epic row inside a *label* item's customize
+        dialog. Mirrors :meth:`_on_customize_item`: the epic's children are
+        fetched fresh from Jira on every open, the dialog is pre-filled with the
+        row's nested overrides, and accepting writes them back onto the row (so
+        they persist when the outer dialog is saved).
+        """
+        if self._child_settings_busy:
+            logger.debug("Child settings fetch already in progress; ignoring click")
+            return
+        epic_key = child_row.key  # type: ignore[attr-defined]
+        if not RE_EPIC_KEY.match(epic_key.upper()):
+            QMessageBox.warning(
+                parent_dialog,
+                "Invalid Epic Key",
+                f"'{epic_key}' is not a valid epic key.",
+            )
+            return
+        epic_link_field = (
+            self._epic_link_field.text.strip() or _DEFAULTS["epic_link_field"]
+        )
+        parent_certainty = child_row.effective_certainty()  # type: ignore[attr-defined]
+        overrides = child_row.get_nested_overrides()  # type: ignore[attr-defined]
+        child_order = child_row.nested_order()  # type: ignore[attr-defined]
+        logger.info("Customizing stories/tasks of epic child %s", epic_key)
+
+        def _fetch() -> list[tuple[str, str]]:
+            return self._jira.fetch_child_summaries(epic_key.upper(), epic_link_field)
+
+        def _on_fetched(result: object) -> None:
+            self._child_settings_busy = False
+            if isinstance(result, Exception):
+                QMessageBox.warning(
+                    parent_dialog, "Error", f"Failed to load child items: {result}"
+                )
+                return
+            grandchildren: list[tuple[str, str]] = result  # type: ignore[assignment]
+            nested = ChildCustomizeDialog(
+                kind="epic",
+                parent_key=epic_key,
+                parent_certainty=parent_certainty,
+                children=grandchildren,
+                overrides=overrides,
+                child_order=child_order,
+                parent=parent_dialog,
+            )
+            if nested.exec() == QDialog.DialogCode.Accepted:
+                child_row.set_nested(  # type: ignore[attr-defined]
+                    nested.get_overrides(), nested.get_child_order()
+                )
+                logger.info("Saved nested overrides for epic child %s", epic_key)
+
+        self._child_settings_busy = True
         self._tasks.start(_fetch, _on_fetched, capture_exceptions=True)
 
     def _detect_fields(self) -> None:
         if not self._require_connected():
             return
         logger.info("Detecting Jira custom fields")
+        self._detect_btn.setEnabled(False)
+        self._detect_btn.setText("Detecting…")
 
         def _on_fields_fetched(result: object) -> None:
+            self._detect_btn.setEnabled(True)
+            self._detect_btn.setText("Detect Fields")
             if isinstance(result, Exception):
                 QMessageBox.warning(self, "Error", f"Failed to fetch fields: {result}")
                 return
