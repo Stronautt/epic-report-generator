@@ -49,10 +49,9 @@ env:
     PySide6.QtOpenGL PySide6.QtOpenGLWidgets
 
 jobs:
-  # Guard: on tag builds, the tag must match the version in pyproject.toml.
-  # Runs once (not per-OS) and gates the whole matrix via `needs`. The check is
-  # step-scoped to tags so workflow_dispatch on a branch still succeeds (a job
-  # whose only check is skipped counts as success, so `build` proceeds).
+  # Guard: tag must match the version in pyproject.toml. Runs once (not per-OS)
+  # and gates the matrix via `needs`. Step-scoped to tags so workflow_dispatch
+  # on a branch still succeeds (skipped step ⇒ job success → `build` proceeds).
   validate-version:
     runs-on: ubuntu-24.04
     steps:
@@ -93,10 +92,9 @@ jobs:
             installer_path: "packaging/windows/Output/epic-report-generator-setup.exe"
     runs-on: ${{ matrix.os }}
 
-    # macOS signing + notarization credentials, surfaced as env so steps can guard
-    # on their presence (the `secrets` context can't be read in a step `if:`).
-    # Absent on forks / PRs from forks → the macOS build degrades gracefully to an
-    # unsigned, un-notarized DMG instead of failing.
+    # Signing + notarization credentials surfaced as env so steps can guard on
+    # their presence (the `secrets` context can't be read in a step `if:`).
+    # Absent on forks/PRs → the macOS build degrades to an unsigned DMG.
     env:
       MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
       MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
@@ -154,13 +152,11 @@ jobs:
       - name: Build Nuitka binary
         shell: bash
         run: |
-          # Expand nofollow list into individual flags
           NOFOLLOW_FLAGS=()
           for mod in $NUITKA_NOFOLLOW; do
             NOFOLLOW_FLAGS+=("--nofollow-import-to=$mod")
           done
 
-          # Platform-specific flags
           case "$RUNNER_OS" in
             Windows)
               PLATFORM_FLAGS=(
@@ -207,8 +203,7 @@ jobs:
             "${PLATFORM_FLAGS[@]}" \
             src/epic_report_generator
 
-          # Nuitka names output dirs after the package name;
-          # rename to the expected names.
+          # Nuitka names output dirs after the package name; rename to expected names.
           case "$RUNNER_OS" in
             Linux)  mv epic_report_generator.dist epic-report-generator.dist ;;
             macOS)  mv epic_report_generator.app  "Epic Report Generator.app"  ;;
@@ -372,12 +367,15 @@ jobs:
           }
           test -f "$DMG"
 
-      # ── Notarize + staple the DMG (macOS) ──────────────────────────
-      # A Developer ID signature alone is no longer enough: since macOS 10.15
-      # Gatekeeper also requires the app to be notarized by Apple. notarytool
-      # uploads the (signed) DMG, waits for the verdict, then `stapler` attaches
-      # the ticket so the DMG verifies offline. Skipped when no notary key.
-      - name: Notarize and staple DMG (macOS)
+      # ── Submit the signed DMG to Apple's notary service (macOS) ─────
+      # Submit WITHOUT --wait: this only uploads the DMG and returns a
+      # submission id immediately. Apple keeps processing server-side; the slow
+      # wait for the verdict happens in the separate notarize-macos job. That
+      # job can be re-run ("Re-run failed jobs") to re-attach to THIS submission
+      # by id — no rebuild and no re-upload, and if Apple has since finished the
+      # verdict returns at once. The id is handed off via its own artifact
+      # because matrix job outputs don't propagate reliably (last leg wins).
+      - name: Submit DMG to notary (macOS)
         if: runner.os == 'macOS' && env.MACOS_NOTARY_KEY_BASE64 != ''
         shell: bash
         run: |
@@ -385,14 +383,25 @@ jobs:
           DMG="${{ matrix.installer_path }}"
           KEYFILE="$RUNNER_TEMP/notary_key.p8"
           echo "$MACOS_NOTARY_KEY_BASE64" | base64 --decode > "$KEYFILE"
-          xcrun notarytool submit "$DMG" \
+          out="$(xcrun notarytool submit "$DMG" \
             --key "$KEYFILE" \
             --key-id "$MACOS_NOTARY_KEY_ID" \
-            --issuer "$MACOS_NOTARY_ISSUER_ID" \
-            --wait
-          xcrun stapler staple "$DMG"
-          xcrun stapler validate "$DMG"
+            --issuer "$MACOS_NOTARY_ISSUER_ID")"
           rm -f "$KEYFILE"
+          echo "$out"
+          echo "$out" \
+            | grep -m1 -Eo '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
+            > notary-submission-id.txt
+          test -s notary-submission-id.txt  # abort the build if no id was returned
+          echo "Notary submission id: $(cat notary-submission-id.txt)"
+
+      - name: Upload notary submission id (macOS)
+        if: runner.os == 'macOS' && env.MACOS_NOTARY_KEY_BASE64 != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: notary-submission-id
+          path: notary-submission-id.txt
+          retention-days: 3
 
       # ── Linux AppImage ─────────────────────────────────────────────
       - name: Build Linux AppImage
@@ -417,9 +426,84 @@ jobs:
           path: ${{ matrix.installer_path }}
           retention-days: 3
 
+  # ── Wait for notarization + staple the macOS DMG ─────────────────
+  # The DMG was already submitted to Apple in the build job; here we only wait
+  # for the verdict and attach the ticket. Split from build so a slow/hung wait
+  # can be retried with "Re-run failed jobs" WITHOUT recompiling OR re-uploading:
+  # it re-attaches to the same submission id, and if Apple has since finished the
+  # verdict returns immediately. stapler is macOS-only, so this runs on macOS.
+  # With no notary secrets (forks/PRs) the wait/staple is skipped and the build's
+  # DMG artifact is used as-is — the job still succeeds, so it never blocks
+  # `release` through needs-skip propagation.
+  notarize-macos:
+    needs: build
+    runs-on: macos-26
+    env:
+      MACOS_NOTARY_KEY_BASE64: ${{ secrets.MACOS_NOTARY_KEY_BASE64 }}
+      MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+      MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+      # Must match the macOS matrix entry's artifact name + installer_path.
+      DMG: epic-report-generator.dmg
+    steps:
+      - name: Download the signed DMG from build
+        uses: actions/download-artifact@v8
+        with:
+          name: installer-macos-26
+          path: .
+
+      - name: Download the notary submission id
+        if: env.MACOS_NOTARY_KEY_BASE64 != ''
+        uses: actions/download-artifact@v8
+        with:
+          name: notary-submission-id
+          path: .
+
+      - name: Wait for notary verdict and staple
+        if: env.MACOS_NOTARY_KEY_BASE64 != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          id="$(cat notary-submission-id.txt)"
+          KEYFILE="$RUNNER_TEMP/notary_key.p8"
+          echo "$MACOS_NOTARY_KEY_BASE64" | base64 --decode > "$KEYFILE"
+          # Re-attach to the submission created in the build job and wait for
+          # Apple's verdict. --timeout caps a pathological wait; on timeout the
+          # job fails and can be re-run to wait on the SAME id (no re-upload, no
+          # rebuild) — by then Apple has usually finished and it returns at once.
+          # Dump the notary log if the verdict is not Accepted.
+          set +e
+          xcrun notarytool wait "$id" \
+            --key "$KEYFILE" \
+            --key-id "$MACOS_NOTARY_KEY_ID" \
+            --issuer "$MACOS_NOTARY_ISSUER_ID" \
+            --timeout 1h
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            echo "::error::Notarization did not succeed for $id (exit $status)."
+            xcrun notarytool log "$id" \
+              --key "$KEYFILE" \
+              --key-id "$MACOS_NOTARY_KEY_ID" \
+              --issuer "$MACOS_NOTARY_ISSUER_ID" || true
+            rm -f "$KEYFILE"
+            exit "$status"
+          fi
+          rm -f "$KEYFILE"
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate "$DMG"
+
+      - name: Re-publish the stapled DMG
+        if: env.MACOS_NOTARY_KEY_BASE64 != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: installer-macos-26
+          path: ${{ env.DMG }}
+          retention-days: 3
+          overwrite: true
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [build, notarize-macos]
     runs-on: ubuntu-24.04
     steps:
       - name: Download all installer artifacts
