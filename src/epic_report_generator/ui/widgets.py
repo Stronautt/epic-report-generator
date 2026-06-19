@@ -128,6 +128,25 @@ def make_dialog_button_box(dialog: QDialog, ok_text: str) -> QDialogButtonBox:
     return box
 
 
+def exec_dialog(dialog: QDialog) -> int:
+    """Run a modal *dialog* and guarantee its C++ object is freed afterwards.
+
+    A parented ``QDialog`` shown with ``exec()`` is owned by its C++ parent, so
+    the Python wrapper going out of scope does **not** destroy it — it lingers
+    under the parent (a long-lived panel) until that parent dies, leaking the
+    whole dialog widget subtree on every reopen. Scheduling ``deleteLater()``
+    once ``exec()`` returns frees the subtree deterministically.
+
+    The deferred delete is processed on the next event-loop pass, so the dialog
+    is still alive when the caller reads its results (e.g. ``get_overrides()``,
+    ``selected_*``) immediately after this returns.
+    """
+    try:
+        return dialog.exec()
+    finally:
+        dialog.deleteLater()
+
+
 def _icon_btn(glyph: str, tooltip: str, hover: str, pressed: str) -> QPushButton:
     """Return a flat 22×22 icon button (grey glyph that tints on hover/press)."""
     btn = QPushButton(glyph)

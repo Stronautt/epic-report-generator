@@ -1,17 +1,17 @@
 # Epic Report Generator
 
-Generate polished, landscape PDF reports from your Jira Epics — in a few clicks.
+Generate landscape PDF reports from your Jira Epics in a few clicks.
 
-Epic Report Generator is a desktop app that connects to Jira Cloud, pulls Epic progress data (story points, issue counts, velocity, cycle time), renders Jira-style trend charts, and produces ready-to-share PDF reports. Hand them to stakeholders, attach them to Confluence, or drop them in Slack — no spreadsheets required.
+Epic Report Generator is a desktop app that connects to Jira Cloud, pulls Epic progress data (story points, issue counts, velocity, cycle time), draws trend charts, and produces PDF reports. Hand them to stakeholders, attach them to Confluence, or drop them in Slack. No spreadsheets required.
 
 ## What you get
 
-- **Title page** with project name, date, author, and optional confidentiality notice
-- **Summary table** — one row per Epic with progress bars, story points, issue counts, assignees, and optional scope-certainty legend
-- **Timeline page** — optional Gantt-style chart showing epic and (optionally) child issue date ranges with milestone markers (included by default; can be excluded via the "Include timeline chart" option)
-- **Per-Epic detail pages** — trend chart (total vs. completed SP, cumulative issues, weekend bands) plus a metrics sidebar (velocity, cycle time, scope change %, forecast date)
-- **Light & Dark themes** — Material Design base with app-specific overlays; the PDF and the app UI both follow your preference
-- **Theme customization** — pick a custom accent colour and font (from a file or by Google Fonts name) in Settings → Appearance; both the app and the report update, and a one-click reset restores the defaults
+- **Title page** with the project name, date, author, and an optional confidentiality notice
+- **Summary table**: one row per Epic, with progress bars, story points, issue counts, assignees, and an optional scope-certainty legend
+- **Timeline page**: a Gantt-style chart of epic (and optionally child-issue) date ranges with milestone markers. On by default; turn it off with the "Include timeline chart" option
+- **Per-Epic detail pages**: a trend chart (total vs. completed SP, cumulative issues, weekend bands) and a metrics sidebar (velocity, cycle time, scope change %, forecast date)
+- **Light and dark themes** built on Material Design with app-specific overlays. The PDF and the app UI follow the same preference
+- **Theme customization**: set a custom accent colour and font (from a file or by Google Fonts name) under Settings → Appearance. The app and the report both update, and a one-click reset restores the defaults
 
 ## Functional Requirements
 

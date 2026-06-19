@@ -30,7 +30,8 @@ env:
   # Modules to exclude — space-separated, expanded into --nofollow-import-to= flags at build time
   # NOTE: QtSvg is intentionally KEPT — qt-material renders all its UI chrome
   # (combobox arrows, checkboxes, radios, tree branches) from SVG icons via the
-  # qsvg plugin. QtNetwork (OAuth avatar) and QtPdf (PDF preview) are also required.
+  # qsvg plugin. QtNetwork (OAuth avatar) and QtPdf + QtPdfWidgets (the QPdfView
+  # PDF preview) are also required.
   NUITKA_NOFOLLOW: >-
     tkinter unittest test distutils
     ftplib imaplib poplib smtplib telnetlib nntplib
@@ -45,7 +46,7 @@ env:
     PySide6.QtPositioning PySide6.QtSensors PySide6.QtSerialPort
     PySide6.QtRemoteObjects PySide6.QtSpatialAudio PySide6.QtTextToSpeech
     PySide6.QtSvgWidgets PySide6.QtPrintSupport PySide6.QtSql
-    PySide6.QtConcurrent PySide6.QtXml PySide6.QtDBus PySide6.QtPdfWidgets
+    PySide6.QtConcurrent PySide6.QtXml PySide6.QtDBus
     PySide6.QtOpenGL PySide6.QtOpenGLWidgets
 
 jobs:

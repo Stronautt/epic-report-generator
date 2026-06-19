@@ -33,6 +33,7 @@ from epic_report_generator.ui.widgets import (
     LabelledField,
     ProfileBar,
     ReportItemTable,
+    exec_dialog,
     make_dialog_button_box,
     no_scroll_wheel,
 )
@@ -1364,7 +1365,7 @@ class ConfigPanel(QWidget):
             dialog.child_settings_requested.connect(
                 lambda child_row: self._on_child_epic_settings(dialog, child_row)
             )
-            if dialog.exec() == QDialog.DialogCode.Accepted:
+            if exec_dialog(dialog) == QDialog.DialogCode.Accepted:
                 new_overrides = dialog.get_overrides()
                 row.set_child_overrides(new_overrides)  # type: ignore[attr-defined]
                 row.set_child_order(dialog.get_child_order())  # type: ignore[attr-defined]
@@ -1425,7 +1426,7 @@ class ConfigPanel(QWidget):
                 child_order=child_order,
                 parent=parent_dialog,
             )
-            if nested.exec() == QDialog.DialogCode.Accepted:
+            if exec_dialog(nested) == QDialog.DialogCode.Accepted:
                 child_row.set_nested(  # type: ignore[attr-defined]
                     nested.get_overrides(), nested.get_child_order()
                 )
@@ -1510,7 +1511,7 @@ class ConfigPanel(QWidget):
                     "timeline_end_field": self._timeline_end_field.text.strip(),
                 },
             )
-            if dialog.exec() == QDialog.DialogCode.Accepted:
+            if exec_dialog(dialog) == QDialog.DialogCode.Accepted:
                 if method == "story_points":
                     sp_id = dialog.selected_sp_field
                     if sp_id:

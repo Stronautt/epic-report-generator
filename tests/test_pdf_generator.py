@@ -115,6 +115,13 @@ class TestGeneratePdf:
         pdf = generate_pdf(report)
         assert pdf[:5] == b"%PDF-"
 
+    def test_cjk_content_renders(self) -> None:
+        """CJK text in the report exercises the conditional Noto CJK font path."""
+        report = _make_report()
+        report.config.title = "プロジェクト計画 — 项目进度 — 프로젝트"
+        pdf = generate_pdf(report)
+        assert pdf[:5] == b"%PDF-"
+
     def test_epic_without_children(self) -> None:
         """An epic with no children should not crash PDF generation."""
         epic = _make_epic("PROJ-99", [])
