@@ -1,0 +1,1 @@
+Turn your Jira Cloud Epics into a shareable PDF report: progress bars, a Gantt timeline, and trend charts, all generated on your Mac.

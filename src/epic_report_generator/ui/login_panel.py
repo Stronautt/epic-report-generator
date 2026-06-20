@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 from epic_report_generator.core.jira_client import JiraClient
+from epic_report_generator.services import install_source
 from epic_report_generator.services.auth_manager import AuthManager
 from epic_report_generator.services.config_manager import ConfigManager
 from epic_report_generator.ui._threading import ThreadedTask
@@ -62,6 +63,10 @@ class LoginPanel(QWidget):
         self._jira = jira
         self._tasks = ThreadedTask(self)
         self._nam = QNetworkAccessManager(self)
+        # MAS v1 is API-Token-only: hide the OAuth tab in managed-store builds
+        # (the loopback OAuth redirect would need a network.server entitlement we
+        # deliberately omit). Non-store builds keep both tabs.
+        self._oauth_enabled = not install_source.is_store_install()
 
         self._build_ui()
 
@@ -89,7 +94,8 @@ class LoginPanel(QWidget):
         root.addWidget(self._tabs)
 
         self._build_api_token_tab()
-        self._build_oauth_tab()
+        if self._oauth_enabled:
+            self._build_oauth_tab()
 
         root.addStretch()
 
@@ -347,13 +353,14 @@ class LoginPanel(QWidget):
         """Attempt to restore a previous session from keyring."""
         logger.debug("Attempting to restore previous session")
 
-        # Pre-fill OAuth config fields
-        cid = self._config.get("client_id", "")
-        csec = self._config.get("client_secret", "")
-        if cid:
-            self._client_id_field.text = cid
-        if csec:
-            self._client_secret_field.text = csec
+        # Pre-fill OAuth config fields (only when the OAuth tab exists)
+        if self._oauth_enabled:
+            cid = self._config.get("client_id", "")
+            csec = self._config.get("client_secret", "")
+            if cid:
+                self._client_id_field.text = cid
+            if csec:
+                self._client_secret_field.text = csec
 
         # Pre-fill API token fields
         saved_url = self._config.get("jira_url", "")
@@ -382,7 +389,7 @@ class LoginPanel(QWidget):
             )
             return
 
-        if method == "oauth":
+        if method == "oauth" and self._oauth_enabled:
             logger.debug("Restoring OAuth session")
             if not self._auth.is_configured:
                 logger.info("OAuth not configured — showing setup section")
@@ -471,14 +478,15 @@ class LoginPanel(QWidget):
         self._connect_btn.setEnabled(True)
         self._connect_btn.setText("Connect")
 
-        # Reset OAuth tab
-        self._login_btn.setText("Login with Atlassian")
-        self._login_btn.setEnabled(True)
-        self._login_btn.show()
+        # Reset OAuth tab (only present in non-store builds)
+        if self._oauth_enabled:
+            self._login_btn.setText("Login with Atlassian")
+            self._login_btn.setEnabled(True)
+            self._login_btn.show()
 
-        if not self._auth.is_configured:
-            self._setup_section.show()
-            self._login_btn.setEnabled(False)
+            if not self._auth.is_configured:
+                self._setup_section.show()
+                self._login_btn.setEnabled(False)
 
         # Show tabs again
         self._tabs.show()

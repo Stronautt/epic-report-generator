@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "epic-report-generator"
-version = "1.0.2"
+version = "1.0.4"
 description = "PySide6 desktop app that generates PDF Epic progress reports from Jira Cloud"
 readme = "README.md"
 license = "MIT"
@@ -39,6 +39,7 @@ dev = [
     "pytest-cov>=5.0",
     "build>=1.2",
     "pypdf>=5.0",
+    "PyYAML>=6.0",
 ]
 
 [project.scripts]

@@ -31,6 +31,32 @@ def _get(url: str) -> tuple[int, str]:
         return exc.code, exc.read().decode()
 
 
+class TestReuseAddr:
+    """SO_REUSEADDR avoids EADDRINUSE on a quick re-login on the fixed port."""
+
+    def test_allow_reuse_address_enabled(self) -> None:
+        server = OAuthCallbackServer(0, "s")
+        try:
+            assert server.allow_reuse_address is True
+            assert server.server_address[0] == "127.0.0.1"
+        finally:
+            server.server_close()
+
+    def test_rapid_rebind_same_port(self) -> None:
+        """Bind, close, and rebind the same port without EADDRINUSE."""
+        first = OAuthCallbackServer(0, "s")
+        port = first.server_address[1]
+        first.server_close()
+
+        # Re-bind the just-released port immediately; SO_REUSEADDR makes this
+        # succeed even while the previous socket lingers in TIME_WAIT.
+        second = OAuthCallbackServer(port, "s")
+        try:
+            assert second.server_address[1] == port
+        finally:
+            second.server_close()
+
+
 class TestCallbackSuccess:
     """A valid callback should capture the authorization code."""
 

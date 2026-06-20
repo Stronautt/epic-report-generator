@@ -97,6 +97,11 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
 class OAuthCallbackServer(HTTPServer):
     """An HTTPServer that stores the callback result and auto-shuts down."""
 
+    # Set SO_REUSEADDR before binding so a quick re-login on the fixed callback
+    # port (18492) does not hit EADDRINUSE while the previous socket lingers in
+    # TIME_WAIT. socketserver reads this class attribute during server_bind().
+    allow_reuse_address = True
+
     def __init__(self, port: int, expected_state: str) -> None:
         super().__init__(("127.0.0.1", port), OAuthCallbackHandler)
         self.expected_state = expected_state

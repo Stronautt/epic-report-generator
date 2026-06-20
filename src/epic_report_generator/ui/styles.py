@@ -282,6 +282,16 @@ QLabel[status="connected"] {
     background: transparent;
     qproperty-alignment: 'AlignCenter';
 }
+/* Privacy policy — always-visible muted footnote below the copyright. Smaller
+   than the copyright label; the muted anchor colour is set inline (QSS can't
+   colour an <a>), so only structural rules live here. */
+#sidebarPrivacyLink {
+    font-size: 9px;
+    font-weight: 500;
+    padding: 0 10px 2px 10px;
+    background: transparent;
+    qproperty-alignment: 'AlignCenter';
+}
 """
 
 # ---------------------------------------------------------------------------

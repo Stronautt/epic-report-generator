@@ -20,7 +20,8 @@ The GitHub Actions workflow (`.github/workflows/build.yml`) runs on `v*` tags an
 | Platform | Installer | Tool |
 |---|---|---|
 | Windows | `epic-report-generator-setup.exe` | Inno Setup (`packaging/windows/setup.iss`) |
-| macOS | `epic-report-generator.dmg` | `create-dmg` from the Nuitka `.app` bundle |
+| macOS (direct) | `epic-report-generator.dmg` | `create-dmg` from the Nuitka `.app` bundle (Developer-ID notarized) |
+| macOS (store) | `epic-report-generator-mas.pkg` | `productbuild` from a re-signed Nuitka `.app` (Mac App Store) |
 | Linux | `epic-report-generator.AppImage` | `appimagetool` + `packaging/linux/AppDir/` |
 
 Key Nuitka flags used across all platforms:
@@ -31,7 +32,98 @@ Key Nuitka flags used across all platforms:
 
 Linux uses `--onedir` (not `--onefile`) because AppImage provides its own single-file SquashFS layer. macOS uses `--macos-create-app-bundle` with the display name `"Epic Report Generator.app"`. Windows uses `--onefile` with `--windows-console-mode=disable` and embeds a `.ico` converted from `logo.png` at build time via Pillow.
 
-Only installer artifacts are uploaded — plain binaries are not retained. The workflow has no release job; GitHub Releases are created manually.
+**App-icon assets.** Two source PNGs live in `resources/`: **`logo.png`** is *full-bleed* (artwork fills ~90% of the canvas) and feeds the Windows `.ico` (multi-size 16/24/32/48/64/128/256), the Linux AppImage icons, and the in-app `setWindowIcon`. **`logo-macos.png`** is the *padded* variant (artwork inset ~9% per Apple's HIG) and is used **only** by macOS — `--macos-app-icon` in CI and `_macos_install()` (via `desktop._macos_icon_src()`, which falls back to `logo.png`). Using the padded file everywhere previously made the Windows/Linux icons look shrunken. For Linux desktop integration the icon must land in `AppDir/usr/share/icons/hicolor/{256x256,512x512}/apps/epic-report-generator.png` (the AppDir-root `.DirIcon` only feeds the file-manager thumbnail; AppImageLauncher/`appimaged` read the menu icon from the hicolor theme). On Windows, `app._set_windows_app_id()` sets the `AppUserModelID` to `desktop.BUNDLE_ID` before the first window so the taskbar button unifies with the pinned shortcut. On Linux, the **running window's** dock/taskbar icon is resolved by matching the window's `WM_CLASS` / Wayland `app_id` to a `.desktop` entry (GNOME/Wayland ignores `setWindowIcon`), so `run_app` calls `app.setDesktopFileName(desktop.APP_ID)` and **both** the AppImage `.desktop` (`packaging/linux/AppDir/`) and the from-source `_DESKTOP_ENTRY` carry `StartupWMClass=epic-report-generator` — all three (`app_id`, `StartupWMClass`, `.desktop` basename) must equal `epic-report-generator`.
+
+Both macOS channels sign **inside-out** (strip every Mach-O, sign deepest-first with our Team ID, the app bundle last — no `--deep`) via sibling scripts: `packaging/macos/sign_devid.sh` for the Developer-ID `.dmg` (hardened runtime + the `cs.*` entitlements in `entitlements.plist`) and `packaging/macos/sign_mas.sh` for the Mac App Store `.pkg` (App Sandbox + inherit entitlements). Because every nested binary is re-signed under one Team ID, **neither needs `disable-library-validation`**. `sign_devid.sh` falls back to an inside-out ad-hoc signature when no `MACOS_SIGN_IDENTITY` is set (forks / no-secrets CI); it is invoked from the build job's "Sign binaries (macOS)" step.
+
+Only installer artifacts are uploaded — plain binaries are not retained. The `release` job is tag-driven and downloads with an `installer-*` pattern, so it publishes **only** the three platform installers (Dev-ID `.dmg` + Windows/Linux); the cross-job handoff artifacts (`unsigned-macos-app`, `notary-submission-id`) and the Mac App Store `.pkg` are **not** part of it. The `.pkg` is never stored as a workflow artifact at all — it goes straight to TestFlight.
+
+### Mac App Store channel
+
+macOS ships through **two** independent channels from the same Nuitka `.app`:
+
+- **Direct download** (primary): the Developer-ID notarized `.dmg`. Keeps OAuth.
+  `build` → `notarize-macos` → `release`, unchanged.
+- **Mac App Store** (MAS): a sandboxed, TestFlight-distributed `.pkg`. Built by a
+  **`mas-upload` job** (`needs: build`, `runs-on: macos-26`) that runs in the
+  tag-driven flow — gated on the `v*` tag ref (`if: startsWith(github.ref,
+  'refs/tags/v')`) plus MAS secrets, so forks/PRs and non-tag dispatches skip it.
+  It only **validates then uploads to TestFlight** (`fastlane mac beta`); App
+  Review submission (`fastlane mac release`) is **not** automated. The GitHub
+  `release` job is **gated on it** (`mas-upload` is in `release`'s `needs`): a
+  failed TestFlight upload must not cut a release. Because `mas-upload` shares
+  `release`'s `v*` gate and every MAS step no-ops (job still succeeds) when the
+  MAS secrets are absent, forks / no-secrets runs are unaffected — the gate only
+  bites when MAS is configured and genuinely fails. (Trade-off: a real
+  TestFlight/ASC hiccup will now hold back the public installer release until the
+  run is fixed or re-run.)
+
+Key MAS differences from the Dev-ID build:
+
+- **API-Token sign-in only.** The OAuth tab is hidden in store builds
+  (`login_panel` gates `_build_oauth_tab()` on `install_source.is_store_install()`).
+  OAuth can return later via the `entitlements.mas.oauth.plist` (adds
+  `network.server`) plus un-gating the tab — a flag-flip, not a rewrite. The
+  Dev-ID `.dmg` keeps OAuth.
+- **Sandbox + entitlements.** `packaging/macos/entitlements.mas.plist` (container:
+  `app-sandbox` + `network.client` + `files.user-selected.read-write`) and
+  `entitlements.mas.inherit.plist` (nested: `app-sandbox` + `inherit`). **No
+  `cs.*`** entitlements and **no hardened runtime** (those stay on the Dev-ID
+  `entitlements.plist`). No XML comments (AMFI rejects `<!--`); a plist guard test
+  enforces both.
+- **Inside-out signing.** `packaging/macos/sign_mas.sh` strips, then signs
+  deepest-first with the **Apple Distribution** identity (every nested
+  `*.dylib`/`*.so` incl. the Typst `.so`, frameworks as bundles, nested
+  executables + main exe with the inherit entitlements), then the app bundle last
+  with the container entitlements. **No `--deep`**, no `disable-library-validation`
+  (re-signing with our Team ID makes library validation pass). The Dev-ID `.dmg`
+  signs inside-out the same way via `packaging/macos/sign_devid.sh` (hardened
+  runtime + `entitlements.plist` in place of sandbox/inherit), so it too dropped
+  `disable-library-validation`.
+  Before the final app-bundle signing, `sign_mas.sh` injects
+  **`com.apple.application-identifier`** (+ `com.apple.developer.team-identifier`)
+  into a copy of the container entitlements — Xcode adds these automatically but
+  plain `codesign` does not, and TestFlight rejects a build whose signature lacks
+  the app identifier present in the profile (**ITMS-90886**). The value is decoded
+  from the embedded provisioning profile (`security cms -D`, exact match) with an
+  `$APPLE_TEAM_ID` + bundle-id fallback.
+- **`.pkg` wrapper.** `packaging/macos/build_pkg.sh` runs `productbuild
+  --component … /Applications --sign "<Mac Installer Distribution>"`, with an
+  optional `altool --validate-app` gated on ASC creds.
+- **fastlane.** `fastlane/Appfile` + `Fastfile` (lanes `bootstrap`, `profile`,
+  `beta`, `release`; ASC API key; **no `match`/`gym`** — Nuitka builds the `.app`).
+  `Gemfile` pins `fastlane`. `bootstrap`/`produce` runs locally once.
+- **Bundle identity.** One `CFBundleIdentifier = com.epicreportgenerator.app`
+  (`MAS_BUNDLE_ID` build var + `desktop.BUNDLE_ID`), plus MAS Info.plist keys
+  (`LSApplicationCategoryType`, `ITSAppUsesNonExemptEncryption=false`,
+  `LSMinimumSystemVersion`, monotonic `CFBundleVersion = git rev-list --count HEAD`).
+- **Deployment target (12.0).** The runners are Apple Silicon, so Nuitka emits an
+  **arm64-only** `.app`; the App Store accepts arm64-only only at a **macOS 12.0+**
+  deployment target (**ITMS-90869**), and it reads the **Mach-O `LC_BUILD_VERSION`
+  `minos`** — not `LSMinimumSystemVersion` — across *every* nested binary. Nuitka
+  bakes `minos` from the building Python and ignores `MACOSX_DEPLOYMENT_TARGET`
+  (Nuitka #2513), so the build job's **"Set Mach-O minimum macOS version"** step
+  rewrites every Mach-O with `vtool -set-build-version macos $MACOS_DEPLOYMENT_TARGET
+  … -replace` *after* Nuitka and *before* any signing (vtool invalidates
+  signatures; the signing steps re-sign). `MACOS_DEPLOYMENT_TARGET = "12.0"` drives
+  both the plist key and the `vtool` rewrite, and the floor is shared by **both**
+  channels (the Dev-ID `.dmg` also requires macOS 12).
+- **Fresh-start migration.** No auto-migration from the `.dmg`. MAS data lives in
+  the sandbox container `~/Library/Containers/com.epicreportgenerator.app/Data/…`,
+  separate from the `.dmg`'s `~/Library/Application Support/…`.
+- **No notarization.** Where the Dev-ID `.dmg` is notarized (`notarytool` +
+  staple), the MAS `.pkg` is **not** — App Review replaces notarization, and the
+  app carries an embedded provisioning profile instead of a notarization ticket.
+  Self-update is disabled in store builds (`install_source` `_MASReceipt` gating,
+  already correct).
+
+Three cross-linked docs cover the channel: the feasibility analysis in
+`docs/mac-app-store-research.md`, the in-repo execution plan in
+`docs/plans/2026-06-20-mac-app-store-distribution.md`, and the ASC-side
+submission metadata (privacy nutrition label, demo creds, category, screenshots)
+in `docs/mac-app-store-submission.md`; the privacy policy is
+`docs/privacy-policy.md`. The OAuth re-enablement path is documented as the
+`entitlements.mas.oauth.plist` (adds `network.server`) flag-flip.
 
 ## Tech Stack
 
@@ -44,6 +136,7 @@ Only installer artifacts are uploaded — plain binaries are not retained. The w
 - **Token storage**: `keyring` (OS-native)
 - **Config**: `platformdirs` + JSON
 - **Dates**: python-dateutil
+- **Docs rendering**: Python-Markdown (`markdown`) — renders the bundled user guide to HTML in the Help panel
 - **Python**: >=3.11
 
 ## Project Structure
@@ -86,7 +179,8 @@ src/epic_report_generator/
     ├── typst/                     # Templates: theme, components (gantt, trend_chart, progress_bar, …), pages
     ├── fonts/                     # Bundled Inter (deterministic cross-OS rendering) + Noto Sans CJK JP (CJK fallback)
     ├── user-guide.md              # End-user guide, rendered in-app by help_panel (bundled as package data)
-    └── logo.png
+    ├── logo.png                   # Full-bleed app icon (Windows .ico, Linux AppImage, in-app window icon)
+    └── logo-macos.png             # Padded variant (Apple HIG inset) — macOS app icon only
 ```
 
 ## Architecture

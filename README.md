@@ -50,7 +50,30 @@ Go to the [Releases](../../releases) page and download the installer for your pl
 | **macOS** | `epic-report-generator.dmg` | Open the DMG, drag the app to Applications |
 | **Linux** | `epic-report-generator.AppImage` | `chmod +x epic-report-generator.AppImage && ./epic-report-generator.AppImage` |
 
-No Python installation required — the app is fully self-contained.
+No Python installation required. The app is fully self-contained.
+
+#### macOS: two channels
+
+macOS is available two ways:
+
+- **Direct download:** the `epic-report-generator.dmg` above. Supports both
+  API-Token and OAuth sign-in.
+- **Mac App Store:** a sandboxed build that ships API-Token sign-in only
+  (the OAuth tab is hidden). The App Store handles updates.
+
+> **The Mac App Store build is the same app as the free direct download** on the
+> [Releases](../../releases) page: same features, same reports, nothing locked
+> behind a paywall. The only reason to buy it is to support the work. If you'd
+> rather not pay, grab the `.dmg` above and run the same app for free.
+
+The two builds keep separate storage with no migration between them: the Mac App
+Store build stores its settings and cache inside its sandbox
+container (`~/Library/Containers/com.epicreportgenerator.app/Data/…`), while the
+direct download uses `~/Library/Application Support/Epic Report Generator/…`. If
+you switch channels, re-enter your Jira URL, email, and API token once.
+
+See the [Privacy Policy](docs/privacy-policy.md) for how your data is handled
+(short version: local-first, no developer servers, no analytics).
 
 ### Connect to Jira
 
@@ -130,7 +153,7 @@ Three progress methods are available:
 
 ## Tech stack
 
-PySide6 · qt-material · ReportLab · matplotlib · jira · keyring · platformdirs
+PySide6 · qt-material · Typst (typst-py) · jira · requests · keyring · platformdirs · python-dateutil · markdown
 
 ## License
 

@@ -59,6 +59,25 @@ class _CursorEventFilter(QObject):
             obj.setCursor(Qt.CursorShape.PointingHandCursor)
 
 
+def _set_windows_app_id() -> None:
+    """Give Windows an explicit AppUserModelID for correct taskbar identity.
+
+    Without this, Windows does not unify the running process with its pinned /
+    Start-menu shortcut (duplicate taskbar buttons) and jump lists do not work.
+    Must run before the first window is created. No-op off Windows; never raises.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        from epic_report_generator.desktop import BUNDLE_ID
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(BUNDLE_ID)
+    except Exception:  # pragma: no cover - best-effort cosmetic taskbar fix
+        logger.debug("Could not set Windows AppUserModelID", exc_info=True)
+
+
 def run_app(argv: list[str] | None = None) -> int:
     """Create and run the application, returning the exit code."""
     logging.basicConfig(
@@ -68,9 +87,17 @@ def run_app(argv: list[str] | None = None) -> int:
 
     logger.info("Starting Epic Report Generator")
 
+    _set_windows_app_id()
     app = QApplication(argv or sys.argv)
     app.setApplicationName("Epic Report Generator")
     app.setOrganizationName("EpicReportGenerator")
+    # Tie the window to its .desktop entry so the Linux dock/taskbar (esp.
+    # GNOME/Wayland, which ignores setWindowIcon) shows the app icon instead of
+    # a generic one. Sets the Wayland app_id / X11 WM_CLASS; must match the
+    # .desktop basename and its StartupWMClass.
+    from epic_report_generator.desktop import APP_ID
+
+    app.setDesktopFileName(APP_ID)
 
     try:
         from epic_report_generator.resources_util import get_resource_path

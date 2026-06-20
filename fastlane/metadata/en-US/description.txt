@@ -1,0 +1,16 @@
+Epic Report Generator builds PDF status reports from your Jira Cloud Epics. Connect with a Jira API token, pick the Epics or labels you care about, and it generates a landscape PDF with progress bars, a Gantt-style timeline, and per-Epic trend charts. Everything runs locally on your Mac.
+
+FEATURES
+• Connect to Jira Cloud with an API token (site URL, email, token)
+• Report on a single Epic, or group several Epics under a label
+• Bottom-up progress across Epics, stories, and subtasks
+• Estimate by story points or by time in days
+• Gantt-style timeline you can pin to a fixed date window
+• Per-Epic trend charts: velocity, cycle time, scope change, and forecast
+• Scope-certainty indicators, with per-item overrides
+• Drag to reorder items; rename or hide individual children
+• Set your own accent colour and fonts for both the app and the PDF
+• Light and dark themes
+• Export a 16:9 landscape PDF, ready to drop into a deck
+
+Your Jira credentials live in the macOS Keychain and are used only to reach your own Jira site. The app collects no account or usage data.

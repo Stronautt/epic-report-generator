@@ -34,6 +34,7 @@ from epic_report_generator.services.auth_manager import AuthManager
 from epic_report_generator.services.config_manager import ConfigManager
 from epic_report_generator.services.font_manager import FontManager
 from epic_report_generator.services.update_checker import (
+    PRIVACY_POLICY_URL,
     RELEASES_URL,
     UpdateChecker,
     UpdateInfo,
@@ -87,6 +88,9 @@ class MainWindow(QMainWindow):
         # refreshed by _apply_theme and embedded in the hyperlink's inline style.
         self._update_info: UpdateInfo | None = None
         self._accent_hex = theming.DEFAULT_ACCENT
+        # Muted hex for the always-visible sidebar privacy link (matches the
+        # copyright label); refreshed per theme in _apply_theme.
+        self._muted_hex = "#aeb1b8"
 
         self.setWindowTitle("Epic Report Generator")
         self.setMinimumSize(self._MIN_WINDOW_WIDTH, self._MIN_WINDOW_HEIGHT)
@@ -183,6 +187,16 @@ class MainWindow(QMainWindow):
         self._copyright_label = QLabel("© Olha & Pavlo")
         self._copyright_label.setObjectName("sidebarCopyright")
         footer_layout.addWidget(self._copyright_label)
+
+        # Privacy policy — always visible, muted + small, below the copyright.
+        # The anchor colour is set inline in _render_privacy_link (QSS can't
+        # colour an <a>); clicking opens the policy in the browser.
+        self._privacy_link = QLabel()
+        self._privacy_link.setObjectName("sidebarPrivacyLink")
+        self._privacy_link.setTextFormat(Qt.TextFormat.RichText)
+        self._privacy_link.setOpenExternalLinks(True)
+        self._privacy_link.setCursor(Qt.CursorShape.PointingHandCursor)
+        footer_layout.addWidget(self._privacy_link)
 
         sidebar_layout.addWidget(footer)
 
@@ -463,6 +477,8 @@ class MainWindow(QMainWindow):
         self._accent_hex = (
             shades or theming.qt_shades(theming.DEFAULT_ACCENT, is_dark)
         )["accent"]
+        # Muted privacy-link colour, matching #sidebarCopyright per theme.
+        self._muted_hex = "#65686c" if is_dark else "#aeb1b8"
 
         theme_xml = self._MATERIAL_THEMES.get(theme, self._MATERIAL_THEMES["light"])
 
@@ -495,6 +511,7 @@ class MainWindow(QMainWindow):
         # Re-tint the update hyperlink (if shown) for the new accent — its colour
         # lives in inline HTML, so a QSS re-apply alone wouldn't update it.
         self._render_update_link()
+        self._render_privacy_link()
 
     def _on_appearance_changed(self) -> None:
         """Re-apply the current theme after accent/font customization."""
@@ -561,6 +578,19 @@ class MainWindow(QMainWindow):
         """
         if isinstance(info, UpdateInfo):
             self._apply_update_info(info)
+
+    def _render_privacy_link(self) -> None:
+        """Set the always-visible sidebar privacy link for the active theme.
+
+        The muted colour matches the copyright label above it; an anchor's colour
+        isn't stylable via QSS, so it is set inline here and re-tinted on a theme
+        change.
+        """
+        self._privacy_link.setText(
+            f'<a href="{PRIVACY_POLICY_URL}" '
+            f'style="color:{self._muted_hex}; text-decoration:underline;">'
+            "Privacy Policy</a>"
+        )
 
     def _apply_update_info(self, info: UpdateInfo) -> None:
         """Store a finished update check and refresh the hyperlink."""

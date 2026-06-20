@@ -1,0 +1,8 @@
+# fastlane Appfile — Mac App Store distribution.
+#
+# All identity comes from environment variables so the same config works locally
+# (the one-time `bootstrap`/`produce` run) and in CI (`profile`/`beta`/`release`
+# with the ASC API key). No Matchfile — signing is manual.
+app_identifier(ENV["MAS_BUNDLE_ID"])      # e.g. com.epicreportgenerator.app
+apple_id(ENV["FASTLANE_APPLE_ID"])        # only for `produce`, run locally
+team_id(ENV["APPLE_TEAM_ID"])

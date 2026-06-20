@@ -15,6 +15,11 @@ logger = logging.getLogger(__name__)
 
 APP_ID = "epic-report-generator"
 APP_NAME = "Epic Report Generator"
+# Single source of truth for the macOS bundle identifier, shared by both
+# distribution channels (the Developer-ID .dmg and the Mac App Store .pkg).
+# The CI build var MAS_BUNDLE_ID (.github/workflows/build.yml) and the ASC app
+# record must use this exact string; the plist guard test keeps them in step.
+BUNDLE_ID = "com.epicreportgenerator.app"
 _GUI_ENTRY_POINT = "epic-report-generator-gui"
 
 
@@ -111,7 +116,7 @@ _INFO_PLIST = """\
     <key>CFBundleName</key>
     <string>{name}</string>
     <key>CFBundleIdentifier</key>
-    <string>com.epicreportgenerator.app</string>
+    <string>{bundle_id}</string>
     <key>CFBundleExecutable</key>
     <string>{executable}</string>
     <key>CFBundleIconFile</key>
@@ -133,8 +138,21 @@ exec {bin_path} "$@"
 """
 
 
+def _macos_icon_src() -> Path:
+    """Return the macOS app-icon source.
+
+    macOS icons follow Apple's HIG (artwork inset with a transparent margin),
+    so prefer the padded ``logo-macos.png`` variant; fall back to the full-bleed
+    ``logo.png`` if the variant is absent.
+    """
+    try:
+        return get_resource_path("logo-macos.png")
+    except FileNotFoundError:
+        return get_resource_path("logo.png")
+
+
 def _macos_install() -> None:
-    icon_src = get_resource_path("logo.png")
+    icon_src = _macos_icon_src()
     bin_path = _resolve_gui_bin()
 
     contents = _MACOS_APP_BUNDLE / "Contents"
@@ -147,7 +165,7 @@ def _macos_install() -> None:
     # Info.plist
     plist = contents / "Info.plist"
     plist.write_text(
-        _INFO_PLIST.format(name=APP_NAME, executable=APP_ID),
+        _INFO_PLIST.format(name=APP_NAME, executable=APP_ID, bundle_id=BUNDLE_ID),
         encoding="utf-8",
     )
 

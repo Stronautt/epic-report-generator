@@ -40,6 +40,11 @@ _LATEST_RELEASE_API = (
     f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 )
 RELEASES_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+# Public privacy-policy URL (App Store Connect + the in-app sidebar link). Hosted
+# as a GitHub gist so it can be updated without shipping a new app build.
+PRIVACY_POLICY_URL = (
+    "https://gist.github.com/Stronautt/ff26be326e9736d3652d377e0dab25ba"
+)
 
 # GitHub requires a User-Agent; the API version header pins the response shape.
 _HEADERS = {
