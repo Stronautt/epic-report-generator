@@ -127,6 +127,8 @@ Customize the report's cover.
 | **Show detailed metrics** | On | Cycle time, velocity, scope change, and a completion forecast on each epic's page |
 | **Expand label epics** | On | A separate page per epic under a label (instead of one combined page) |
 
+> **Always use light theme for report** *(on by default)* keeps the PDF light even when the app is in dark mode. Turn it off to let a dark app theme carry through to the report.
+
 ### Timeline
 
 A Gantt-style timeline page showing when epics start and finish.
