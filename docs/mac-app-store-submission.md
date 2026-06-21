@@ -87,6 +87,38 @@ working demo Jira instance in the review notes:
 - Confirm the demo site is reachable and the sample data renders before
   submitting.
 
+### Make the dependency easier — two levels
+
+The hard part of Guideline 2.1 here is that the reviewer cannot evaluate the app
+without a working Jira. Two ways to de-risk it, cheapest first:
+
+1. **Ship-now (no code): a stable, dedicated demo site.** Create a *throwaway*
+   free Atlassian Cloud site used **only** for review — not a personal/work site.
+   Seed one project (`DEMO`) with ~3 Epics, a dozen child issues carrying story
+   points and start/due dates, and a couple of labels, so every report surface
+   (summary, timeline, per-epic detail) has data. Generate a **long-lived API
+   token** on the review user and **disable 2FA** on it. Paste URL + email + token
+   into the review notes. Caveats that cause re-review: tokens can be revoked,
+   free sites can be deactivated for inactivity, and rate limits / outages all
+   read to the reviewer as "app is broken." Re-verify the day you submit.
+
+2. **Durable (small code change), recommended: an offline "Sample data" mode.**
+   Add a **"Try with sample data"** button on the login panel that loads bundled
+   demo `EpicData`/`ReportData` fixtures and skips the network entirely. The
+   reviewer evaluates the full report flow with **no credentials, no external
+   site, no token to expire** — which removes the single biggest 2.1 rejection
+   cause for credential-gated apps. Seam: `login_panel` already gates UI on
+   `install_source.is_store_install()` (see `_oauth_enabled` at
+   `login_panel.py:69`); add the demo entry the same way and feed a stub that
+   returns bundled fixtures into the existing `JiraClient` → report path instead
+   of `connect_basic()`. Bundle the fixtures as package data under
+   `resources/`. This also doubles as a first-run "what does a report look like?"
+   onboarding for real users.
+
+Best practice is **both**: ship the demo button *and* still put working demo creds
+in the notes (belt-and-suspenders), so the reviewer can exercise the live-Jira
+path too if they choose.
+
 ## App Category
 
 - **Primary:** Productivity (`public.app-category.productivity`, matching
@@ -95,15 +127,18 @@ working demo Jira instance in the review notes:
 
 ## Screenshots
 
-macOS App Store screenshots are **landscape**. Provide at least one set in a
-supported size:
+macOS App Store screenshots are **landscape**, **RGB**, **no alpha/transparency**
+(flatten before upload), PNG or JPEG. ASC requires the image to be *exactly* one
+of these pixel sizes — a normal window grab will not match, so capture at a fixed
+size (procedure below). Provide 1–10 shots in **one** size; the whole set must use
+the same size:
 
 - 1280 × 800
 - 1440 × 900
-- 2560 × 1600
-- 2880 × 1800
+- 2560 × 1600  ← easiest on Retina (capture 1280×800 points)
+- 2880 × 1800  ← easiest on Retina (capture 1440×900 points)
 
-Shot list (capture in light or dark theme, consistent across the set):
+Shot list (capture in light *or* dark theme, consistent across the set):
 
 1. **Login** — the API-Token tab with the Jira URL/email/token fields.
 2. **Report Items configuration** — Step 1 with Epic/label rows, certainty
@@ -111,6 +146,44 @@ Shot list (capture in light or dark theme, consistent across the set):
 3. **Report preview** — the in-app PDF preview of a generated report.
 4. **Exported PDF page** — a summary or per-epic detail page of an exported PDF.
 5. **Settings / Appearance** — theme, accent colour, and font customization.
+
+### How to capture at an exact size
+
+You need a Mac. Install the uploaded build from **TestFlight** (TestFlight.app →
+Epic Report Generator → Install) or run the Nuitka `.app` locally. To get real
+data into shots 2–4, connect with the **demo Jira** (next section) and generate a
+report first.
+
+**Retina trick.** `screencapture -R` takes coordinates in *points*; on a 2× Retina
+display the PNG comes out at double the pixels. So a 1440×900-point region →
+**2880×1800 px**, and 1280×800 points → **2560×1600 px** — both valid sizes with
+no resizing.
+
+1. Move the app window to the **top-left** of the main display and resize its
+   content so it is at least 1440×900 points (it must fully cover the capture
+   region — anything outside the window captures desktop).
+2. Capture the fixed region in Terminal (`-x` mutes the shutter, `-t png`):
+
+   ```sh
+   screencapture -R 0,0,1440,900 -t png -x ~/Desktop/shot1.png   # → 2880 × 1800 px
+   # or, for the smaller set:
+   screencapture -R 0,0,1280,800 -t png -x ~/Desktop/shot1.png   # → 2560 × 1600 px
+   ```
+3. Verify the pixels: `sips -g pixelWidth -g pixelHeight ~/Desktop/shot1.png`.
+4. Repeat for each shot, navigating the app between captures (keep the window in
+   the same place/size so every image is identical dimensions).
+5. **Flatten alpha** before upload (window content is opaque, but be safe):
+
+   ```sh
+   sips -s format jpeg -s formatOptions best ~/Desktop/shot1.png --out ~/Desktop/shot1.jpg
+   ```
+6. ASC → **My Apps → (app) → macOS App → version → Screenshots**: drag the set in,
+   then order them to match the shot list.
+
+**Not on a Retina Mac, or window too small?** Grab the window with
+`Cmd+Shift+4` then `Space` (click the window), then in Preview place/scale it onto
+a solid-colour canvas sized exactly to one of the sizes above (ASC allows a
+background around the window). Flatten and export as in step 5.
 
 ## Fresh-Start Migration
 

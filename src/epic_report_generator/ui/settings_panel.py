@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 class SettingsPanel(QWidget):
     """Application settings: connection info, theme, defaults, logout."""
 
-    theme_changed = Signal(str)  # "light" or "dark"
+    theme_changed = Signal(str)  # "light", "dark", or "system"
     appearance_changed = Signal()  # accent/font customization changed
     logout_requested = Signal()
 
@@ -195,8 +195,14 @@ class SettingsPanel(QWidget):
         layout.addWidget(theme_lbl)
         self._theme_combo = QComboBox()
         no_scroll_wheel(self._theme_combo)
-        self._theme_combo.addItems(["Light", "Dark"])
-        self._theme_combo.currentTextChanged.connect(self._on_theme_changed)
+        self._theme_combo.addItem("System", "system")
+        self._theme_combo.addItem("Light", "light")
+        self._theme_combo.addItem("Dark", "dark")
+        self._theme_combo.setToolTip(
+            "System follows your operating system's light/dark setting "
+            "(falls back to Light if it can't be detected)"
+        )
+        self._theme_combo.currentIndexChanged.connect(self._on_theme_changed)
         layout.addWidget(self._theme_combo)
 
         # Accent colour
@@ -419,8 +425,12 @@ class SettingsPanel(QWidget):
         self._default_company.text = self._config.get(
             "default_company", _DEFAULTS["default_company"]
         )
-        theme = self._config.get("theme", "light")
-        self._theme_combo.setCurrentText(theme.capitalize())
+        self._loading = True
+        try:
+            idx = self._theme_combo.findData(self._config.get("theme", "system"))
+            self._theme_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        finally:
+            self._loading = False
         self._load_appearance_values()
 
     def _save(self) -> None:
@@ -443,8 +453,10 @@ class SettingsPanel(QWidget):
         logger.info("Settings saved successfully")
         QMessageBox.information(self, "Saved", "Settings saved successfully.")
 
-    def _on_theme_changed(self, text: str) -> None:
-        theme = text.lower()
+    def _on_theme_changed(self, _index: int) -> None:
+        if self._loading:
+            return
+        theme = self._theme_combo.currentData() or "light"
         logger.info("Theme changed to %s", theme)
         self._config.set("theme", theme)
         self.theme_changed.emit(theme)

@@ -99,12 +99,20 @@ def run_app(argv: list[str] | None = None) -> int:
 
     app.setDesktopFileName(APP_ID)
 
-    try:
-        from epic_report_generator.resources_util import get_resource_path
+    # macOS resolves the running app's Dock icon from the bundle
+    # (CFBundleIconName -> Assets.car on Tahoe, CFBundleIconFile -> logo.icns on
+    # 12-15). Calling setWindowIcon there OVERRIDES it at runtime with the
+    # full-bleed logo.png — which is why the running app showed the wrong icon no
+    # matter what icon the bundle carried. Set the window icon only on
+    # Windows/Linux, where the taskbar reads it (Linux also via setDesktopFileName
+    # for GNOME/Wayland, which ignores setWindowIcon).
+    if sys.platform != "darwin":
+        try:
+            from epic_report_generator.resources_util import get_resource_path
 
-        app.setWindowIcon(QIcon(str(get_resource_path("logo.png"))))
-    except (FileNotFoundError, ModuleNotFoundError):
-        logger.warning("logo.png not found; running without a window icon")
+            app.setWindowIcon(QIcon(str(get_resource_path("logo.png"))))
+        except (FileNotFoundError, ModuleNotFoundError):
+            logger.warning("logo.png not found; running without a window icon")
 
     _install_signal_handlers(app)
     app.installEventFilter(_CursorEventFilter(app))

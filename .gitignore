@@ -40,7 +40,8 @@ packaging/linux/AppDir/usr/
 # qt-material runtime-generated theme assets
 theme/
 
-# Generated icons (created at CI build time)
+# Generated icons (created at build time)
+src/epic_report_generator/resources/logo.png
 src/epic_report_generator/resources/logo.ico
 
 # App config (generated at runtime)

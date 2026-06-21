@@ -30,9 +30,9 @@ Key Nuitka flags used across all platforms:
 - `--include-package-data=epic_report_generator.resources`, `--include-package-data=qt_material`
 - `--nofollow-import-to` exclusions for unused stdlib modules and heavy PySide6 modules (WebEngine, 3D, Quick/QML, Multimedia, etc.)
 
-Linux uses `--onedir` (not `--onefile`) because AppImage provides its own single-file SquashFS layer. macOS uses `--macos-create-app-bundle` with the display name `"Epic Report Generator.app"`. Windows uses `--onefile` with `--windows-console-mode=disable` and embeds a `.ico` converted from `logo.png` at build time via Pillow.
+Linux uses `--onedir` (not `--onefile`) because AppImage provides its own single-file SquashFS layer. macOS uses `--macos-create-app-bundle` with the display name `"Epic Report Generator.app"`. Windows uses `--onefile` with `--windows-console-mode=disable` and embeds a `.ico` converted at build time via Pillow from the generated `logo.png` (see below).
 
-**App-icon assets.** Two source PNGs live in `resources/`: **`logo.png`** is *full-bleed* (artwork fills ~90% of the canvas) and feeds the Windows `.ico` (multi-size 16/24/32/48/64/128/256), the Linux AppImage icons, and the in-app `setWindowIcon`. **`logo-macos.png`** is the *padded* variant (artwork inset ~9% per Apple's HIG) and is used **only** by macOS — `--macos-app-icon` in CI and `_macos_install()` (via `desktop._macos_icon_src()`, which falls back to `logo.png`). Using the padded file everywhere previously made the Windows/Linux icons look shrunken. For Linux desktop integration the icon must land in `AppDir/usr/share/icons/hicolor/{256x256,512x512}/apps/epic-report-generator.png` (the AppDir-root `.DirIcon` only feeds the file-manager thumbnail; AppImageLauncher/`appimaged` read the menu icon from the hicolor theme). On Windows, `app._set_windows_app_id()` sets the `AppUserModelID` to `desktop.BUNDLE_ID` before the first window so the taskbar button unifies with the pinned shortcut. On Linux, the **running window's** dock/taskbar icon is resolved by matching the window's `WM_CLASS` / Wayland `app_id` to a `.desktop` entry (GNOME/Wayland ignores `setWindowIcon`), so `run_app` calls `app.setDesktopFileName(desktop.APP_ID)` and **both** the AppImage `.desktop` (`packaging/linux/AppDir/`) and the from-source `_DESKTOP_ENTRY` carry `StartupWMClass=epic-report-generator` — all three (`app_id`, `StartupWMClass`, `.desktop` basename) must equal `epic-report-generator`.
+**App-icon assets.** The **single source of truth** for the app icon on every platform is the Icon Composer `.icon` bundle at `packaging/macos/logo.icon/` — **no raster logo is committed**. At build time `packaging/render_logo.py` reproduces the bundle's look into `resources/logo.png`: it paints the `icon.json` `fill` (the `automatic-gradient`, **Display-P3 → sRGB** converted, ≈`#D2E2EF`) as a subtle top-lighter vertical gradient into a rounded-square (squircle, radius ≈ 0.2237 × side) tile via `fillPath` (antialiased corners), then composites the foreground layer SVGs (`Assets/logo-objects.svg` under `Assets/logo-arrow.svg`, the order read from `icon.json` and painted back-to-front via PySide6 QtSvg) on top — so the PNG carries the **same background and shape** macOS renders from the same `.icon`, not a bare cut-out. (`--no-background` restores the historical transparent full-bleed foreground-only output.) The CI step **"Generate app logo from .icon bundle"** runs it before the wheel **and** the Nuitka build so both bundle the PNG. That `logo.png` feeds the Windows `.ico` (multi-size 16/24/32/48/64/128/256), the Linux AppImage/hicolor icons, the in-app `setWindowIcon`, and the Help-panel banner. `setWindowIcon` is **Windows/Linux only** — `run_app` skips it on macOS (`sys.platform == "darwin"`), because there a window icon **overrides the bundle Dock icon at runtime**: a full-bleed window icon was what made the *running* app show the wrong/oversized icon regardless of the `.icns`/`Assets.car` in the bundle. macOS instead gets its HIG-padded bundle icon from the *same* `.icon` via actool (two-tier, below); the old padded **`logo-macos.png`** variant and the `--macos-app-icon` flag were dropped. From source (no CI), `logo.png` is absent unless you run `python packaging/render_logo.py …`, and every consumer degrades gracefully (warns, skips the icon). **macOS app icon (two-tier).** The `.dmg`/`.pkg` bundle icon is **two-tier**: macOS 26 "Tahoe" gets a Liquid Glass icon and macOS 12–15 a legacy icns. The Liquid Glass source is an **Icon Composer** `.icon` bundle at `packaging/macos/logo.icon/` (`icon.json` defines a light gradient fill + two layers — `logo-objects` under `logo-arrow`, the arrow carrying dark/tinted specializations — over SVG art in `Assets/`). The build job's **"Compile Liquid Glass app icon"** step runs `xcrun actool` (Xcode 26, on the `macos-26` runner) to compile it into `Contents/Resources/` — actool emits **both** `Assets.car` (Tahoe Liquid Glass) **and** a flattened legacy `logo.icns` fallback derived from the same `.icon`. The step sets `CFBundleIconName=logo` (Tahoe → `Assets.car`) and `CFBundleIconFile=logo` (macOS 12–15 → `logo.icns`), then removes any stray `Icons.icns` (a `rm -f` no-op now that Nuitka emits none). It runs after Nuitka but **before** the unsigned-app archive (so the MAS `.pkg` inherits it) and **before** signing (so the bundle signature seals `Assets.car`/`logo.icns` — neither is Mach-O, so the strip/vtool steps skip them). Because actool derives the 12–15 fallback from the `.icon`, the macOS bundle icon needs **no committed PNG at all** — the padded `logo-macos.png` variant and the `--macos-app-icon` Nuitka flag were both removed (Nuitka therefore bakes no `Icons.icns`). The `.icon` layers were produced by stripping the `#D2E2EF` squircle background from `logo-test.svg` and splitting the black trend arrow onto its own layer (`packaging/macos/logo.icon/Assets/`). For Linux desktop integration the icon must land in `AppDir/usr/share/icons/hicolor/{256x256,512x512}/apps/epic-report-generator.png` (the AppDir-root `.DirIcon` only feeds the file-manager thumbnail; AppImageLauncher/`appimaged` read the menu icon from the hicolor theme). On Windows, `app._set_windows_app_id()` sets the `AppUserModelID` to `desktop.BUNDLE_ID` before the first window so the taskbar button unifies with the pinned shortcut. On Linux, the **running window's** dock/taskbar icon is resolved by matching the window's `WM_CLASS` / Wayland `app_id` to a `.desktop` entry (GNOME/Wayland ignores `setWindowIcon`), so `run_app` calls `app.setDesktopFileName(desktop.APP_ID)` and **both** the AppImage `.desktop` (`packaging/linux/AppDir/`) and the from-source `_DESKTOP_ENTRY` carry `StartupWMClass=epic-report-generator` — all three (`app_id`, `StartupWMClass`, `.desktop` basename) must equal `epic-report-generator`.
 
 Both macOS channels sign **inside-out** (strip every Mach-O, sign deepest-first with our Team ID, the app bundle last — no `--deep`) via sibling scripts: `packaging/macos/sign_devid.sh` for the Developer-ID `.dmg` (hardened runtime + the `cs.*` entitlements in `entitlements.plist`) and `packaging/macos/sign_mas.sh` for the Mac App Store `.pkg` (App Sandbox + inherit entitlements). Because every nested binary is re-signed under one Team ID, **neither needs `disable-library-validation`**. `sign_devid.sh` falls back to an inside-out ad-hoc signature when no `MACOS_SIGN_IDENTITY` is set (forks / no-secrets CI); it is invoked from the build job's "Sign binaries (macOS)" step.
 
@@ -178,10 +178,10 @@ src/epic_report_generator/
 └── resources/
     ├── typst/                     # Templates: theme, components (gantt, trend_chart, progress_bar, …), pages
     ├── fonts/                     # Bundled Inter (deterministic cross-OS rendering) + Noto Sans CJK JP (CJK fallback)
-    ├── user-guide.md              # End-user guide, rendered in-app by help_panel (bundled as package data)
-    ├── logo.png                   # Full-bleed app icon (Windows .ico, Linux AppImage, in-app window icon)
-    └── logo-macos.png             # Padded variant (Apple HIG inset) — macOS app icon only
+    └── user-guide.md              # End-user guide, rendered in-app by help_panel (bundled as package data)
 ```
+
+No raster logo is committed: `resources/logo.png` (the gradient-squircle Windows/Linux/in-app icon, matching the `.icon` background + shape) is generated at build time from `packaging/macos/logo.icon/` by `packaging/render_logo.py`; the macOS bundle icon is compiled from the same `.icon` via actool. See **App-icon assets** above.
 
 ## Architecture
 
@@ -390,6 +390,29 @@ The UI uses a two-layer theming architecture:
 2. **Overlay layer**: `styles.py` contains app-specific QSS overrides applied at the `QMainWindow` level. These use object-name selectors (`#sidebar`, `#collapsibleHeader`, etc.) and property selectors (`QPushButton[secondary="true"]`) to style custom UI components without duplicating base widget rules.
 
 A global `_CursorEventFilter` event filter in `app.py` sets `PointingHandCursor` on interactive controls (`QAbstractButton`, `QComboBox`, `QAbstractSpinBox`, `QTabBar`).
+
+**Theme selection.** The `theme` config key is `"light"`, `"dark"`, or `"system"`
+— **`"system"` is the default** (new installs). `ui/_theme.resolve_theme()` is the
+single resolver shared by the app and the report: it maps `light`/`dark` to
+themselves and resolves `system` to the OS colour scheme via Qt's
+`QStyleHints.colorScheme()` (Qt 6.5+), **falling back to `light`** when it can't be
+determined (older Qt, no `QApplication`, or an `Unknown` scheme). `system` is also
+the hardcoded fallback in every `config.get("theme", "system")` call.
+`MainWindow._apply_theme` resolves the configured value to `effective`
+(`is_dark`/`theme_xml` derive from it). In `system` mode the app tracks **live** OS
+flips: `_watch_system_color_scheme` connects `QStyleHints.colorSchemeChanged` (Qt
+6.5+; guarded) to `_on_system_color_scheme_changed`, which re-applies only while the
+configured theme is `system`. The settings combo (`settings_panel`) carries the
+value as item **data** (`Light`/`Dark`/`System`), so the displayed label is
+decoupled from the stored value.
+
+**Report theme (force-light).** The report is independent of the app theme. The
+"Always use light theme for report" checkbox in **Step 1 → Report Content**
+(`config_panel`, persisted as the profile key `report_force_light`, **default on**)
+controls it. `report_panel._on_validated_for_generate` sets
+`ReportConfig.dark_mode = app_is_dark and not force_light`, where `app_is_dark`
+comes from `resolve_theme(theme)` — so a dark/system app still yields a **light**
+PDF unless the user opts out.
 
 ### Theme Customization (NFR-05)
 

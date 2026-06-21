@@ -39,6 +39,7 @@ from epic_report_generator.services.update_checker import (
     UpdateChecker,
     UpdateInfo,
 )
+from epic_report_generator.ui._theme import resolve_theme
 from epic_report_generator.ui._threading import ThreadedTask
 from epic_report_generator.ui.animations import fade_in, pulse, stop_pulse
 from epic_report_generator.ui.help_panel import HelpPanel
@@ -106,7 +107,8 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._setup_shortcuts()
-        self._apply_theme(self._config.get("theme", "light"))
+        self._apply_theme(self._config.get("theme", "system"))
+        self._watch_system_color_scheme()
         self._setup_update_check()
 
         # Restore the previous session *after* the window is shown and the
@@ -445,8 +447,10 @@ class MainWindow(QMainWindow):
     }
 
     def _apply_theme(self, theme: str) -> None:
-        logger.info("Applying theme: %s", theme)
-        is_dark = theme == "dark"
+        # "system" follows the OS colour scheme (Qt 6.5+), falling back to light.
+        effective = resolve_theme(theme)
+        logger.info("Applying theme: %s (effective: %s)", theme, effective)
+        is_dark = effective == "dark"
 
         # Apply Material Design base theme at the application level
         app = QApplication.instance()
@@ -480,7 +484,9 @@ class MainWindow(QMainWindow):
         # Muted privacy-link colour, matching #sidebarCopyright per theme.
         self._muted_hex = "#65686c" if is_dark else "#aeb1b8"
 
-        theme_xml = self._MATERIAL_THEMES.get(theme, self._MATERIAL_THEMES["light"])
+        theme_xml = self._MATERIAL_THEMES.get(
+            effective, self._MATERIAL_THEMES["light"]
+        )
 
         # ``apply_stylesheet`` re-polishes the entire widget tree (~0.5s on a
         # built-out window).  Skip the whole re-apply when nothing that affects
@@ -515,7 +521,30 @@ class MainWindow(QMainWindow):
 
     def _on_appearance_changed(self) -> None:
         """Re-apply the current theme after accent/font customization."""
-        self._apply_theme(self._config.get("theme", "light"))
+        self._apply_theme(self._config.get("theme", "system"))
+
+    def _watch_system_color_scheme(self) -> None:
+        """Re-apply the theme when the OS colour scheme flips, in System mode.
+
+        Qt emits ``colorSchemeChanged`` (Qt 6.5+) when the user switches the OS
+        between light and dark.  We only react when the configured theme is
+        ``"system"`` so a fixed Light/Dark choice is never overridden.  No-op on
+        an older Qt that lacks the signal.
+        """
+        app = QApplication.instance()
+        hints = app.styleHints() if app is not None else None
+        if hints is None:
+            return
+        try:
+            hints.colorSchemeChanged.connect(self._on_system_color_scheme_changed)
+        except AttributeError:  # Qt < 6.5: no colorSchemeChanged signal
+            logger.debug("Qt lacks colorSchemeChanged; system theme is static")
+
+    def _on_system_color_scheme_changed(self, _scheme: object) -> None:
+        """Follow a live OS light/dark switch when the theme is set to System."""
+        if self._config.get("theme", "system") == "system":
+            logger.info("System colour scheme changed; re-applying theme")
+            self._apply_theme("system")
 
     # -- update check ---------------------------------------------------------
 

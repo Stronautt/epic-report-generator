@@ -1,0 +1,49 @@
+{
+  "fill" : {
+    "automatic-gradient" : "display-p3:0.83252,0.87939,0.93164,1.00000"
+  },
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "fill-specializations" : [
+            {
+              "appearance" : "dark",
+              "value" : {
+                "solid" : "display-p3:0.88818,0.82275,0.64990,1.00000"
+              }
+            },
+            {
+              "appearance" : "tinted",
+              "value" : {
+                "solid" : "srgb:0.75407,0.75409,0.75408,1.00000"
+              }
+            }
+          ],
+          "glass" : false,
+          "image-name" : "logo-arrow.svg",
+          "name" : "logo-arrow"
+        },
+        {
+          "glass" : false,
+          "image-name" : "logo-objects.svg",
+          "name" : "logo-objects"
+        }
+      ],
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.5
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.5
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "circles" : [
+      "watchOS"
+    ],
+    "squares" : "shared"
+  }
+}

@@ -138,21 +138,12 @@ exec {bin_path} "$@"
 """
 
 
-def _macos_icon_src() -> Path:
-    """Return the macOS app-icon source.
-
-    macOS icons follow Apple's HIG (artwork inset with a transparent margin),
-    so prefer the padded ``logo-macos.png`` variant; fall back to the full-bleed
-    ``logo.png`` if the variant is absent.
-    """
-    try:
-        return get_resource_path("logo-macos.png")
-    except FileNotFoundError:
-        return get_resource_path("logo.png")
-
-
 def _macos_install() -> None:
-    icon_src = _macos_icon_src()
+    # The single icon source is the packaging/macos/logo.icon bundle; the
+    # distributed .app/.dmg/.pkg get their HIG-padded icon from it via actool.
+    # This hand-rolled from-source bundle just reuses the bundled full-bleed
+    # logo.png — adequate for a local `--install-desktop`.
+    icon_src = get_resource_path("logo.png")
     bin_path = _resolve_gui_bin()
 
     contents = _MACOS_APP_BUNDLE / "Contents"

@@ -44,6 +44,7 @@ PROFILE_KEYS: frozenset[str] = frozenset(
         "expand_label_details",
         "show_additional_metrics",
         "show_timeline_chart",
+        "report_force_light",
         "confidential",
     }
 )
@@ -66,7 +67,8 @@ _DEFAULTS: dict[str, Any] = {
     "callback_port": 18492,
     "cloud_id": "",
     "site_name": "",
-    "theme": "light",
+    # "light", "dark", or "system" (follow the OS colour scheme).
+    "theme": "system",
     # Appearance customization (NFR-05) — global, like `theme`.
     # accent_color: "" = built-in blue, else "#rrggbb".
     # font_source: "" = default font, "file", or "google".
@@ -109,6 +111,8 @@ _DEFAULTS: dict[str, Any] = {
     "expand_label_details": True,
     "show_additional_metrics": True,
     "show_timeline_chart": True,
+    # Force the generated report to the light theme regardless of the app theme.
+    "report_force_light": True,
     "confidential": False,
 }
 

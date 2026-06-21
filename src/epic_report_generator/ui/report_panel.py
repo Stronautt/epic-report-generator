@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 from epic_report_generator.core.jira_client import JiraClient
 from epic_report_generator.services.config_manager import ConfigManager
 from epic_report_generator.services.font_manager import FontManager
+from epic_report_generator.ui._theme import resolve_theme
 from epic_report_generator.ui.config_panel import ConfigPanel
 from epic_report_generator.ui.preview_panel import PreviewPanel
 from epic_report_generator.ui.widgets import CollapsibleSection, make_scroll_content
@@ -221,7 +222,12 @@ class ReportPanel(QWidget):
             self._preview_panel.clear_preview()
             return
 
-        cfg.dark_mode = self._config_mgr.get("theme", "light") == "dark"
+        # The report is light by default ("Always use light theme for report" in
+        # Step 1). Only when that's unticked does the app theme carry over —
+        # resolving "system" to the OS scheme just like the UI does.
+        force_light = self._config_mgr.get("report_force_light", True)
+        app_is_dark = resolve_theme(self._config_mgr.get("theme", "system")) == "dark"
+        cfg.dark_mode = app_is_dark and not force_light
 
         # Appearance customization (NFR-05): carry the configured accent and the
         # resolved custom font (family + provisioned dir) into the renderer.

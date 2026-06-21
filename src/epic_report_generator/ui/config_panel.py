@@ -453,6 +453,18 @@ class ConfigPanel(QWidget):
         self._content_section = CollapsibleSection("Report Content", expanded=False)
         content = self._content_section.body_layout
 
+        self._force_light_report_check = QCheckBox("Always use light theme for report")
+        self._force_light_report_check.setChecked(True)
+        self._force_light_report_check.stateChanged.connect(
+            lambda _: self._persist_values()
+        )
+        content.addWidget(self._force_light_report_check)
+        content.addWidget(
+            self._hint(
+                "Generate the PDF with the light theme regardless of the app's theme"
+            )
+        )
+
         self._show_additional_metrics_check = QCheckBox("Show detailed metrics")
         self._show_additional_metrics_check.setChecked(True)
         self._show_additional_metrics_check.stateChanged.connect(
@@ -777,6 +789,11 @@ class ConfigPanel(QWidget):
             self._config.get("show_timeline_chart", True)
         )
 
+        # Restore force-light report theme
+        self._force_light_report_check.setChecked(
+            self._config.get("report_force_light", True)
+        )
+
     _MIN_HARD_DATE_GAP_DAYS = 5
 
     def _restore_hard_date(self, widget: QDateEdit, config_key: str) -> None:
@@ -885,6 +902,7 @@ class ConfigPanel(QWidget):
                     self._show_additional_metrics_check.isChecked()
                 ),
                 "show_timeline_chart": self._show_timeline_check.isChecked(),
+                "report_force_light": self._force_light_report_check.isChecked(),
             }
         )
 
@@ -1056,6 +1074,7 @@ class ConfigPanel(QWidget):
         self._show_subtasks_timeline_check.setChecked(False)
         self._expand_label_details_check.setChecked(True)
         self._show_additional_metrics_check.setChecked(True)
+        self._force_light_report_check.setChecked(True)
         self._clear_validation_ui()
         self._on_estimation_method_changed()
         # Collapse optional sections

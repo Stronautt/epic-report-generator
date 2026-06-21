@@ -120,6 +120,23 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]" build "nuitka[onefile]" imageio pillow
 
+      - name: Generate app logo from .icon bundle
+        shell: bash
+        run: |
+          # Single source of truth for the icon is packaging/macos/logo.icon.
+          # Reproduce its look into resources/logo.png: the icon.json fill
+          # gradient painted into a rounded-square (squircle) tile with the
+          # foreground layers on top, so the PNG carries the same background and
+          # shape macOS renders from the .icon. Used by Windows (.ico), Linux
+          # (AppImage/hicolor) and the in-app window / Help-panel logo. No raster
+          # copy is committed; it is regenerated here before the wheel + Nuitka
+          # build so both bundle it. macOS gets its padded bundle icon from the
+          # same .icon via actool further down.
+          python packaging/render_logo.py \
+            --icon-dir packaging/macos/logo.icon \
+            --out src/epic_report_generator/resources/logo.png \
+            --size 1024
+
       - name: Run tests
         run: pytest --tb=short
 
@@ -174,7 +191,9 @@ jobs:
                 --macos-create-app-bundle
                 "--macos-app-name=Epic Report Generator"
                 "--macos-signed-app-name=$MAS_BUNDLE_ID"
-                "--macos-app-icon=src/epic_report_generator/resources/logo-macos.png"
+                # No --macos-app-icon: the bundle icon is compiled from the
+                # .icon bundle by actool below (Assets.car + logo.icns), which
+                # supersedes any Nuitka-baked Icons.icns.
                 "--macos-app-version=${{ steps.meta.outputs.version }}"
                 "--output-filename=epic-report-generator"
                 "--output-dir=."
@@ -214,6 +233,58 @@ jobs:
           plutil -replace CFBundleVersion -string "$BUILD_NUMBER" "$PLIST"
           plutil -replace CFBundleShortVersionString -string "${{ steps.meta.outputs.version }}" "$PLIST"
           echo "Info.plist after identity stamp:"; plutil -p "$PLIST"
+
+      - name: Compile Liquid Glass app icon (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="Epic Report Generator.app"
+          PLIST="$APP/Contents/Info.plist"
+          ICON="packaging/macos/logo.icon"
+          # macOS 26 "Tahoe" Liquid Glass icon. Icon Composer authors the `.icon`
+          # bundle (layers + fill in icon.json, layer art in Assets/*.svg); actool
+          # from Xcode 26 compiles it to a Resources/Assets.car. Tahoe reads the
+          # icon from Assets.car via CFBundleIconName; macOS 12–15 fall back to the
+          # actool-emitted logo.icns (CFBundleIconFile) — both derive from the same
+          # .icon, and the two keys coexist. Runs after Nuitka but BEFORE the
+          # unsigned-app archive
+          # (so the MAS .pkg job inherits Assets.car) and BEFORE signing (so the
+          # bundle signature seals it). Assets.car is not Mach-O, so the later
+          # strip/vtool steps skip it. Needs Xcode 26's actool for the `.icon` format.
+          for x in /Applications/Xcode_26*.app /Applications/Xcode.app; do
+            [ -d "$x/Contents/Developer" ] && export DEVELOPER_DIR="$x/Contents/Developer" && break
+          done
+          echo "actool: $(xcrun --find actool) (DEVELOPER_DIR=${DEVELOPER_DIR:-default})"
+          # actool --compile requires the output dir to exist; it does not create
+          # it. Nuitka no longer emits Contents/Resources/ now that --macos-app-icon
+          # is gone (no Icons.icns), so create it ourselves before compiling.
+          mkdir -p "$APP/Contents/Resources"
+          xcrun actool "$ICON" \
+            --compile "$APP/Contents/Resources" \
+            --app-icon logo \
+            --target-device mac \
+            --platform macosx \
+            --minimum-deployment-target "$MACOS_DEPLOYMENT_TARGET" \
+            --include-all-app-icons \
+            --enable-on-demand-resources NO \
+            --development-region en \
+            --output-partial-info-plist "$RUNNER_TEMP/icon-partial.plist" \
+            --output-format human-readable-text
+          test -f "$APP/Contents/Resources/Assets.car" \
+            || { echo "::error::actool produced no Assets.car"; exit 1; }
+          test -f "$APP/Contents/Resources/logo.icns" \
+            || { echo "::error::actool produced no logo.icns fallback"; exit 1; }
+          # actool emits BOTH the Tahoe Assets.car and a flattened legacy logo.icns
+          # fallback derived from the same .icon. Point CFBundleIconName at the car
+          # (Tahoe) and CFBundleIconFile at logo.icns (macOS 12–15), then remove any
+          # stray Icons.icns (Nuitka no longer emits one now that --macos-app-icon
+          # is gone; -f keeps this a no-op if absent).
+          plutil -replace CFBundleIconName -string logo "$PLIST"
+          plutil -replace CFBundleIconFile -string logo "$PLIST"
+          rm -f "$APP/Contents/Resources/Icons.icns"
+          echo "Assets.car $(du -h "$APP/Contents/Resources/Assets.car" | cut -f1), logo.icns $(du -h "$APP/Contents/Resources/logo.icns" | cut -f1)"
+          echo "Icon keys -> CFBundleIconName=$(plutil -extract CFBundleIconName raw "$PLIST" 2>/dev/null || echo MISSING), CFBundleIconFile=$(plutil -extract CFBundleIconFile raw "$PLIST" 2>/dev/null || echo MISSING)"
 
       - name: Import signing certificate (macOS)
         if: runner.os == 'macOS' && env.MACOS_CERT_P12_BASE64 != ''

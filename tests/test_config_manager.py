@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import time
 from pathlib import Path
 
 from epic_report_generator.services.config_manager import (
+    _DEFAULTS,
     _LEGACY_TIMESTAMP,
     DEFAULT_PROFILE_NAME,
+    PROFILE_KEYS,
     ConfigManager,
 )
 
@@ -19,10 +22,6 @@ def _make_manager(tmp_path: Path) -> ConfigManager:
     mgr._dir = tmp_path
     mgr._path = tmp_path / "config.json"
     mgr._dir_created = False
-    import copy
-
-    from epic_report_generator.services.config_manager import _DEFAULTS
-
     mgr._data = copy.deepcopy(_DEFAULTS)
     return mgr
 
@@ -36,7 +35,7 @@ class TestDefaults:
 
     def test_theme(self, tmp_path: Path) -> None:
         mgr = _make_manager(tmp_path)
-        assert mgr.get("theme") == "light"
+        assert mgr.get("theme") == "system"
 
     def test_auth_method_empty(self, tmp_path: Path) -> None:
         mgr = _make_manager(tmp_path)
@@ -49,6 +48,14 @@ class TestDefaults:
     def test_missing_key_returns_default(self, tmp_path: Path) -> None:
         mgr = _make_manager(tmp_path)
         assert mgr.get("nonexistent", "fallback") == "fallback"
+
+    def test_report_force_light_default(self, tmp_path: Path) -> None:
+        mgr = _make_manager(tmp_path)
+        assert mgr.get("report_force_light") is True
+
+    def test_report_force_light_is_profile_scoped(self) -> None:
+        # Lives inside each profile, like the other Report Content toggles.
+        assert "report_force_light" in PROFILE_KEYS
 
 
 class TestSetAndGet:
@@ -64,6 +71,7 @@ class TestSetAndGet:
         mgr.update({"jira_url": "https://x.atlassian.net", "jira_email": "a@b.com"})
         assert mgr.get("jira_url") == "https://x.atlassian.net"
         assert mgr.get("jira_email") == "a@b.com"
+
 
 class TestPersistence:
     """Config should persist to and load from disk."""
@@ -94,7 +102,7 @@ class TestPersistence:
         mgr = _make_manager(tmp_path)
         mgr._load()
         # Should not raise; defaults survive corrupt file
-        assert mgr.get("theme") == "light"
+        assert mgr.get("theme") == "system"
 
     def test_list_values_persist(self, tmp_path: Path) -> None:
         mgr = _make_manager(tmp_path)
