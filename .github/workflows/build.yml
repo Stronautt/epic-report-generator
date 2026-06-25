@@ -225,14 +225,35 @@ jobs:
         run: |
           set -euo pipefail
           PLIST="Epic Report Generator.app/Contents/Info.plist"
-          BUILD_NUMBER="$(git rev-list --count HEAD)"
+          VERSION="${{ steps.meta.outputs.version }}"
+          COMMITS="$(git rev-list --count HEAD)"
+          # Build number = version folded into commit count, so it can't
+          # collide or regress across releases (version dominates; commits
+          # disambiguate within a version). Single int, <18 chars:
+          #   MAJOR*1e12 + MINOR*1e9 + PATCH*1e6 + COMMITS   (COMMITS < 1e6)
+          IFS='.' read -r MAJOR MINOR PATCH _ <<< "$VERSION"
+          BUILD_NUMBER=$(( 10#${MAJOR:-0} * 1000000000000 + 10#${MINOR:-0} * 1000000000 + 10#${PATCH:-0} * 1000000 + 10#${COMMITS} ))
           plutil -replace CFBundleIdentifier -string "$MAS_BUNDLE_ID" "$PLIST"
           plutil -replace LSApplicationCategoryType -string "public.app-category.productivity" "$PLIST"
           plutil -replace ITSAppUsesNonExemptEncryption -bool false "$PLIST"
           plutil -replace LSMinimumSystemVersion -string "$MACOS_DEPLOYMENT_TARGET" "$PLIST"
           plutil -replace CFBundleVersion -string "$BUILD_NUMBER" "$PLIST"
-          plutil -replace CFBundleShortVersionString -string "${{ steps.meta.outputs.version }}" "$PLIST"
-          echo "Info.plist after identity stamp:"; plutil -p "$PLIST"
+          plutil -replace CFBundleShortVersionString -string "$VERSION" "$PLIST"
+          echo "Info.plist after identity stamp (build $BUILD_NUMBER from $VERSION + $COMMITS commits):"; plutil -p "$PLIST"
+
+      - name: Write Contents/Resources/qt.conf (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Pin Qt's prefix so QLibraryInfo never resolves it from the main
+          # bundle — under the App Sandbox that lookup crashes at startup
+          # (CFBundleGetMainBundle() is NULL). Must be Contents/Resources/ and
+          # precede both sign scripts.
+          APP="Epic Report Generator.app"
+          mkdir -p "$APP/Contents/Resources"
+          cp packaging/macos/qt.conf "$APP/Contents/Resources/qt.conf"
+          echo "Wrote qt.conf:"; cat "$APP/Contents/Resources/qt.conf"
 
       - name: Compile Liquid Glass app icon (macOS)
         if: runner.os == 'macOS'

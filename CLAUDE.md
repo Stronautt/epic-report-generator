@@ -38,6 +38,8 @@ Both macOS channels sign **inside-out** (strip every Mach-O, sign deepest-first 
 
 Only installer artifacts are uploaded — plain binaries are not retained. The `release` job is tag-driven and downloads with an `installer-*` pattern, so it publishes **only** the three platform installers (Dev-ID `.dmg` + Windows/Linux); the cross-job handoff artifacts (`unsigned-macos-app`, `notary-submission-id`) and the Mac App Store `.pkg` are **not** part of it. The `.pkg` is never stored as a workflow artifact at all — it goes straight to TestFlight.
 
+**macOS `qt.conf` (App Sandbox startup crash).** The build job's **"Write Contents/Resources/qt.conf (macOS)"** step copies `packaging/macos/qt.conf` (`[Paths] Prefix = MacOS`, `Plugins = MacOS/PySide6/qt-plugins`) into the bundle's `Contents/Resources/` before the icon/`vtool`/upload steps and **both** sign scripts, so each channel inherits it and the signature seals it. It pins Qt's prefix so `QLibraryInfo` never derives it from the main bundle. **Why it's required:** under the **App Sandbox** (MAS only), a LaunchServices/`launchd` launch leaves `CFBundleGetMainBundle()` **NULL** during QtCore's *pre-`main()` static init* (a global `QLoggingCategory` → `QLoggingRegistry::instance()` → `QLibraryInfoPrivate::paths`), and Qt 6.11 passes that NULL straight into `CFBundleCopyBundleURL` → `EXC_BAD_ACCESS` / `KERN_INVALID_ADDRESS at 0x8` before any Python runs. The Dev-ID `.dmg` dodged it (non-sandbox launch resolves the bundle), so the TestFlight `.pkg` crashed on **every** launch while the `.dmg` was fine — same Nuitka binary. Of Qt's startup qt.conf lookups only **`Contents/Resources/qt.conf`** (`CFBundleCopyResourceURL`) is consulted that early; `Contents/MacOS/qt.conf` needs a live `QCoreApplication` and does **not** fix it (both confirmed by re-signing the `.app` ad-hoc with `entitlements.mas.plist` and launching via `open`). It is harmless to the Dev-ID build and non-load-bearing for plugins (Nuitka still sets `QT_PLUGIN_PATH`) — it only short-circuits the relocatable-prefix path.
+
 ### Mac App Store channel
 
 macOS ships through **two** independent channels from the same Nuitka `.app`:
@@ -96,7 +98,17 @@ Key MAS differences from the Dev-ID build:
 - **Bundle identity.** One `CFBundleIdentifier = com.epicreportgenerator.app`
   (`MAS_BUNDLE_ID` build var + `desktop.BUNDLE_ID`), plus MAS Info.plist keys
   (`LSApplicationCategoryType`, `ITSAppUsesNonExemptEncryption=false`,
-  `LSMinimumSystemVersion`, monotonic `CFBundleVersion = git rev-list --count HEAD`).
+  `LSMinimumSystemVersion`, and a monotonic `CFBundleVersion`). The build
+  number **folds the marketing version into the commit count** so it can't
+  collide or regress across releases: `CFBundleVersion = MAJOR*1e12 + MINOR*1e9
+  + PATCH*1e6 + git rev-list --count HEAD` (a single integer, ~13 digits, well
+  under Apple's 18-char limit; TestFlight compares it numerically). The version
+  dominates the ordering — a newer release always outranks an older one even if
+  history was rebased/squashed — while the commit count disambiguates builds
+  within a version. `CFBundleShortVersionString` stays the bare pyproject
+  marketing version. (A bare commit count carried no version, so it could repeat
+  or go backwards; rebuilding the *identical* commit at the *same* version still
+  collides — bump the version for that.)
 - **Deployment target (12.0).** The runners are Apple Silicon, so Nuitka emits an
   **arm64-only** `.app`; the App Store accepts arm64-only only at a **macOS 12.0+**
   deployment target (**ITMS-90869**), and it reads the **Mach-O `LC_BUILD_VERSION`

@@ -119,6 +119,19 @@ class TestInfoPlistStampStep:
             'plutil -replace CFBundleVersion -string "$BUILD_NUMBER"' in self.run
         )
 
+    def test_build_number_folds_in_marketing_version(self) -> None:
+        # The build number must combine the marketing version with the commit
+        # count (version dominant) so it can't collide or regress across
+        # releases — a bare commit count carries no version and can repeat or
+        # go backwards after a rebase/squash/branch build.
+        assert "${{ steps.meta.outputs.version }}" in self.run
+        # version is split into MAJOR.MINOR.PATCH and combined arithmetically
+        assert "IFS='.'" in self.run
+        assert "MAJOR" in self.run
+        assert "MINOR" in self.run
+        assert "PATCH" in self.run
+        assert "BUILD_NUMBER=$((" in self.run
+
     def test_marketing_version_distinct_from_build_number(self) -> None:
         # CFBundleShortVersionString stays the pyproject marketing version.
         assert "CFBundleShortVersionString" in self.run
