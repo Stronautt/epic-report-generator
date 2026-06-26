@@ -1,4 +1,4 @@
-#import "../theme.typ": certainty-color, progress-color
+#import "../theme.typ": certainty-color, issue-icon, progress-color
 
 // Native Gantt timeline. All geometry is computed from the available region
 // (via layout()), so it fills the page and adapts. Stacked top axis (thin):
@@ -250,18 +250,26 @@
       let yt = ytops.at(i)
       let yc = yt + rh / 2
       let indent = if r.child { 6mm } else { 2mm }
+      // Boxed issue-type icon (custom chain only) before the key; reserve a
+      // fixed gap so the key never overlaps it. Empty path → no icon, no gap.
+      let icon-sz = if r.child { 3.4mm } else { 4mm }
+      let icon-gap = if r.icon != "" { icon-sz + 1.4mm } else { 0mm }
+      if r.icon != "" {
+        _at(indent, yc - icon-sz / 2, issue-icon(r.icon, size: icon-sz))
+      }
+      let kx = indent + icon-gap
       let keyfs = if r.child { 7pt } else { 8pt }
-      let kw = gutter - indent - 2mm
+      let kw = gutter - kx - 2mm
       let show-title = (not r.child) and r.title != "" and rh >= 4.6mm
       if show-title {
-        _ltext(indent, yc - 6pt, kw, text(
+        _ltext(kx, yc - 6pt, kw, text(
           keyfs,
           weight: "bold",
           fill: c.text,
         )[#r.key])
-        _ltext(indent, yc + 1.5pt, kw, text(5.5pt, fill: c.muted)[#r.title])
+        _ltext(kx, yc + 1.5pt, kw, text(5.5pt, fill: c.muted)[#r.title])
       } else {
-        _ltext(indent, yc - 4pt, kw, text(
+        _ltext(kx, yc - 4pt, kw, text(
           keyfs,
           weight: if r.child { "regular" } else { "bold" },
           fill: if r.child { c.muted } else { c.text },

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
+from typing import Any
 
 from epic_report_generator.core.data_models import (
     STATUS_DONE,
@@ -88,9 +89,24 @@ def calculate_metrics(
     # the Gantt's fixed axis instead of running on to today.
     if window_end is not None and window_end < reference_date:
         reference_date = window_end
-    children = epic.children
+    # in_estimate=False issues are dropped from metrics entirely (no weight, no
+    # done/total count, no velocity/trend contribution), mirroring the old
+    # include_subtasks=False.  `show` is display-only and handled elsewhere.
+    children = [c for c in epic.children if c.in_estimate]
     m = EpicMetrics()
     m.estimation_unit = "Days" if estimation_method == "time_days" else "SP"
+
+    # Shown-but-unestimated children are excluded from the metrics pass below, so
+    # their `.progress` would otherwise stay a hard 0.0 even when Done.  Give each
+    # a leaf display value so the timeline bar / nested summary row reflects real
+    # completion (display only — they stay out of the aggregate).  Runs before the
+    # empty-`children` early return so it still applies when an epic has only
+    # shown-but-unestimated children.
+    for c in epic.children:
+        if c.show and not c.in_estimate:
+            c.progress = (
+                PROGRESS_DONE if c.status_category == STATUS_DONE else PROGRESS_MIN
+            )
 
     if not children:
         logger.debug("Epic %s has no children — returning empty metrics", epic.key)
@@ -108,8 +124,9 @@ def calculate_metrics(
     parent_to_subs: dict[str, list[JiraIssue]] = {}
     subtask_keys: set[str] = set()
     for c in children:
-        if c.parent_key and c.parent_key in child_key_set:
-            parent_to_subs.setdefault(c.parent_key, []).append(c)
+        pk = _hier_parent(c)
+        if pk and pk in child_key_set:
+            parent_to_subs.setdefault(pk, []).append(c)
             subtask_keys.add(c.key)
 
     omit_unestimated = progress_method == PROGRESS_ESTIMATES_ONLY
@@ -241,7 +258,6 @@ def merge_metrics(
     estimation_method: str = "story_points",
     progress_method: str = PROGRESS_COMBINED,
     *,
-    include_subtask_timeline: bool = True,
     source_metrics_out: list[EpicMetrics] | None = None,
     reference_date: date | None = None,
     window_start: date | None = None,
@@ -294,8 +310,9 @@ def merge_metrics(
     # Expand date ranges to cover all merged children (estimation + timeline).
     for c in merged_children:
         collect_child_estimation_dates(c, start_dates, due_dates)
-        # Skip subtasks for timeline dates when not included
-        if c.is_subtask and not include_subtask_timeline:
+        # A tier-2 (sub-task) child expands the timeline range only when shown;
+        # `show` already encodes the old include_subtasks_in_timeline flag.
+        if c.display_tier == 2 and not c.show:
             continue
         collect_child_timeline_dates(c, tl_starts, tl_ends)
     if not due_dates and start_dates:
@@ -352,7 +369,11 @@ def merge_metrics(
         epic_weights: list[float] = []
         for epic in epics:
             subtask_keys = _subtask_keys(epic.children)
-            direct_children = [c for c in epic.children if c.key not in subtask_keys]
+            direct_children = [
+                c
+                for c in epic.children
+                if c.in_estimate and c.key not in subtask_keys
+            ]
             epic_weights.append(
                 sum(c.effective_weight for c in direct_children)
                 if direct_children
@@ -372,10 +393,22 @@ def merge_metrics(
 # -- helpers ------------------------------------------------------------------
 
 
+def _hier_parent(issue: JiraIssue) -> str | None:
+    """Effective parent key for hierarchy roll-up.
+
+    Prefers the chain-resolved ``hierarchy_parent_key`` (set by N-tier traversal)
+    and falls back to the native ``parent_key`` so the default 2-tier path — which
+    never sets ``hierarchy_parent_key`` — behaves exactly as before.
+    """
+    return issue.hierarchy_parent_key or issue.parent_key
+
+
 def _subtask_keys(children: list[JiraIssue]) -> set[str]:
     """Return keys of children whose parent is also among *children* (subtasks)."""
     child_key_set = {c.key for c in children}
-    return {c.key for c in children if c.parent_key and c.parent_key in child_key_set}
+    return {
+        c.key for c in children if (pk := _hier_parent(c)) and pk in child_key_set
+    }
 
 
 def _get_estimate(issue: JiraIssue, method: str) -> float | None:
@@ -469,7 +502,7 @@ def _compute_all_issue_progress(
             if est is not None:
                 weight = est
             elif omit_unestimated:
-                weight = weight_total if weight_total > 0 else 0.0
+                weight = weight_total
             else:
                 weight = weight_total
         else:
@@ -589,6 +622,16 @@ def _forecast(
     return (reference_date or date.today()) + timedelta(weeks=weeks_remaining)
 
 
+def _naive(dt: datetime) -> datetime:
+    """Drop tz so Jira's aware timestamps compare with naive window/ref dates.
+
+    Mixing an aware ``datetime`` with a naive one raises ``TypeError`` on
+    subtraction/comparison. Stripping the offset keeps every event timestamp
+    comparable and leaves ``.date()`` labels identical to the old daily path.
+    """
+    return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
+
+
 def _build_time_series(
     m: EpicMetrics,
     children: list[JiraIssue],
@@ -597,94 +640,133 @@ def _build_time_series(
     reference_date: date | None = None,
     window_start: date | None = None,
 ) -> None:
-    """Build daily time-series arrays for the trend chart.
+    """Build the trend chart's time-series as one point **per changelog event**.
 
-    Uses an O(n log n + d) algorithm with sorted event lists and incremental
-    pointers instead of the previous O(n × d) approach.
+    Each scope/estimate/completion event (enter / sp-change / done) becomes a
+    point at its **exact timestamp**, and the view-model positions x by time —
+    matching Jira's burnup, where same-day events spread along a continuous
+    axis instead of collapsing into one daily step.
 
-    *window_start* clips the chart's first day to the fixed start date (the end
-    is clipped by the caller capping *reference_date* to the fixed end).  The
-    cumulative running totals carry over: because the per-day pointer admits
-    every event dated on or before the current day, the first emitted day still
-    reflects all issues created before the window — the series is zoomed to the
+    *window_start* clips the left edge to the fixed start date (the right edge
+    is clipped by the caller capping *reference_date* to the fixed end). The
+    cumulative running totals carry over: every event at or before the window
+    start folds into the left-edge anchor, so the series is zoomed to the
     window, not recomputed as if earlier work never happened.
     """
-    dated = [(c, c.created) for c in children if c.created is not None]
+    dated = [c for c in children if c.created is not None]
     if not dated:
         return
 
-    min_date = min(dt for _, dt in dated).date()
+    min_date = min(c.created for c in dated).date()
     if window_start is not None and window_start > min_date:
         min_date = window_start
     max_date = reference_date or date.today()
     if min_date >= max_date:
         return
 
-    # Pre-compute estimates once
-    est_map: dict[str, float | None] = {
-        c.key: _get_estimate(c, estimation_method) for c, _ in dated
-    }
+    # Continuous datetime bounds for the time-proportional x-axis. The left edge
+    # is the earliest event instant (or the window start at midnight); the right
+    # edge is the end of the reference day, so an event at any time on that day
+    # is admitted while `.date()` still equals the reference date.
+    range_start = min(_naive(c.created) for c in dated)
+    if window_start is not None:
+        ws = datetime.combine(window_start, time.min)
+        if ws > range_start:
+            range_start = ws
+    range_end = datetime.combine(max_date, time.max)
 
-    # Sort by creation date for incremental pointer
-    created_sorted = sorted(dated, key=lambda pair: pair[1])
-    # Build resolved list: (resolved_date as date, child) sorted by resolved date.
-    # Use .date() to avoid timezone-aware vs naive datetime comparison issues.
-    resolved_sorted = sorted(
-        [
-            (c.resolved.date(), c)
-            for c, _ in dated
-            if c.status_category == STATUS_DONE and c.resolved
-        ],
-        key=lambda pair: pair[0],
-    )
+    # Per-issue event timelines feed one chronological replay. When the changelog
+    # was attached (story-point method + events present) the scope line steps on
+    # every estimate change and completion is dated by the resolution event —
+    # Jira-fidelity burnup. Otherwise each issue contributes a single scope point
+    # at `created` (its final estimate) and a single done point at `resolved`,
+    # reproducing the historical created/resolved approximation byte-for-byte.
+    # Event kinds double as the same-day tiebreak order: 0=enter, 1=sp, 2=done.
+    use_changelog = estimation_method != "time_days"
+    events: list[tuple[datetime, int, int, Any]] = []
+    for idx, c in enumerate(dated):
+        if use_changelog and c.sp_history:
+            events.append((_naive(c.created), 0, idx, c.sp_history[0][1]))
+            for dt, val in c.sp_history[1:]:
+                events.append((_naive(dt), 1, idx, val))
+        else:
+            events.append(
+                (_naive(c.created), 0, idx, _get_estimate(c, estimation_method))
+            )
+        # Completion: prefer the changelog resolution toggles; fall back to the
+        # resolved date so a missing/truncated changelog never loses a done event.
+        done_hist = c.done_history
+        if not done_hist and c.status_category == STATUS_DONE and c.resolved:
+            done_hist = [(c.resolved, True)]
+        for dt, is_done in done_hist:
+            events.append((_naive(dt), 2, idx, is_done))
+    events.sort(key=lambda e: (e[0], e[1]))
 
-    num_days = (max_date - min_date).days + 1
-    dates: list[date] = []
-    total_sp_ts: list[float] = []
-    completed_sp_ts: list[float] = []
-    cum_issues: list[int] = []
-    cum_unest: list[int] = []
-
-    # Running totals
+    sp_state: list[float | None] = [None] * len(dated)
+    done_state: list[bool] = [False] * len(dated)
     running_total_sp = 0.0
     running_done_sp = 0.0
     running_issues = 0
     running_unest = 0
 
-    created_ptr = 0
-    resolved_ptr = 0
+    def _apply(idx: int, kind: int, value: Any) -> None:
+        nonlocal running_total_sp, running_done_sp, running_issues, running_unest
+        if kind == 0:  # issue enters scope
+            sp_state[idx] = value
+            running_total_sp += value or 0
+            running_issues += 1
+            if value is None:
+                running_unest += 1
+        elif kind == 1:  # estimate changed
+            old, new = sp_state[idx], value
+            running_total_sp += (new or 0) - (old or 0)
+            if done_state[idx]:
+                running_done_sp += (new or 0) - (old or 0)
+            if (old is None) != (new is None):
+                running_unest += -1 if new is not None else 1
+            sp_state[idx] = new
+        else:  # done state toggled
+            if value and not done_state[idx]:
+                running_done_sp += sp_state[idx] or 0
+                done_state[idx] = True
+            elif not value and done_state[idx]:
+                running_done_sp -= sp_state[idx] or 0
+                done_state[idx] = False
 
-    for i in range(num_days):
-        day = min_date + timedelta(days=i)
+    dates: list[datetime] = []
+    total_sp_ts: list[float] = []
+    completed_sp_ts: list[float] = []
+    cum_issues: list[int] = []
+    cum_unest: list[int] = []
 
-        # Advance created pointer
-        while created_ptr < len(created_sorted):
-            c, dt = created_sorted[created_ptr]
-            if dt.date() <= day:
-                est = est_map[c.key]
-                running_total_sp += est or 0
-                running_issues += 1
-                if est is None:
-                    running_unest += 1
-                created_ptr += 1
-            else:
-                break
-
-        # Advance resolved pointer (compare date-to-date, no timezone issues)
-        while resolved_ptr < len(resolved_sorted):
-            resolved_date, c = resolved_sorted[resolved_ptr]
-            if resolved_date <= day:
-                est = est_map[c.key]
-                running_done_sp += est or 0
-                resolved_ptr += 1
-            else:
-                break
-
-        dates.append(day)
+    def _snapshot(t: datetime) -> None:
+        dates.append(t)
         total_sp_ts.append(running_total_sp)
         completed_sp_ts.append(running_done_sp)
         cum_issues.append(running_issues)
         cum_unest.append(running_unest)
+
+    ptr = 0
+    # Left-edge anchor: fold every event at/before the window start into day-one
+    # totals (carryover), then emit the baseline point.
+    while ptr < len(events) and events[ptr][0] <= range_start:
+        _, kind, idx, value = events[ptr]
+        _apply(idx, kind, value)
+        ptr += 1
+    _snapshot(range_start)
+    # One point per distinct event timestamp inside the window — simultaneous
+    # events collapse into a single combined step (no zero-width jumps).
+    while ptr < len(events) and events[ptr][0] <= range_end:
+        t = events[ptr][0]
+        while ptr < len(events) and events[ptr][0] == t:
+            _, kind, idx, value = events[ptr]
+            _apply(idx, kind, value)
+            ptr += 1
+        _snapshot(t)
+    # Right-edge anchor holds the last totals to the plot edge (the staircase
+    # would otherwise stop at the final event).
+    if dates[-1] != range_end:
+        _snapshot(range_end)
 
     m.dates = dates
     m.total_sp_over_time = total_sp_ts

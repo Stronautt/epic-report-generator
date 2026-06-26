@@ -6,7 +6,13 @@ from epic_report_generator.core.data_models import ChildOverride, JiraIssue
 from epic_report_generator.ui.preview_panel import _resolve_children
 
 
-def _issue(key: str, summary: str = "S") -> JiraIssue:
+def _issue(
+    key: str,
+    summary: str = "S",
+    *,
+    parent_key: str | None = None,
+    hierarchy_parent_key: str | None = None,
+) -> JiraIssue:
     return JiraIssue(
         key=key,
         summary=summary,
@@ -18,6 +24,8 @@ def _issue(key: str, summary: str = "S") -> JiraIssue:
         created=None,
         resolved=None,
         assignee=None,
+        parent_key=parent_key,
+        hierarchy_parent_key=hierarchy_parent_key,
     )
 
 
@@ -51,3 +59,31 @@ def test_resolve_children_exclude_wins_over_rename_and_order():
         {"A": ChildOverride(display_name="Alpha", include=False)},
     )
     assert [c.key for c in out] == ["B"]
+
+
+def test_resolve_children_drops_descendants_of_excluded_parent():
+    """Excluding a non-leaf child also drops its deeper descendants.
+
+    The customize dialog only lists direct children, so the override is keyed
+    on the story. Its sub-tasks must not survive — otherwise calculate_metrics
+    promotes them to direct children of the epic and re-counts them.
+    """
+    children = [
+        _issue("STORY"),
+        _issue("SUB1", parent_key="STORY"),
+        _issue("SUB2", hierarchy_parent_key="STORY"),
+        _issue("KEEP"),
+    ]
+    out = _resolve_children(children, [], {"STORY": ChildOverride(include=False)})
+    assert [c.key for c in out] == ["KEEP"]
+
+
+def test_resolve_children_drops_grandchildren_transitively():
+    """Transitive descendants (sub-sub-tasks) of an excluded child are dropped."""
+    children = [
+        _issue("S", hierarchy_parent_key="E"),
+        _issue("A", hierarchy_parent_key="S"),
+        _issue("B", hierarchy_parent_key="A"),
+    ]
+    out = _resolve_children(children, [], {"S": ChildOverride(include=False)})
+    assert out == []

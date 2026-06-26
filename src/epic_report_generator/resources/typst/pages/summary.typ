@@ -46,6 +46,28 @@
           table.cell(fill: lh)[#text(weight: "bold")[#r.done-sp]],
         )
     )
+  } else if r.kind == "child" {
+    // Nested chain child (Story/Sub-task tier): indented key + boxed icon, then
+    // summary/progress/(cert)/status. The trailing estimate columns stay blank —
+    // roll-ups live on the epic row above.
+    let cert = if show-cert { ([#certainty-cell(r.certainty, c)],) } else { () }
+    let key-cell = {
+      h(r.depth * 9pt)
+      if r.icon != "" {
+        issue-icon(r.icon)
+        h(3pt)
+      }
+      text(8.5pt, fill: c.muted)[#r.key]
+    }
+    (
+      (
+        key-cell,
+        text(fill: c.muted)[#r.summary],
+        progress-bar(r.progress, c, neutral: show-cert),
+      )
+        + cert
+        + (text(fill: c.muted)[#r.status], [], [], [], [], [])
+    )
   } else {
     let cert = if show-cert { ([#certainty-cell(r.certainty, c)],) } else { () }
     (

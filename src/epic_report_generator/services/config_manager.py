@@ -41,6 +41,7 @@ PROFILE_KEYS: frozenset[str] = frozenset(
         "timeline_hard_end",
         "show_epic_stories_on_timeline",
         "show_subtasks_on_timeline",
+        "issue_hierarchy",
         "expand_label_details",
         "show_additional_metrics",
         "show_timeline_chart",
@@ -108,6 +109,10 @@ _DEFAULTS: dict[str, Any] = {
     "timeline_hard_end": "",
     "show_epic_stories_on_timeline": False,
     "show_subtasks_on_timeline": False,
+    # Custom issue-type hierarchy chain (list of serialized HierarchyNode dicts).
+    # [] = derive the classic Epic→Story→Sub-task default. The four booleans above
+    # are retained for back-compat reads / migration; only this key is written.
+    "issue_hierarchy": [],
     "expand_label_details": True,
     "show_additional_metrics": True,
     "show_timeline_chart": True,

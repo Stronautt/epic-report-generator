@@ -83,8 +83,9 @@ class _FakeJira:
 def captured(monkeypatch):
     store: dict = {}
 
-    def _fake_generate_pdf(report):
+    def _fake_generate_pdf(report, icons=None):
         store["report"] = report
+        store["icons"] = icons
         return b"%PDF-stub"
 
     monkeypatch.setattr(preview_panel, "generate_pdf", _fake_generate_pdf)
@@ -172,3 +173,33 @@ def test_no_overrides_leaves_certainty_unset(captured):
     report = _run(jira, item, captured)
 
     assert report.metrics[0].scope_certainty is None
+
+
+def test_nested_subtask_override_excludes_it_from_epic(captured):
+    """A sub-task excluded via its story's nested override is dropped from the epic.
+
+    Strict tier nesting stores the sub-task override under the story's
+    ``ChildOverride.child_overrides``; ``_generate_report`` must flatten it so the
+    exclusion reaches the epic's flat child list.
+    """
+    story = _issue("PROJ-2")
+    subtask = _issue("PROJ-9", done=True)
+    subtask.hierarchy_parent_key = "PROJ-2"
+    subtask.display_tier = 2
+    epic = _epic("PROJ-1", [story, subtask])
+    jira = _FakeJira(by_key={"PROJ-1": epic})
+    item = ReportItem(
+        kind="epic",
+        key="PROJ-1",
+        child_overrides={
+            "PROJ-2": ChildOverride(
+                child_overrides={"PROJ-9": ChildOverride(include=False)}
+            )
+        },
+    )
+
+    report = _run(jira, item, captured)
+
+    keys = {c.key for c in report.epics[0].children}
+    assert "PROJ-9" not in keys  # nested-excluded sub-task dropped
+    assert "PROJ-2" in keys  # its story stays

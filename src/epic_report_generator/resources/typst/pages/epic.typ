@@ -35,6 +35,10 @@
           pill(p.label-tag, c.label-tag-text, c.label-tag-bg)
           h(6pt)
         }
+        if p.at("icon", default: "") != "" {
+          issue-icon(p.icon, size: 16pt)
+          h(6pt)
+        }
         text(20pt, weight: "bold", fill: c.accent)[#p.key]
         if p.summary != none {
           text(20pt, fill: c.text)[ · #p.summary]

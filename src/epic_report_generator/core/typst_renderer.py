@@ -41,14 +41,41 @@ def _needs_cjk(text: str) -> bool:
     return _CJK_RE.search(text) is not None
 
 
+def icon_ext(data: bytes) -> str:
+    """Pick the file extension matching *data*'s real image format.
+
+    Jira issue-type ``iconUrl``s serve PNG as often as SVG, and Typst infers the
+    decoder from the file extension — so PNG bytes written to a ``.svg`` file
+    hard-error the whole compile. Sniff the magic bytes; fall back to ``svg`` for
+    anything textual (the historical assumption). The view-model's icon path and
+    the on-disk filename both route through here so they always agree.
+    """
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "jpg"
+    if data[:4] in (b"GIF8",):
+        return "gif"
+    return "svg"
+
+
 def render_pdf(
-    payload: dict[str, Any], extra_font_paths: list[str] | None = None
+    payload: dict[str, Any],
+    extra_font_paths: list[str] | None = None,
+    icons: dict[str, bytes] | None = None,
 ) -> bytes:
     """Render the report payload to PDF bytes via Typst.
 
     *extra_font_paths* are added to Typst's font search path so a custom report
     font (NFR-05) is available alongside the bundled Inter (Latin/Cyrillic/Greek
     fallback) and Noto Sans CJK JP (CJK ideograph/kana/Hangul fallback).
+
+    *icons* maps issue-type id → icon bytes; each is written into the throwaway
+    project as ``icons/<id>.<ext>`` (extension sniffed from the bytes via
+    :func:`icon_ext`) so the templates can ``image()`` them (typst-py has no
+    in-memory FS).  The view-model only emits an icon path for ids present here
+    — routing the filename through the same :func:`icon_ext` — so a referenced
+    file is always written first with a matching extension.
     """
     res = resources.files(_RESOURCES)
     with resources.as_file(res) as res_dir:
@@ -63,6 +90,13 @@ def render_pdf(
             # Per-render view-model.
             data_json = json.dumps(payload, ensure_ascii=False)
             (root / "data.json").write_text(data_json, encoding="utf-8")
+
+            # Issue-type icons referenced by the payload (custom-hierarchy only).
+            if icons:
+                icons_dir = root / "icons"
+                icons_dir.mkdir(exist_ok=True)
+                for type_id, data in icons.items():
+                    (icons_dir / f"{type_id}.{icon_ext(data)}").write_bytes(data)
 
             # Base path holds Inter (Latin/Cyrillic/Greek). The 16MB Noto Sans
             # CJK JP lives in a sibling dir that is only searched when the report

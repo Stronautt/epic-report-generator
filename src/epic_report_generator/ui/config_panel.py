@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import html
 import logging
 from collections.abc import Callable
@@ -22,7 +23,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from epic_report_generator.core.data_models import ReportConfig
+from epic_report_generator.core.data_models import (
+    ReportConfig,
+    coerce_hierarchy,
+    epic_tier_type_names,
+    migrate_default_hierarchy,
+    serialize_hierarchy,
+)
 from epic_report_generator.core.jira_client import JiraClient
 from epic_report_generator.services.config_manager import _DEFAULTS, ConfigManager
 from epic_report_generator.ui._threading import ThreadedTask
@@ -30,6 +37,7 @@ from epic_report_generator.ui.widgets import (
     RE_EPIC_KEY,
     ChildCustomizeDialog,
     CollapsibleSection,
+    IssueHierarchyEditor,
     LabelledField,
     ProfileBar,
     ReportItemTable,
@@ -70,6 +78,15 @@ class _EmptyAwareDateEdit(QDateEdit):
             today = QDate.currentDate()
             self.calendarWidget().setCurrentPage(today.year(), today.month())
         return super().eventFilter(obj, event)
+
+    def stepBy(self, steps: int) -> None:  # noqa: N802
+        # Same fix as the calendar popup, for the text field: stepping (arrow key
+        # / scroll) out of the empty special-value state starts at today, not the
+        # ~1752 minimum date the field would otherwise step from.
+        if self.date() == self.minimumDate():
+            self.setDate(QDate.currentDate())
+            return
+        super().stepBy(steps)
 
 
 def _populate_field_combo(
@@ -222,6 +239,26 @@ class ConfigPanel(QWidget):
         self._persist_timer.setSingleShot(True)
         self._persist_timer.setInterval(300)
         self._persist_timer.timeout.connect(self._do_persist)
+        # Debounce + cancel-in-flight state for epic key autocomplete.
+        self._epic_picker_timer = QTimer(self)
+        self._epic_picker_timer.setSingleShot(True)
+        # 500ms debounce: continuous typing coalesces into one request, and a
+        # brief pause mid-word no longer fires its own (300ms was too eager).
+        self._epic_picker_timer.setInterval(500)
+        self._epic_picker_timer.timeout.connect(self._run_epic_picker)
+        self._epic_picker_pending: tuple[object, str] | None = None
+        self._epic_picker_seq = 0
+        # Issue-type icons for report-item rows: a {type_id: bytes} map (lazily
+        # loaded from the persisted metadata cache) + a {key: type_id} resolution
+        # cache, applied via a debounced eager lookup.
+        self._issue_type_icons: dict[str, bytes | None] | None = None
+        self._item_type_ids: dict[str, str] = {}
+        self._item_summaries: dict[str, str] = {}
+        self._item_icon_seq = 0
+        self._item_icon_timer = QTimer(self)
+        self._item_icon_timer.setSingleShot(True)
+        self._item_icon_timer.setInterval(500)
+        self._item_icon_timer.timeout.connect(self._resolve_item_icons)
         self._build_ui()
         self._restore_values()
         self._persisting = True
@@ -432,21 +469,6 @@ class ConfigPanel(QWidget):
             )
         )
 
-        self._include_subtasks_progress_check = QCheckBox(
-            "Include subtasks into progress calculation"
-        )
-        self._include_subtasks_progress_check.setChecked(True)
-        self._include_subtasks_progress_check.stateChanged.connect(
-            lambda _: self._persist_values()
-        )
-        est.addWidget(self._include_subtasks_progress_check)
-        est.addWidget(
-            self._hint(
-                "Fetch sub-tasks linked via the parent field and include them "
-                "in progress calculations"
-            )
-        )
-
         root.addWidget(self._estimation_section)
 
         # ── Report Content (collapsible, collapsed) ─────────────────────
@@ -501,42 +523,10 @@ class ConfigPanel(QWidget):
         self._show_timeline_check.stateChanged.connect(lambda _: self._persist_values())
         content.addWidget(self._show_timeline_check)
         content.addWidget(self._hint("Add a Gantt-style timeline page to the report"))
-
-        self._show_children_timeline_check = QCheckBox("Show stories/tasks on timeline")
-        self._show_children_timeline_check.setChecked(False)
-        self._show_children_timeline_check.stateChanged.connect(
-            lambda _: self._persist_values()
-        )
-        content.addWidget(self._show_children_timeline_check)
         content.addWidget(
             self._hint(
-                "Display each epic's direct stories and tasks as individual "
-                "bars on the Gantt chart (not recursive subtasks)"
-            )
-        )
-
-        self._include_subtasks_timeline_check = QCheckBox(
-            "Include subtask dates in timeline ranges"
-        )
-        self._include_subtasks_timeline_check.setChecked(False)
-        self._include_subtasks_timeline_check.stateChanged.connect(
-            lambda _: self._persist_values()
-        )
-        content.addWidget(self._include_subtasks_timeline_check)
-        content.addWidget(
-            self._hint("Expand epic timeline ranges using subtask start/due dates")
-        )
-
-        self._show_subtasks_timeline_check = QCheckBox("Show subtasks on timeline")
-        self._show_subtasks_timeline_check.setChecked(False)
-        self._show_subtasks_timeline_check.stateChanged.connect(
-            lambda _: self._persist_values()
-        )
-        content.addWidget(self._show_subtasks_timeline_check)
-        content.addWidget(
-            self._hint(
-                "Display subtasks as individual bars on the Gantt chart "
-                "alongside their parent issues"
+                "Which tiers appear on the timeline (and expand epic ranges) is "
+                "driven by each type's Show toggle in the Issue Hierarchy section."
             )
         )
 
@@ -563,6 +553,30 @@ class ConfigPanel(QWidget):
         )
 
         root.addWidget(self._content_section)
+
+        # ── Issue Hierarchy (collapsible, collapsed) ────────────────────
+        self._hierarchy_section = CollapsibleSection(
+            "Issue Hierarchy",
+            expanded=False,
+        )
+        self._hierarchy_section.body_layout.addWidget(
+            self._hint(
+                "Map your Jira issue types onto three report tiers (Epic / "
+                "Standard / Sub-task) used to fetch and roll up children. Use "
+                "+ Add to place a type in a tier and drag a card to move it "
+                "between tiers; per type set its relationship to the tier above "
+                "(Parent or link types) and toggle whether it shows on the report "
+                "and counts in the metrics. Leave every tier empty to use the "
+                "default Epic → Standard → Sub-task."
+            )
+        )
+        self._hierarchy_editor = IssueHierarchyEditor()
+        self._hierarchy_editor.changed.connect(self._persist_values)
+        self._hierarchy_editor.refresh_requested.connect(self._refresh_hierarchy_types)
+        self._hierarchy_section.toggled.connect(self._on_hierarchy_section_toggled)
+        self._hierarchy_types_loaded = False
+        self._hierarchy_section.body_layout.addWidget(self._hierarchy_editor)
+        root.addWidget(self._hierarchy_section)
 
         # ── Jira Field Mapping (collapsible, collapsed) ─────────────────
         self._field_mapping_section = CollapsibleSection(
@@ -651,6 +665,8 @@ class ConfigPanel(QWidget):
         # Auto-save on any change + lazy label fetch
         self._item_table.items_changed.connect(self._persist_values)
         self._item_table.items_changed.connect(self._ensure_labels_fetched)
+        self._item_table.items_changed.connect(self._item_icon_timer.start)
+        self._item_table.epic_query_changed.connect(self._on_epic_query)
         self._customize_busy = False  # guards against stacked customize fetches
         self._child_settings_busy = False  # guards nested per-epic settings fetches
         self._item_table.edit_requested.connect(self._on_customize_item)
@@ -731,13 +747,6 @@ class ConfigPanel(QWidget):
             "due_date_field", _DEFAULTS["due_date_field"]
         )
 
-        self._include_subtasks_progress_check.setChecked(
-            self._config.get("include_subtasks", True)
-        )
-        self._include_subtasks_timeline_check.setChecked(
-            self._config.get("include_subtasks_in_timeline", True)
-        )
-
         # Restore estimation method (block signals so the change handler and
         # persist callback don't fire mid-restore; apply visibility once below).
         method = self._config.get("estimation_method", _DEFAULTS["estimation_method"])
@@ -766,14 +775,6 @@ class ConfigPanel(QWidget):
         self._restore_hard_date(self._hard_start_edit, "timeline_hard_start")
         self._restore_hard_date(self._hard_end_edit, "timeline_hard_end")
 
-        # Restore show children / subtasks on timeline
-        self._show_children_timeline_check.setChecked(
-            self._config.get("show_epic_stories_on_timeline", False)
-        )
-        self._show_subtasks_timeline_check.setChecked(
-            self._config.get("show_subtasks_on_timeline", False)
-        )
-
         # Restore expand label details
         self._expand_label_details_check.setChecked(
             self._config.get("expand_label_details", True)
@@ -793,6 +794,40 @@ class ConfigPanel(QWidget):
         self._force_light_report_check.setChecked(
             self._config.get("report_force_light", True)
         )
+
+        # Restore the issue-type hierarchy chain. A saved chain wins; otherwise
+        # migrate the legacy boolean toggles (Jira metadata unavailable here, so
+        # the offline classic Epic→Story→Sub-task names are used and refine on the
+        # next Refresh). All-default flags leave the chain empty (= the default).
+        self._hierarchy_editor.set_hierarchy(self._restore_hierarchy())
+
+    def _restore_hierarchy(self) -> list:
+        """Return the chain to load: saved, migrated-from-legacy, or empty."""
+        saved = self._config.get("issue_hierarchy", [])
+        if saved:
+            return coerce_hierarchy(saved)
+        legacy = {
+            "include_subtasks": self._config.get("include_subtasks", True),
+            "include_subtasks_in_timeline": self._config.get(
+                "include_subtasks_in_timeline", False
+            ),
+            "show_epic_stories_on_timeline": self._config.get(
+                "show_epic_stories_on_timeline", False
+            ),
+            "show_subtasks_on_timeline": self._config.get(
+                "show_subtasks_on_timeline", False
+            ),
+        }
+        # All defaults → empty chain reproduces today's output byte-for-byte; only
+        # a non-default toggle needs an explicit migrated chain to be preserved.
+        if legacy == {
+            "include_subtasks": True,
+            "include_subtasks_in_timeline": False,
+            "show_epic_stories_on_timeline": False,
+            "show_subtasks_on_timeline": False,
+        }:
+            return []
+        return migrate_default_hierarchy(**legacy)
 
     _MIN_HARD_DATE_GAP_DAYS = 5
 
@@ -874,10 +909,6 @@ class ConfigPanel(QWidget):
                 or _DEFAULTS["start_date_field"],
                 "due_date_field": self._due_date_field_input.text.strip()
                 or _DEFAULTS["due_date_field"],
-                "include_subtasks": self._include_subtasks_progress_check.isChecked(),
-                "include_subtasks_in_timeline": (
-                    self._include_subtasks_timeline_check.isChecked()
-                ),
                 "timeline_start_field": self._timeline_start_field.text.strip(),
                 "timeline_end_field": self._timeline_end_field.text.strip(),
                 "timeline_hard_start": (
@@ -891,18 +922,15 @@ class ConfigPanel(QWidget):
                     if self._hard_end_edit.date() != self._hard_end_edit.minimumDate()
                     else ""
                 ),
-                "show_epic_stories_on_timeline": (
-                    self._show_children_timeline_check.isChecked()
-                ),
-                "show_subtasks_on_timeline": (
-                    self._show_subtasks_timeline_check.isChecked()
-                ),
                 "expand_label_details": (self._expand_label_details_check.isChecked()),
                 "show_additional_metrics": (
                     self._show_additional_metrics_check.isChecked()
                 ),
                 "show_timeline_chart": self._show_timeline_check.isChecked(),
                 "report_force_light": self._force_light_report_check.isChecked(),
+                "issue_hierarchy": serialize_hierarchy(
+                    self._hierarchy_editor.to_hierarchy()
+                ),
             }
         )
 
@@ -1015,17 +1043,10 @@ class ConfigPanel(QWidget):
             timeline_end_field=timeline_end,
             timeline_hard_start=hard_start,
             timeline_hard_end=hard_end,
-            include_subtasks=(self._include_subtasks_progress_check.isChecked()),
-            include_subtasks_in_timeline=(
-                self._include_subtasks_timeline_check.isChecked()
-            ),
-            show_epic_stories_on_timeline=(
-                self._show_children_timeline_check.isChecked()
-            ),
-            show_subtasks_on_timeline=(self._show_subtasks_timeline_check.isChecked()),
             expand_label_details=self._expand_label_details_check.isChecked(),
             show_additional_metrics=self._show_additional_metrics_check.isChecked(),
             show_timeline_chart=self._show_timeline_check.isChecked(),
+            issue_hierarchy=self._hierarchy_editor.to_hierarchy(),
         )
 
         self._persist_values()
@@ -1067,11 +1088,8 @@ class ConfigPanel(QWidget):
         self._timeline_end_field.text = ""
         self._hard_start_edit.setDate(self._hard_start_edit.minimumDate())
         self._hard_end_edit.setDate(self._hard_end_edit.minimumDate())
-        self._include_subtasks_progress_check.setChecked(True)
-        self._include_subtasks_timeline_check.setChecked(False)
         self._show_timeline_check.setChecked(True)
-        self._show_children_timeline_check.setChecked(False)
-        self._show_subtasks_timeline_check.setChecked(False)
+        self._hierarchy_editor.set_hierarchy([])
         self._expand_label_details_check.setChecked(True)
         self._show_additional_metrics_check.setChecked(True)
         self._force_light_report_check.setChecked(True)
@@ -1081,6 +1099,7 @@ class ConfigPanel(QWidget):
         self._title_section.set_expanded(False)
         self._estimation_section.set_expanded(False)
         self._content_section.set_expanded(False)
+        self._hierarchy_section.set_expanded(False)
         self._field_mapping_section.set_expanded(False)
 
     def refresh_label_completions(self) -> None:
@@ -1090,6 +1109,7 @@ class ConfigPanel(QWidget):
         """
         self._labels_fetched = False
         self._ensure_labels_fetched()
+        self._resolve_item_icons()  # eagerly icon any restored epic rows
 
     def _ensure_labels_fetched(self) -> None:
         """Lazily fetch Jira labels once when any label row exists."""
@@ -1107,6 +1127,119 @@ class ConfigPanel(QWidget):
                 logger.debug("Set %d label completions", len(labels))
 
         self._tasks.start(self._jira.fetch_labels, _on_labels, capture_exceptions=True)
+
+    # -- epic key autocomplete -------------------------------------------------
+
+    def _on_epic_query(self, row: object, query: str) -> None:
+        """Debounce an epic-key autocomplete request from a report-item row."""
+        if not self._jira.connected or len(query) < 2:
+            return
+        self._epic_picker_pending = (row, query)
+        self._epic_picker_timer.start()
+
+    def _run_epic_picker(self) -> None:
+        """Fetch issue-picker suggestions (scoped to Epic-tier types) off-thread.
+
+        Each run bumps a sequence counter so any in-flight result for a stale
+        query is ignored — the UI never blocks and only the latest query wins.
+        """
+        if not self._epic_picker_pending:
+            return
+        row, query = self._epic_picker_pending
+        self._epic_picker_seq += 1
+        seq = self._epic_picker_seq
+        types = epic_tier_type_names(self._hierarchy_editor.to_hierarchy())
+        types_csv = ", ".join(f'"{t}"' for t in types)
+        jql = f"issuetype in ({types_csv})"
+
+        def _on_result(result: object) -> None:
+            # Drop stale results (newer query in flight) and rows removed meanwhile.
+            if seq != self._epic_picker_seq or isinstance(result, Exception):
+                return
+            if row in self._item_table.rows:
+                row.set_epic_completions(result)  # type: ignore[attr-defined]
+
+        self._tasks.start(
+            lambda: self._jira.fetch_issue_picker(query, jql),
+            _on_result,
+            capture_exceptions=True,
+        )
+
+    # -- report-item issue-type icons ------------------------------------------
+
+    def _ensure_icon_map(self) -> dict[str, bytes | None]:
+        """Issue-type icons ({type_id: bytes}), lazily decoded from the cache."""
+        if self._issue_type_icons is None:
+            blob = self._config.get("issue_type_cache")
+            raw = blob.get("icons", {}) if isinstance(blob, dict) else {}
+            self._issue_type_icons = {k: base64.b64decode(v) for k, v in raw.items()}
+        return self._issue_type_icons
+
+    def _child_icon_bytes(self, type_ids: dict[str, str]) -> dict[str, bytes]:
+        """Map a child's key → its issue-type icon bytes (skip unknown/iconless)."""
+        icons = self._ensure_icon_map()
+        out: dict[str, bytes] = {}
+        for key, tid in type_ids.items():
+            data = icons.get(tid)
+            if data:
+                out[key] = data
+        return out
+
+    def _apply_item_icons(self) -> None:
+        """Paint each row's leading icon + display-name placeholder from cache."""
+        icons = self._ensure_icon_map()
+        for row in self._item_table.rows:
+            if row.kind == "epic":
+                key = row.key.upper()
+                tid = self._item_type_ids.get(key)
+                row.set_type_icon(icons.get(tid) if tid else None)
+                summary = self._item_summaries.get(key)
+                if summary:
+                    row.set_jira_summary(summary)
+            else:
+                row.set_type_icon(None)  # label → tag glyph handled by the row
+
+    def _resolve_item_icons(self) -> None:
+        """Eagerly resolve epic rows' issue-type icons (batched + cached).
+
+        Mirrors the epic-picker seq guard so a stale in-flight result is ignored;
+        label rows show their tag glyph immediately (no fetch). Resolved and
+        missing keys are both cached so a row isn't re-fetched on every keystroke.
+        """
+        self._apply_item_icons()
+        if not self._jira.connected:
+            return
+        pending = sorted(
+            {
+                row.key.upper()
+                for row in self._item_table.rows
+                if row.kind == "epic"
+                and row.key
+                and RE_EPIC_KEY.match(row.key.upper())
+                and row.key.upper() not in self._item_type_ids
+            }
+        )
+        if not pending:
+            return
+        self._item_icon_seq += 1
+        seq = self._item_icon_seq
+
+        def _done(result: object) -> None:
+            if seq != self._item_icon_seq or isinstance(result, Exception):
+                return
+            for key in pending:  # record misses too, so they aren't re-fetched
+                self._item_type_ids.setdefault(key, "")
+            for key, (tid, _name, summary) in result.items():  # type: ignore[union-attr]
+                self._item_type_ids[key.upper()] = tid
+                if summary:
+                    self._item_summaries[key.upper()] = summary
+            self._apply_item_icons()
+
+        self._tasks.start(
+            lambda: self._jira.fetch_issue_meta(pending),
+            _done,
+            capture_exceptions=True,
+        )
 
     # -- background Jira helpers -----------------------------------------------
 
@@ -1175,6 +1308,11 @@ class ConfigPanel(QWidget):
         epic_link_field = (
             self._epic_link_field.text.strip() or _DEFAULTS["epic_link_field"]
         )
+        # Read the chain on the main thread; the worker runs off it. Without the
+        # chain the child/label fetches default to ["Epic"] + the 2-tier path,
+        # which false-flags custom-chain labels and lists the wrong children.
+        chain = self._hierarchy_editor.to_hierarchy()
+        epic_tier_types = epic_tier_type_names(chain)
         logger.info("Validating %d report item(s) against Jira", len(specs))
         self._validate_btn.setEnabled(False)
         self._validate_btn.setText("Validating…")
@@ -1208,11 +1346,13 @@ class ConfigPanel(QWidget):
                         children = {
                             k
                             for k, _ in self._jira.fetch_child_summaries(
-                                ekey, epic_link_field
+                                ekey, epic_link_field, chain
                             )
                         }
                 else:  # label
-                    epics = self._jira.fetch_epic_summaries_by_label(key)
+                    epics = self._jira.fetch_epic_summaries_by_label(
+                        key, epic_tier_types
+                    )
                     if not epics:
                         findings.append(
                             (
@@ -1267,6 +1407,13 @@ class ConfigPanel(QWidget):
                     state_by_row[row] = severity
             for row, state in state_by_row.items():
                 row.set_validation(state)  # type: ignore[attr-defined]
+            # Issue-hierarchy chain checks: guards block, stale refs warn.
+            for msg in self._hierarchy_editor.guard_messages():
+                problems.append(("error", msg))
+            stale = self._hierarchy_editor.stale_warnings()
+            self._hierarchy_editor.show_warnings(stale)
+            for msg in stale:
+                problems.append(("warning", msg))
             self._show_validation_summary(problems)
             if on_complete is not None:
                 has_errors = any(sev == "error" for sev, _ in problems)
@@ -1335,6 +1482,8 @@ class ConfigPanel(QWidget):
 
         kind = row.kind  # type: ignore[attr-defined]
         key = row.key  # type: ignore[attr-defined]
+        # The override name, else the resolved Jira summary, for the dialog title.
+        display_name = row.effective_name  # type: ignore[attr-defined]
         if not key:
             QMessageBox.information(
                 self, "No Key", "Enter an Epic key or label before customizing."
@@ -1355,12 +1504,21 @@ class ConfigPanel(QWidget):
         epic_link_field = (
             self._epic_link_field.text.strip() or _DEFAULTS["epic_link_field"]
         )
+        chain = self._hierarchy_editor.to_hierarchy()
+        epic_tier_types = epic_tier_type_names(chain)
         logger.info("Customizing %s item %s", kind, key)
 
-        def _fetch() -> list[tuple[str, str]]:
+        def _fetch() -> tuple[list[tuple[str, str]], dict[str, str]]:
             if kind == "label":
-                return self._jira.fetch_epic_summaries_by_label(key)
-            return self._jira.fetch_child_summaries(key.upper(), epic_link_field)
+                children = self._jira.fetch_epic_summaries_by_label(
+                    key, epic_tier_types
+                )
+            else:
+                children = self._jira.fetch_child_summaries(
+                    key.upper(), epic_link_field, chain
+                )
+            type_ids = self._jira.fetch_issue_type_ids([k for k, _ in children])
+            return children, type_ids
 
         def _on_fetched(result: object) -> None:
             self._customize_busy = False
@@ -1369,7 +1527,7 @@ class ConfigPanel(QWidget):
                     self, "Error", f"Failed to load child items: {result}"
                 )
                 return
-            children: list[tuple[str, str]] = result  # type: ignore[assignment]
+            children, type_ids = result  # type: ignore[misc]
             dialog = ChildCustomizeDialog(
                 kind=kind,
                 parent_key=key,
@@ -1377,6 +1535,9 @@ class ConfigPanel(QWidget):
                 children=children,
                 overrides=overrides,
                 child_order=child_order,
+                child_icons=self._child_icon_bytes(type_ids),
+                parent_display_name=display_name,
+                children_tier=0 if kind == "label" else 1,
                 parent=self,
             )
             # For label items the children are epics — wire the per-epic gear so
@@ -1420,13 +1581,21 @@ class ConfigPanel(QWidget):
         epic_link_field = (
             self._epic_link_field.text.strip() or _DEFAULTS["epic_link_field"]
         )
+        chain = self._hierarchy_editor.to_hierarchy()
+        # The clicked row's own tier is the tier of the children the source dialog
+        # displays; we drill one tier below it (parent_tier = the row's tier).
+        source_tier = getattr(parent_dialog, "children_tier", 1)
         parent_certainty = child_row.effective_certainty()  # type: ignore[attr-defined]
         overrides = child_row.get_nested_overrides()  # type: ignore[attr-defined]
         child_order = child_row.nested_order()  # type: ignore[attr-defined]
-        logger.info("Customizing stories/tasks of epic child %s", epic_key)
+        logger.info("Customizing tier-%d children of %s", source_tier + 1, epic_key)
 
-        def _fetch() -> list[tuple[str, str]]:
-            return self._jira.fetch_child_summaries(epic_key.upper(), epic_link_field)
+        def _fetch() -> tuple[list[tuple[str, str]], dict[str, str]]:
+            children = self._jira.fetch_child_summaries(
+                epic_key.upper(), epic_link_field, chain, parent_tier=source_tier
+            )
+            type_ids = self._jira.fetch_issue_type_ids([k for k, _ in children])
+            return children, type_ids
 
         def _on_fetched(result: object) -> None:
             self._child_settings_busy = False
@@ -1435,7 +1604,7 @@ class ConfigPanel(QWidget):
                     parent_dialog, "Error", f"Failed to load child items: {result}"
                 )
                 return
-            grandchildren: list[tuple[str, str]] = result  # type: ignore[assignment]
+            grandchildren, type_ids = result  # type: ignore[misc]
             nested = ChildCustomizeDialog(
                 kind="epic",
                 parent_key=epic_key,
@@ -1443,7 +1612,14 @@ class ConfigPanel(QWidget):
                 children=grandchildren,
                 overrides=overrides,
                 child_order=child_order,
+                child_icons=self._child_icon_bytes(type_ids),
+                children_tier=source_tier + 1,
                 parent=parent_dialog,
+            )
+            # A nested dialog above Sub-task tier carries its own gears (e.g. a
+            # label's epic → story → sub-task drill); recurse into them.
+            nested.child_settings_requested.connect(
+                lambda r: self._on_child_epic_settings(nested, r)
             )
             if exec_dialog(nested) == QDialog.DialogCode.Accepted:
                 child_row.set_nested(  # type: ignore[attr-defined]
@@ -1453,6 +1629,99 @@ class ConfigPanel(QWidget):
 
         self._child_settings_busy = True
         self._tasks.start(_fetch, _on_fetched, capture_exceptions=True)
+
+    def _on_hierarchy_section_toggled(self, expanded: bool) -> None:
+        """Load issue types the first time the Issue Hierarchy section opens.
+
+        Prefers the persisted instance metadata so a restart doesn't re-hit
+        Jira; only fetches live when nothing is cached (and connected). The
+        Refresh button always re-fetches.
+        """
+        if not expanded or self._hierarchy_types_loaded:
+            return
+        if self._load_cached_hierarchy_types():
+            return
+        if self._jira.connected:
+            self._refresh_hierarchy_types()
+
+    def _load_cached_hierarchy_types(self) -> bool:
+        """Populate the editor from persisted instance metadata; False if none.
+
+        Icons are stored base64-encoded (raw SVG/PNG bytes aren't JSON-safe).
+        """
+        blob = self._config.get("issue_type_cache")
+        if not isinstance(blob, dict) or not blob.get("types"):
+            return False
+        # Skip a cache from a different Jira site (only when we know the current
+        # one — offline keeps the last-known list). cloud_id is a global key.
+        current = self._config.get("cloud_id", "")
+        if current and blob.get("cloud_id") and blob["cloud_id"] != current:
+            return False
+        icons = {
+            k: base64.b64decode(v) for k, v in (blob.get("icons") or {}).items()
+        }
+        self._hierarchy_types_loaded = True
+        self._hierarchy_editor.set_types(
+            blob["types"], blob.get("link_types", []), icons
+        )
+        self._hierarchy_editor.show_warnings(self._hierarchy_editor.stale_warnings())
+        self._issue_type_icons = dict(icons)
+        self._resolve_item_icons()
+        return True
+
+    def _refresh_hierarchy_types(self) -> None:
+        """Fetch issue types, link types, and icons for the hierarchy editor.
+
+        Clears the client's metadata caches first (a true Refresh), then
+        repopulates the editor's panes and surfaces any stale chain references.
+        """
+        if not self._require_connected():
+            return
+        self._hierarchy_editor.set_busy(True)
+
+        def _fetch() -> tuple[list[dict], list[dict], dict[str, bytes | None]]:
+            self._jira.invalidate_caches()
+            types = self._jira.fetch_issue_types()
+            link_types = self._jira.fetch_issue_link_types()
+            icons = {t["id"]: self._jira.issue_type_icon(t["id"]) for t in types}
+            return types, link_types, icons
+
+        def _on_done(result: object) -> None:
+            self._hierarchy_editor.set_busy(False)
+            if isinstance(result, Exception):
+                QMessageBox.warning(
+                    self, "Error", f"Failed to load issue types: {result}"
+                )
+                return
+            types, link_types, icons = result  # type: ignore[misc]
+            self._hierarchy_types_loaded = True
+            self._hierarchy_editor.set_types(types, link_types, icons)
+            self._hierarchy_editor.show_warnings(
+                self._hierarchy_editor.stale_warnings()
+            )
+            # Persist the instance metadata (global, not per-profile) so the next
+            # launch loads from disk instead of re-fetching. Icons → base64.
+            self._config.set(
+                "issue_type_cache",
+                {
+                    "cloud_id": self._config.get("cloud_id", ""),
+                    "types": types,
+                    "link_types": link_types,
+                    "icons": {
+                        t["id"]: base64.b64encode(icons[t["id"]]).decode()
+                        for t in types
+                        if icons.get(t["id"])
+                    },
+                },
+            )
+            # Refresh may reflect new types/icons — drop the resolution cache and
+            # re-apply icons to the report-item rows.
+            self._issue_type_icons = dict(icons)
+            self._item_type_ids.clear()
+            self._item_summaries.clear()
+            self._resolve_item_icons()
+
+        self._tasks.start(_fetch, _on_done, capture_exceptions=True)
 
     def _detect_fields(self) -> None:
         if not self._require_connected():

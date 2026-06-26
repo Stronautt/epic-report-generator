@@ -76,6 +76,17 @@
   ) { c.red } else { c.muted }
 }
 
+// Issue-type icon glyph rendered from a cached SVG. `path` is the view-model's
+// image path (e.g. "icons/10001.svg") or "" when the type's bytes weren't
+// cached — Typst's image() hard-errors on a missing file, so every caller must
+// guard on `path != ""`. Height-bound so the icon keeps its aspect ratio; the
+// small positive baseline drops it onto the text baseline for inline use.
+#let issue-icon(path, size: 9pt) = box(
+  height: size,
+  baseline: 15%,
+  image(path, height: size),
+)
+
 // Page geometry — landscape 16:9.
 #let page-width = 406mm
 #let page-height = 228.4mm

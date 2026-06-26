@@ -43,6 +43,7 @@ from epic_report_generator.core.data_models import (
     ReportData,
     ReportItem,
     average_certainty,
+    order_by_keys,
 )
 from epic_report_generator.core.jira_client import JiraClient
 from epic_report_generator.core.metrics import calculate_metrics, merge_metrics
@@ -61,27 +62,6 @@ def _project_prefix(key: str) -> str | None:
     return key.rsplit("-", 1)[0] if "-" in key else None
 
 
-def _apply_child_order(
-    child_order: list[str],
-    items: list,
-    *,
-    key: Callable[[object], str] = lambda x: x,  # type: ignore[assignment,return-value]
-) -> list:
-    """Reorder *items* by *child_order* (the user's dragged child-key order).
-
-    Items whose key appears in *child_order* come first, in that order; the rest
-    keep their original relative position, appended after (stable). *key* extracts
-    the child key from each item — identity for a plain key list, ``.key`` for
-    issues/epics. Mirrors ``widgets._order_children`` so the report matches the
-    customize dialog.
-    """
-    if not child_order:
-        return list(items)
-    rank = {k: i for i, k in enumerate(child_order)}
-    fallback = len(rank)
-    return sorted(items, key=lambda x: rank.get(key(x), fallback))
-
-
 def _resolve_children(
     children: list[JiraIssue],
     child_order: list[str],
@@ -90,19 +70,100 @@ def _resolve_children(
     """Apply per-child overrides to an epic's children for report generation.
 
     Drops children whose override sets ``include=False`` (so they don't count
-    toward metrics or appear on the timeline), reorders the survivors by
-    *child_order* (the user's dragged order), and writes any display-name
+    toward metrics or appear on the timeline) — **and any deeper descendant of
+    an excluded child**, so a sub-task whose parent story was excluded is not
+    orphaned and silently promoted to a direct child of the epic in
+    ``calculate_metrics`` (which would re-count it). Then reorders the survivors
+    by *child_order* (the user's dragged order), and writes any display-name
     override onto each kept child's ``summary``. Kept children are mutated in
     place; a new ordered list is returned. Mirrors the customize dialog so the
     generated report matches what the user arranged.
     """
-    kept = [c for c in children if (ov := overrides.get(c.key)) is None or ov.include]
-    kept = _apply_child_order(child_order, kept, key=lambda c: c.key)
+    excluded = {
+        c.key
+        for c in children
+        if (ov := overrides.get(c.key)) is not None and not ov.include
+    }
+    if excluded:
+        by_key = {c.key: c for c in children}
+
+        def _orphaned(child: JiraIssue) -> bool:
+            seen: set[str] = set()
+            pk = child.hierarchy_parent_key or child.parent_key
+            while pk and pk not in seen:
+                if pk in excluded:
+                    return True
+                seen.add(pk)
+                parent = by_key.get(pk)
+                if parent is None:
+                    break
+                pk = parent.hierarchy_parent_key or parent.parent_key
+            return False
+
+        kept = [c for c in children if c.key not in excluded and not _orphaned(c)]
+    else:
+        kept = list(children)
+    kept = order_by_keys(kept, child_order, key=lambda c: c.key)
     for c in kept:
         ov = overrides.get(c.key)
         if ov and ov.display_name:
             c.summary = ov.display_name
     return kept
+
+
+def _flatten_overrides(
+    overrides: dict[str, ChildOverride],
+) -> tuple[dict[str, ChildOverride], list[str]]:
+    """Flatten a recursive override tree into one key→override map + order list.
+
+    Strict tier nesting stores a sub-task's override under its story's
+    ``ChildOverride.child_overrides``, but ``_resolve_children`` runs on the epic's
+    *flat* child list (all tiers).  Merging every level here lets one pass apply the
+    nested overrides too — Jira keys are globally unique, so merge-by-key can't
+    collide.  The returned order concatenates each level's ``child_order`` so a
+    dragged sub-task order is honoured alongside the stories.
+    """
+    flat: dict[str, ChildOverride] = {}
+    order: list[str] = []
+
+    def _walk(ovs: dict[str, ChildOverride]) -> None:
+        for key, ov in ovs.items():
+            flat[key] = ov
+            order.extend(ov.child_order)
+            if ov.child_overrides:
+                _walk(ov.child_overrides)
+
+    _walk(overrides)
+    return flat, order
+
+
+def _gather_icons(
+    jira: JiraClient, config: ReportConfig, report: ReportData
+) -> dict[str, bytes]:
+    """Fetch issue-type icon bytes for every type used by a custom chain.
+
+    Returns ``{type_id: bytes}`` for the chain's types and every child's
+    ``issue_type_id`` whose icon the client can fetch.  The default (empty
+    chain) carries no type ids, so this is a no-op and the report stays
+    icon-free, byte-for-byte.
+    """
+    chain = getattr(config, "issue_hierarchy", None) or []
+    if not chain:
+        return {}
+    type_ids: set[str] = {n.issue_type_id for n in chain if n.issue_type_id}
+    epics = list(report.epics)
+    for sources in report.label_source_epics.values():
+        epics.extend(src_epic for src_epic, _ in sources)
+    for epic in epics:
+        for child in epic.children:
+            if child.issue_type_id:
+                type_ids.add(child.issue_type_id)
+    icons: dict[str, bytes] = {}
+    for tid in type_ids:
+        data = jira.issue_type_icon(tid)
+        if data:
+            icons[tid] = data
+    return icons
 
 
 def _generate_report(
@@ -141,11 +202,23 @@ def _generate_report(
             include_subtasks_in_timeline=config.include_subtasks_in_timeline,
             timeline_start_field=config.timeline_start_field,
             timeline_end_field=config.timeline_end_field,
+            chain=config.issue_hierarchy,
         )
     except Exception as exc:  # noqa: BLE001 - surfaced to the user as an error
         logger.exception("Jira fetch failed in worker")
         report.errors.append(f"Failed to fetch Jira data: {exc}")
         epics_by_key, label_to_keys = {}, {}
+
+    # Reconstruct each issue's scope/completion history from the changelog so the
+    # trend chart's burnup steps on every estimate/done event (Jira-style) rather
+    # than only on created/resolved dates. Isolated + best-effort: an enrichment
+    # failure must never discard the fetched epics — the chart just falls back to
+    # the created/resolved approximation.
+    if epics_by_key:
+        try:
+            jira.enrich_trend_history(epics_by_key, config.story_points_field)
+        except Exception:  # noqa: BLE001 - best-effort; trend falls back
+            logger.warning("Trend history enrichment failed", exc_info=True)
 
     # Pass 2 — build per-item metrics/overrides from the fetched data.  Each
     # EpicData is deep-copied before mutation because dedup means one instance
@@ -160,11 +233,14 @@ def _generate_report(
                 report.errors.append(f"Epic {item.key} not found.")
                 continue
             epic = copy.deepcopy(epic)
-            # Apply per-child (story/task) overrides — drop excluded children,
-            # reorder, and rename — before metrics so excluded items don't count
-            # and the timeline child-bar order matches the customize dialog.
+            # Apply per-child (story/task/sub-task) overrides — drop excluded
+            # children, reorder, and rename — before metrics so excluded items
+            # don't count and the timeline child-bar order matches the customize
+            # dialog.  Flatten the recursive tree so nested sub-task overrides
+            # (set via a story's gear) apply to the epic's flat child list too.
+            child_ovs, nested_order = _flatten_overrides(item.child_overrides)
             epic.children = _resolve_children(
-                epic.children, item.child_order, item.child_overrides
+                epic.children, item.child_order + nested_order, child_ovs
             )
             metrics = calculate_metrics(
                 epic,
@@ -182,10 +258,9 @@ def _generate_report(
                     [
                         ov.scope_certainty
                         for c in epic.children
-                        if (ov := item.child_overrides.get(c.key)) is not None
+                        if (ov := child_ovs.get(c.key)) is not None
                     ]
                 )
-            # Use display_name override if set
             if item.display_name:
                 epic.summary = item.display_name
             report.epics.append(epic)
@@ -199,7 +274,7 @@ def _generate_report(
             # Apply the user's epic order within the label group, then drop any
             # epic excluded via its Include checkbox. Timeline + group roll-up
             # follow this instead of Jira's default order.
-            keys = _apply_child_order(item.child_order, label_to_keys.get(item.key, []))
+            keys = order_by_keys(label_to_keys.get(item.key, []), item.child_order)
             keys = [
                 k
                 for k in keys
@@ -216,8 +291,9 @@ def _generate_report(
             for e in label_epics:
                 ov = item.child_overrides.get(e.key)
                 if ov and (ov.child_overrides or ov.child_order):
+                    nested_ovs, nested_order = _flatten_overrides(ov.child_overrides)
                     e.children = _resolve_children(
-                        e.children, ov.child_order, ov.child_overrides
+                        e.children, ov.child_order + nested_order, nested_ovs
                     )
             # Collect per-epic metrics during merge to avoid recomputing
             per_epic_metrics: list[EpicMetrics] = []
@@ -225,12 +301,10 @@ def _generate_report(
                 label_epics,
                 estimation_method=config.estimation_method,
                 progress_method=config.progress_method,
-                include_subtask_timeline=config.include_subtasks_in_timeline,
                 source_metrics_out=per_epic_metrics,
                 window_start=config.timeline_hard_start,
                 window_end=config.timeline_hard_end,
             )
-            # Set display name for label group
             display = item.display_name or item.key
             synthetic.summary = display
             report.epics.append(synthetic)
@@ -272,7 +346,6 @@ def _generate_report(
                     [em.scope_certainty for _, em in source_pairs]
                 )
 
-    # Collect unique sprints from all children across all epics
     seen_sprints: set[str] = set()
     for epic in report.epics:
         for child in epic.children:
@@ -292,7 +365,6 @@ def _generate_report(
             config.project_display_name,
         )
 
-    # Fetch fix version dates
     report_progress("Fetching fix versions…", 75)
     for pk in project_keys:
         try:
@@ -301,12 +373,12 @@ def _generate_report(
         except Exception as exc:  # noqa: BLE001 - non-fatal, continue with others
             logger.warning("Failed to fetch versions for %s: %s", pk, exc)
 
-    # Generate PDF in the worker thread (off UI thread)
     pdf_bytes: bytes | None = None
     if report.epics:
         report_progress("Generating PDF…", 85)
+        icons = _gather_icons(jira, config, report)
         try:
-            pdf_bytes = generate_pdf(report)
+            pdf_bytes = generate_pdf(report, icons=icons)
         except Exception as exc:  # noqa: BLE001 - surfaced to the user as an error
             logger.exception("PDF generation failed in worker")
             report.errors.append(f"PDF generation failed: {exc}")

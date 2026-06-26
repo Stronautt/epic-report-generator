@@ -32,6 +32,11 @@ def _make_issue(
     start_date: date | None = None,
     due_date: date | None = None,
     parent_key: str | None = None,
+    *,
+    hierarchy_parent_key: str | None = None,
+    display_tier: int = 1,
+    show: bool = True,
+    in_estimate: bool = True,
 ) -> JiraIssue:
     now = datetime.now(tz=timezone.utc)
     return JiraIssue(
@@ -48,6 +53,10 @@ def _make_issue(
         start_date=start_date,
         due_date=due_date,
         parent_key=parent_key,
+        hierarchy_parent_key=hierarchy_parent_key,
+        display_tier=display_tier,
+        show=show,
+        in_estimate=in_estimate,
     )
 
 
@@ -97,8 +106,16 @@ class TestReferenceDate:
 
     def test_time_series_ends_at_reference_date(self) -> None:
         m = calculate_metrics(self._epic(), reference_date=self.REF)
-        assert m.dates[-1] == self.REF
-        assert len(m.dates) == (self.REF - date(2024, 5, 1)).days + 1
+        # Per-event series: a left anchor (both issues enter 5-1), the done
+        # event (6-1), and a right anchor at the reference day.
+        assert [d.date() for d in m.dates] == [
+            date(2024, 5, 1),
+            date(2024, 6, 1),
+            date(2024, 6, 15),
+        ]
+        assert m.dates[-1].date() == self.REF
+        assert m.total_sp_over_time[0] == pytest.approx(12.0)
+        assert m.completed_sp_over_time[-1] == pytest.approx(8.0)
 
     def test_repeatable_across_calls(self) -> None:
         a = calculate_metrics(self._epic(), reference_date=self.REF)
@@ -756,12 +773,43 @@ class TestFixedDateWindow:
             window_end=self.WIN_END,
         )
         # Series is zoomed to [window_start, window_end].
-        assert bounded.dates[0] == self.WIN_START
-        assert bounded.dates[-1] == self.WIN_END
+        assert bounded.dates[0].date() == self.WIN_START
+        assert bounded.dates[-1].date() == self.WIN_END
         # Carry-over: the pre-window EARLY issue is already counted on day one.
         assert bounded.total_sp_over_time[0] == pytest.approx(5.0)
         # MID joins by the window end → both issues counted.
         assert bounded.total_sp_over_time[-1] == pytest.approx(8.0)
+
+    def test_per_event_subday_resolution(self) -> None:
+        """Same-day changelog events become distinct sub-day points (Jira-fidelity).
+
+        Daily aggregation collapsed every event on a calendar day into one step;
+        the per-event series keeps each at its real timestamp, so a same-day SP
+        bump and completion show as separate points with different totals.
+        """
+        tz = timezone.utc
+        bumped = _make_issue(
+            "T-1", "Done", 8.0, created=datetime(2024, 5, 1, 9, 0, tzinfo=tz)
+        )
+        bumped.sp_history = [
+            (datetime(2024, 5, 1, 9, 0, tzinfo=tz), 3.0),  # enters at 3 SP
+            (datetime(2024, 5, 1, 15, 0, tzinfo=tz), 8.0),  # re-estimated same day
+        ]
+        bumped.done_history = [(datetime(2024, 5, 1, 18, 0, tzinfo=tz), True)]
+        other = _make_issue(
+            "T-2", "To Do", 2.0, created=datetime(2024, 5, 1, 9, 0, tzinfo=tz)
+        )
+        epic = _make_epic([bumped, other])
+        m = calculate_metrics(epic, reference_date=date(2024, 5, 10))
+
+        may1 = [i for i, d in enumerate(m.dates) if d.date() == date(2024, 5, 1)]
+        # enter (9:00) + sp-change (15:00) + done (18:00) — three distinct instants.
+        assert len(may1) == 3
+        assert len({m.dates[i] for i in may1}) == 3
+        # Scope steps within the day: 3+2 → then 8+2.
+        assert m.total_sp_over_time[may1[0]] == pytest.approx(5.0)
+        assert m.total_sp_over_time[may1[1]] == pytest.approx(10.0)
+        assert m.completed_sp_over_time[may1[2]] == pytest.approx(8.0)
 
     def test_scope_change_windowed(self) -> None:
         children = [
@@ -845,3 +893,108 @@ class TestFixedDateWindow:
         # Source-epic and merged velocity both exclude the past-window resolution.
         assert per_epic[0].velocity_sp_per_week == pytest.approx(2.0)
         assert merged.velocity_sp_per_week == pytest.approx(2.0)
+
+
+class TestHierarchyMetrics:
+    """Task 4: N-tier roll-up, the in_estimate axis, and tier-2 date pooling."""
+
+    def test_four_tier_rollup_via_hierarchy_parent_key(self) -> None:
+        """Progress rolls up N tiers through ``hierarchy_parent_key`` alone.
+
+        ``parent_key`` is left unset to prove the chain-resolved parent drives
+        the subtask map (mirrors the custom-chain fetch path).
+        """
+        now = datetime.now(tz=timezone.utc)
+        # Epic E-1 → A (tier 1) → B (tier 2 chain) → C → D(done).  Only D is Done.
+        a = _make_issue("A", "In Progress", None, hierarchy_parent_key="E-1")
+        b = _make_issue("B", "In Progress", None, hierarchy_parent_key="A")
+        c = _make_issue("C", "In Progress", None, hierarchy_parent_key="B")
+        d = _make_issue("D", "Done", 4, resolved=now, hierarchy_parent_key="C")
+        epic = _make_epic([a, b, c, d])
+        epic.key = "E-1"
+
+        m_issues = calculate_metrics(epic, progress_method=PROGRESS_ISSUES_ONLY)
+        # Bottom-up: D done → 100% cascades up through C, B, A.
+        assert d.progress == pytest.approx(100.0)
+        assert c.progress == pytest.approx(100.0)
+        assert b.progress == pytest.approx(100.0)
+        assert a.progress == pytest.approx(100.0)
+        # issues_only: epic = weighted avg of its single direct child A = 100%.
+        assert m_issues.progress == pytest.approx(100.0)
+        assert m_issues.total_issues == 4
+
+        # combined multiplies by the done/total ratio (1/4) → 25%.
+        m_combined = calculate_metrics(epic, progress_method=PROGRESS_COMBINED)
+        assert m_combined.progress == pytest.approx(25.0)
+
+    @pytest.mark.parametrize(
+        "method",
+        [PROGRESS_COMBINED, PROGRESS_ISSUES_ONLY, PROGRESS_ESTIMATES_ONLY],
+    )
+    def test_in_estimate_false_dropped_from_metrics(self, method: str) -> None:
+        """``in_estimate=False`` removes an issue from counts under every method."""
+        now = datetime.now(tz=timezone.utc)
+        kept = _make_issue("K-1", "Done", 5, resolved=now)
+        dropped = _make_issue("K-2", "To Do", 5, in_estimate=False)
+        m = calculate_metrics(_make_epic([kept, dropped]), progress_method=method)
+        # The excluded issue contributes no count, no weight: only the done
+        # issue remains, so every method reports 100% over a single issue.
+        assert m.total_issues == 1
+        assert m.completed_issues == 1
+        assert m.progress == pytest.approx(100.0)
+        if method != PROGRESS_ISSUES_ONLY:
+            assert m.total_sp == pytest.approx(5.0)
+            assert m.completed_sp == pytest.approx(5.0)
+
+    def test_tier2_date_pooling_gated_by_show(self) -> None:
+        """A tier-2 child expands the timeline range only when shown."""
+        c1 = _make_issue(
+            "C1",
+            start_date=date(2024, 1, 1),
+            due_date=date(2024, 2, 1),
+            display_tier=1,
+        )
+
+        def _epic_with(sub_show: bool) -> EpicData:
+            c2 = _make_issue(
+                "C2",
+                start_date=date(2024, 3, 1),
+                due_date=date(2024, 4, 1),
+                display_tier=2,
+                hierarchy_parent_key="C1",
+                show=sub_show,
+            )
+            epic = _make_epic([c1, c2])
+            epic.key = "E-1"
+            return epic
+
+        # Hidden tier-2 child: timeline range stops at the tier-1 child's end.
+        hidden, _ = merge_metrics([_epic_with(False)])
+        assert hidden.timeline_end == date(2024, 2, 1)
+        # Estimation dates always pool every child, regardless of show.
+        assert hidden.due_date == date(2024, 4, 1)
+
+        # Shown tier-2 child: it stretches the timeline range.
+        shown, _ = merge_metrics([_epic_with(True)])
+        assert shown.timeline_end == date(2024, 4, 1)
+
+
+class TestShownUnestimatedDisplayProgress:
+    """Shown-but-unestimated children get a leaf display progress, not 0%."""
+
+    def test_done_shown_unestimated_child_reads_complete(self) -> None:
+        done = _make_issue("S-1", "Done", show=True, in_estimate=False)
+        todo = _make_issue("S-2", "To Do", show=True, in_estimate=False)
+        # An estimated child keeps the metrics pass non-empty.
+        est = _make_issue("S-3", "To Do", show=True, in_estimate=True)
+        calculate_metrics(_make_epic([done, todo, est]))
+        assert done.progress == 100.0
+        assert todo.progress == 0.0
+
+    def test_runs_even_with_no_estimated_children(self) -> None:
+        # Epic whose only children are shown-but-unestimated: the display pass
+        # must run before the empty-`children` early return.
+        done = _make_issue("S-1", "Done", show=True, in_estimate=False)
+        m = calculate_metrics(_make_epic([done]))
+        assert m.total_issues == 0  # excluded from the aggregate
+        assert done.progress == 100.0

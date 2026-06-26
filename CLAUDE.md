@@ -144,7 +144,7 @@ in `docs/mac-app-store-submission.md`; the privacy policy is
 - **Jira API**: `jira` library (pycontribs/jira)
 - **OAuth**: hand-rolled Atlassian OAuth 2.0 (3LO) over `requests`
 - **PDF**: Typst (`typst-py`) — bundled `.typ` templates compiled to PDF
-- **Charts**: drawn natively in Typst (Gantt timeline + dual-axis trend chart); no matplotlib
+- **Charts**: drawn natively in Typst (Gantt timeline + dual-axis trend chart); no matplotlib. The trend chart is a **per-event, time-proportional** burnup: `metrics._build_time_series` emits **one point per changelog event** (issue enter / SP-change / completion) at its **exact timestamp** — plus a left anchor (window/earliest, with pre-window events folded into it as carryover) and a right anchor at `reference_date` so the staircase reaches the edge — rather than one sample per day. Same-instant events collapse into a single combined step. `m.dates` therefore holds `datetime`s (tz-stripped via `metrics._naive` so aware Jira timestamps compare with naive window/ref dates), and the view-model carries a per-point fraction list `xs` (`(t−t0)/(t1−t0)`, in the payload) that `trend_chart.typ`'s `xof(i)` reads instead of a uniform `i/(n-1)` index — so same-day events spread along x like Jira's. It uses **step-after (staircase) interpolation** for the cumulative lines *and* the SP area tops (a value holds flat until its next event, then jumps — never a diagonal ramp; `trend_chart.typ`'s `step-pts` builds the point lists) and paints **alternating ISO-week background bands** (`c.surface`). `report_view_model._week_bands(dates)` computes the bands from the **time range** `[t0,t1]` (Monday-aligned weeks → fractional x-ranges, every other week; carried as `bands`) and `_time_ticks(dates, target=10)` places ~10 date labels at their true time-fraction (`{x,label}`); `_nice_axis(target=10, step≥1, no 2.5)` yields ~10 whole-number gridlines. The Unestimated line is a neutral, accent-independent `c.text` ink (not amber `c.yellow`) so it stays legible over the accent-tinted Completed-SP area for any custom accent. The per-event series needs the changelog (`JiraClient.enrich_trend_history`, attached in `preview_panel` after fetch); without it each issue contributes a single enter (at `created`) + done (at `resolved`) point, still time-proportional
 - **Token storage**: `keyring` (OS-native)
 - **Config**: `platformdirs` + JSON
 - **Dates**: python-dateutil
@@ -159,7 +159,7 @@ src/epic_report_generator/
 ├── __main__.py                    # Entry point
 ├── app.py                         # QApplication setup, signal handlers
 ├── core/
-│   ├── data_models.py             # Dataclasses: JiraIssue (with parent_key, progress, effective_weight), EpicData, EpicMetrics, ReportConfig, ReportData, ReportItem (with child_overrides + child_order), ChildOverride, TimelineItem; average_certainty() helper
+│   ├── data_models.py             # Dataclasses: JiraIssue (with parent_key, progress, effective_weight, hierarchy_parent_key, display_tier, issue_type_id, show, in_estimate), EpicData, EpicMetrics, ReportConfig (with issue_hierarchy), ReportData, ReportItem (with child_overrides + child_order), ChildOverride, TimelineItem, HierarchyNode; average_certainty(), order_by_keys(), serialize_hierarchy()/coerce_hierarchy(), epic_tier_type_names(), migrate_default_hierarchy() helpers
 │   ├── jira_client.py             # JIRA library wrapper, API-token + OAuth connection, pagination, retry, date expansion
 │   ├── metrics.py                 # Bottom-up hierarchical progress, velocity, cycle time, scope change, forecasting, time-series
 │   ├── theming.py                 # Accent-colour maths shared by app + report: hex/mix/lighten, qt_shades(), report_overrides()
@@ -185,7 +185,9 @@ src/epic_report_generator/
 │   ├── widgets.py                 # Reusable: StatusIndicator, LabelledField, GuideStep,
 │   │                              #   CollapsibleSection, ReportItemTable (drag-to-reorder,
 │   │                              #   per-row customize button), ChildCustomizeDialog,
-│   │                              #   SidebarUserInfo
+│   │                              #   SidebarUserInfo, IssueHierarchyEditor (three tier
+│   │                              #   silos of _HierarchyItemCard, per-card Show/Estimate
+│   │                              #   toggles + _RelationshipButton, drag between silos)
 │   └── styles.py                  # App-specific QSS overlays on top of qt-material base themes
 └── resources/
     ├── typst/                     # Templates: theme, components (gantt, trend_chart, progress_bar, …), pages
@@ -296,9 +298,70 @@ expanded and scrolling back to the flagged rows (`report_items_anchor`) — whil
 **warnings never block** (generation proceeds, with Step 1 left open so the
 warning callout stays visible).
 
-### Subtask Fetching
+### Issue Hierarchy
 
-When `include_subtasks` is enabled (default `True`), `_fetch_children()` performs a second paginated JQL query (`parent in (CHILD-1, CHILD-2, ...)`) after fetching direct epic children. Subtasks are merged into the children list with key-based deduplication. Child keys are batched in groups of 100 to respect JQL `IN` clause limits. The option is exposed as a checkbox in the Config panel under "Custom Field Mapping" and stored in `ReportConfig.include_subtasks`.
+Each report **profile** can define a custom issue-type hierarchy chain
+(`ReportConfig.issue_hierarchy`, a `list[HierarchyNode]`). A `HierarchyNode`
+(`data_models.py`) is one Jira issue type collapsed into the report's three fixed
+**display tiers** (0=Epic, 1=Story, 2=Sub-task) with an `edge` to the tier above
+(`"parent"` = Jira's native parent, or `"link"` = one-or-more issue-link types
+matched either direction), plus a `show` axis (display-only) and an `in_estimate`
+axis (counts in metrics — the old `include_subtasks`). Serialized compactly
+(`serialize_hierarchy`/`coerce_hierarchy`, default fields omitted).
+
+An **empty chain derives the classic `Epic→Story→Sub-task` default byte-for-byte**.
+The four removed global checkboxes (`include_subtasks`, `include_subtasks_in_timeline`,
+`show_epic_stories_on_timeline`, `show_subtasks_on_timeline`) are kept on
+`ReportConfig` **read-only for migration**: `config_panel._restore_hierarchy`
+leaves the chain empty when all are default, else `migrate_default_hierarchy()`
+maps them onto per-tier `show`/`in_estimate`. Only `issue_hierarchy` is written
+going forward.
+
+Fetch (`jira_client.py`): `_is_custom(chain)` (a `link` edge only — a parent-only
+chain of any size stays on the fast path) routes to the N-tier `_fetch_epics_chain` (BFS, one frontier per **display tier** — *not*
+per chain node: several issue types share a tier (Story + Bug at tier 1; Task +
+Sub-task at tier 2) and a child tier maps **many-to-many** onto the tier above, so
+each tier's frontier is the **union** of all preceding-tier matches. Walking
+node-by-node — the old bug — reassigned the frontier after every node, so a second
+same-tier node with no children (e.g. Bug) overwrote the first node's frontier and
+any deeper tier broke on an empty frontier, dropping e.g. link-edge Tasks hung off a
+Story. `_chain_tier_children` now fetches a whole tier at once: all parent-edge nodes
+share **one** `parent in (...)` query, each `link` edge reads the frontier issues'
+`issuelinks` and batch-fetches matching targets; each row is then claimed by the tier
+its type resolves to. `apply_hierarchy` resolves **both** axes the same way: `show`
+(visibility) and `in_estimate` (metrics) each **AND-cascade** up the
+`hierarchy_parent_key` ancestry + the tier-0 node, so a hidden/excluded parent
+hides/excludes its descendants (a Sub-task whose Story parent is hidden drops off the
+timeline/nested rows with it; an excluded parent drops its descendants' weight). The
+fast-path sub-task fetch is gated permissively (many-to-many): fetch when
+**any** tier-2 node is shown, or any is estimated **and** some tier-1 ancestor + the epic
+are estimated — the cascade then hides/excludes any that an ancestor tier drops. A
+**non-custom migrated chain** stays on the fast path `_fetch_epics_bulk`, which
+mirrors the chain's tier-1 node onto direct children and the tier-2 node onto
+subtasks (`display_tier`/`show`/`in_estimate`) so the metrics, timeline-date, and
+view-model layers gate purely on those fields instead of the legacy booleans —
+**both axes must be applied or migrated profiles regress** (timeline bars / nested
+summary rows). `epic_tier_type_names(chain)` (tier-0 type names, default `["Epic"]`)
+is the single source for the label JQL, label validation, and epic autocomplete.
+
+Display: the view-model treats any non-empty `issue_hierarchy` as "custom" and emits
+nested summary rows + per-`show` timeline bars + issue-type icons. Icons fetch lazily
+via `JiraClient.issue_type_icon` (byte cache, caches failures); `typst_renderer`
+writes each into the throwaway project as `icons/<id>.<ext>` where the extension is
+**sniffed from the bytes** (`icon_ext` — Jira serves PNG as often as SVG, and a
+wrong extension hard-errors the whole Typst compile). The view-model's `_icon_path`
+routes the filename through the same `icon_ext` so path and file always agree.
+
+The chain is edited in `IssueHierarchyEditor` (`widgets.py`) under **Step 1 → Issue
+Hierarchy** — **three tier silos** (Epic / Standard / Sub-task), each a column of
+compact `_HierarchyItemCard`s (icon + type name + a `_RelationshipButton` that picks
+Parent-or-link-types, + Show/Estimate toggle buttons + remove) with a dashed "+ Add"
+picker of the still-unused types; cards drag between silos to change their tier, and
+all silos empty ⇒ `to_hierarchy() == []` ⇒ the classic default. A "Refresh from Jira"
+button reloads live issue/link types + icons. `config_panel` threads
+`to_hierarchy()` into every Jira call that depends on the chain — report fetch,
+**Validate**, and the per-item **customize** dialogs (epic + nested label-epic) —
+so all surfaces see the same children.
 
 ### Timeline Date Computation
 
@@ -344,8 +407,9 @@ consistent:
    - **scope change** considers only issues *created* inside the window, which
      alone form its denominator and baseline.
    - the **trend time-series** is clipped to `[window_start, reference_date]`;
-     cumulative totals carry over (the first emitted day still includes all
-     issues created before the window — the chart is zoomed, not recomputed).
+     cumulative totals carry over (the left-anchor point folds in every event at
+     or before the window start, so it still includes all issues created before
+     the window — the chart is zoomed, not recomputed).
 
    Progress and the estimate roll-ups are deliberately **not** windowed — they
    always reflect the whole epic. Leaving both dates unset (`None`) keeps the

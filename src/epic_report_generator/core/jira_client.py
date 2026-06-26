@@ -14,11 +14,14 @@ from jira import JIRA, JIRAError
 from epic_report_generator.core.data_models import (
     STATUS_TODO,
     EpicData,
+    HierarchyNode,
     JiraIssue,
     SprintInfo,
     collect_child_estimation_dates,
     collect_child_timeline_dates,
+    epic_tier_type_names,
 )
+from epic_report_generator.core.hierarchy import HierarchyResolver
 from epic_report_generator.services.auth_manager import AuthManager
 
 logger = logging.getLogger(__name__)
@@ -73,6 +76,68 @@ def _chunks(seq: list[str], size: int) -> list[list[str]]:
     return [seq[i : i + size] for i in range(0, len(seq), size)]
 
 
+# Changelog (expand=changelog) responses are heavy, so keep each batch small —
+# well under Jira's default 100-issue page so json_result returns it in one page.
+_CHANGELOG_BATCH_SIZE = 50
+
+
+def _to_float(value: Any) -> float | None:
+    """Parse a changelog string value to float, or ``None`` when blank/invalid."""
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_custom(chain: list[HierarchyNode] | None) -> bool:
+    """True when *chain* needs the N-tier BFS path rather than the fast default.
+
+    Only a ``link`` edge forces the BFS — that's the one shape the fast
+    ``key/epic_link/parent`` query can't express. A **parent-only** chain (any
+    number of types) maps onto the fast path's epic → direct-children → sub-tasks
+    structure: several types at one tier are siblings (all direct children of the
+    tier above), and :meth:`apply_hierarchy` filters by type and resolves the
+    show/estimate cascade. An empty chain stays on the byte-for-byte default.
+    """
+    if not chain:
+        return False
+    return any(n.edge == "link" for n in chain)
+
+
+def _link_targets(
+    rows: list[Any], link_types: list[str]
+) -> dict[str, str]:
+    """Map ``target_key -> source_key`` for issue links matching *link_types*.
+
+    Reads each row's ``issuelinks`` field and keeps entries whose
+    ``type.name`` is in *link_types* (either direction — inward or outward).
+    An empty *link_types* means **any** link type, matching the editor's
+    "Links: (any)" label — otherwise the tier would silently fetch nothing.
+    The first source to reference a target wins, so a target attaches to a
+    single hierarchy parent.
+    """
+    wanted = set(link_types)
+    out: dict[str, str] = {}
+    for raw in rows:
+        links = JiraClient._get_raw_field(raw, "issuelinks") or []
+        for link in links:
+            if isinstance(link, dict):
+                name = (link.get("type") or {}).get("name")
+                other = link.get("inwardIssue") or link.get("outwardIssue")
+                tkey = (other or {}).get("key") if isinstance(other, dict) else None
+            else:
+                name = getattr(getattr(link, "type", None), "name", None)
+                other = getattr(link, "inwardIssue", None) or getattr(
+                    link, "outwardIssue", None
+                )
+                tkey = getattr(other, "key", None)
+            if (not wanted or name in wanted) and tkey and tkey not in out:
+                out[tkey] = raw.key
+    return out
+
+
 class JiraClient:
     """High-level wrapper around the ``jira`` library for Epic data."""
 
@@ -90,12 +155,27 @@ class JiraClient:
         self._myself: dict[str, Any] | None = None
         self._fields_cache: list[dict[str, str]] | None = None
         self._fields_cache_time: float = 0.0
+        # Issue-type / link-type metadata for the hierarchy constructor. Lazily
+        # fetched, cleared by the Refresh button via :meth:`invalidate_caches`
+        # (metadata rarely changes, so a None-guard is enough — no TTL).
+        self._issue_types_cache: list[dict[str, Any]] | None = None
+        self._link_types_cache: list[dict[str, str]] | None = None
+        # type_id -> icon bytes (or None when the fetch failed / no iconUrl), so
+        # a missing icon isn't re-requested every render.
+        self._icon_cache: dict[str, bytes | None] = {}
+        # (query, jql) -> picker suggestions, so autocomplete re-issues no request
+        # for a query already seen this session (e.g. backspace/retype). Bounded.
+        self._picker_cache: dict[tuple[str, str], list[tuple[str, str]]] = {}
 
     def invalidate_caches(self) -> None:
         """Clear all cached data (e.g. field metadata)."""
         self._fields_cache = None
         self._fields_cache_time = 0.0
         self._myself = None
+        self._issue_types_cache = None
+        self._link_types_cache = None
+        self._icon_cache = {}
+        self._picker_cache = {}
         logger.info("Jira client caches invalidated")
 
     # -- connection -----------------------------------------------------------
@@ -269,6 +349,7 @@ class JiraClient:
         sprint_field: str = "customfield_10020",
         timeline_start_field: str = "",
         timeline_end_field: str = "",
+        chain: list[HierarchyNode] | None = None,
     ) -> EpicData | None:
         """Fetch a single Epic and all its child issues.
 
@@ -297,6 +378,7 @@ class JiraClient:
                 sprint_field=sprint_field,
                 timeline_start_field=timeline_start_field,
                 timeline_end_field=timeline_end_field,
+                chain=chain,
             )
         except JIRAError as exc:
             logger.error("Failed to fetch epic %s: %s", epic_key, exc)
@@ -356,6 +438,158 @@ class JiraClient:
             logger.error("Failed to fetch fields: %s", exc)
             return []
 
+    # -- hierarchy metadata (issue types / link types / icons / picker) --------
+
+    def fetch_issue_types(self) -> list[dict[str, Any]]:
+        """Return the instance's issue types for the hierarchy constructor.
+
+        Each entry is ``{id, name, iconUrl, subtask, hierarchyLevel}``.
+        ``hierarchyLevel`` (Jira Cloud) maps cleanly to the report's tiers
+        (1+=Epic-tier, 0=Story-tier, <0=Sub-task; standard Epic is level 1).
+        Cached in-memory until
+        :meth:`invalidate_caches` (Refresh).
+        """
+        if not self._jira:
+            return []
+        if self._issue_types_cache is not None:
+            return self._issue_types_cache
+        # getattr so a future jira-lib rename degrades gracefully.
+        getter = getattr(self._jira, "issue_types", None)
+        if getter is None:
+            return []
+        try:
+            raw = getter()
+        except JIRAError as exc:
+            logger.error("Failed to fetch issue types: %s", exc)
+            return []
+        result = [
+            {
+                "id": str(getattr(t, "id", "")),
+                "name": getattr(t, "name", "") or "",
+                "iconUrl": getattr(t, "iconUrl", "") or "",
+                "subtask": bool(getattr(t, "subtask", False)),
+                "hierarchyLevel": getattr(t, "hierarchyLevel", None),
+            }
+            for t in raw
+        ]
+        logger.info("Fetched %d issue type(s)", len(result))
+        self._issue_types_cache = result
+        return result
+
+    def fetch_issue_link_types(self) -> list[dict[str, str]]:
+        """Return the instance's issue link types (``{id, name, inward, outward}``).
+
+        Cached in-memory until :meth:`invalidate_caches` (Refresh).
+        """
+        if not self._jira:
+            return []
+        if self._link_types_cache is not None:
+            return self._link_types_cache
+        getter = getattr(self._jira, "issue_link_types", None)
+        if getter is None:
+            return []
+        try:
+            raw = getter()
+        except JIRAError as exc:
+            logger.error("Failed to fetch issue link types: %s", exc)
+            return []
+        result = [
+            {
+                "id": str(getattr(lt, "id", "")),
+                "name": getattr(lt, "name", "") or "",
+                "inward": getattr(lt, "inward", "") or "",
+                "outward": getattr(lt, "outward", "") or "",
+            }
+            for lt in raw
+        ]
+        logger.info("Fetched %d issue link type(s)", len(result))
+        self._link_types_cache = result
+        return result
+
+    def fetch_issue_picker(
+        self, query: str, current_jql: str = ""
+    ) -> list[tuple[str, str]]:
+        """Return ``(key, summary)`` autocomplete suggestions for *query*.
+
+        Hits the ``/rest/api/3/issue/picker`` endpoint (matches both key and
+        summary), mirroring the raw ``_session`` call in :meth:`fetch_labels`.
+        *current_jql* scopes the suggestions (e.g. to Epic-tier issue types).
+        """
+        if not self._jira or not query.strip():
+            return []
+        cache_key = (query, current_jql)
+        cached = self._picker_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        try:
+            url = f"{self._jira.server_url}/rest/api/3/issue/picker"
+            session = getattr(self._jira, "_session", None)
+            if session is None:
+                raise RuntimeError("No active Jira session")
+            params: dict[str, str] = {"query": query}
+            if current_jql:
+                params["currentJQL"] = current_jql
+            # No timeout= here: the jira lib's ResilientSession injects its own
+            # timeout into request(), and passing one again raises
+            # "got multiple values for keyword argument 'timeout'" (mirrors
+            # fetch_labels, which also omits it).
+            resp = session.get(url, params=params)
+            if resp.status_code != 200:
+                logger.debug("Issue picker returned HTTP %d", resp.status_code)
+                return []
+            seen: set[str] = set()
+            out: list[tuple[str, str]] = []
+            for section in resp.json().get("sections", []) or []:
+                for issue in section.get("issues", []) or []:
+                    key = issue.get("key", "")
+                    if not key or key in seen:
+                        continue
+                    seen.add(key)
+                    summary = issue.get("summaryText") or issue.get("summary") or ""
+                    out.append((key, summary))
+            if len(self._picker_cache) > 128:  # simple bound; clear wholesale
+                self._picker_cache.clear()
+            self._picker_cache[cache_key] = out
+            return out
+        except Exception as exc:
+            logger.debug("Issue picker failed for %r: %s", query, exc)
+            return []
+
+    def issue_type_icon(self, type_id: str) -> bytes | None:
+        """Return the SVG/PNG icon bytes for *type_id*, or None.
+
+        Lazily ``GET``-s the type's ``iconUrl`` via the live ``_session`` and
+        caches the result (including failures, so a broken URL isn't refetched
+        every render). Cleared by :meth:`invalidate_caches`.
+        """
+        if not self._jira or not type_id:
+            return None
+        if type_id in self._icon_cache:
+            return self._icon_cache[type_id]
+        icon_url = next(
+            (t["iconUrl"] for t in self.fetch_issue_types() if t["id"] == type_id),
+            "",
+        )
+        result: bytes | None = None
+        if icon_url:
+            try:
+                session = getattr(self._jira, "_session", None)
+                if session is None:
+                    raise RuntimeError("No active Jira session")
+                # No timeout= — the ResilientSession injects its own (see
+                # fetch_issue_picker); passing one raises a duplicate-kwarg error.
+                resp = session.get(icon_url)
+                if resp.status_code == 200 and resp.content:
+                    result = resp.content
+                else:
+                    logger.debug(
+                        "Icon fetch for %s returned HTTP %d", type_id, resp.status_code
+                    )
+            except Exception as exc:
+                logger.debug("Icon fetch for %s failed: %s", type_id, exc)
+        self._icon_cache[type_id] = result
+        return result
+
     def get_project_name(self, project_key: str) -> str | None:
         """Return the display name of a Jira project."""
         if not self._jira:
@@ -383,6 +617,7 @@ class JiraClient:
         sprint_field: str = "customfield_10020",
         timeline_start_field: str = "",
         timeline_end_field: str = "",
+        chain: list[HierarchyNode] | None = None,
     ) -> list[EpicData]:
         """Fetch all Epics with the given label, including their children.
 
@@ -392,7 +627,7 @@ class JiraClient:
             return []
 
         logger.info("Fetching epics by label %r", label)
-        keys = self._fetch_epic_keys_by_label(label)
+        keys = self._fetch_epic_keys_by_label(label, epic_tier_type_names(chain or []))
         if not keys:
             logger.info("Found 0 epic(s) with label %r", label)
             return []
@@ -408,15 +643,24 @@ class JiraClient:
             sprint_field=sprint_field,
             timeline_start_field=timeline_start_field,
             timeline_end_field=timeline_end_field,
+            chain=chain,
         )
         # Preserve the key-ASC discovery order.
         epics = [epics_by_key[k] for k in keys if k in epics_by_key]
         logger.info("Found %d epic(s) with label %r", len(epics), label)
         return epics
 
-    def _fetch_epic_keys_by_label(self, label: str) -> list[str]:
-        """Return the Epic keys carrying *label*, ordered by key (key-only)."""
-        jql = f'issuetype = Epic AND labels = "{label}" ORDER BY key ASC'
+    def _fetch_epic_keys_by_label(
+        self, label: str, epic_tier_types: list[str] | None = None
+    ) -> list[str]:
+        """Return the Epic keys carrying *label*, ordered by key (key-only).
+
+        *epic_tier_types* scopes the issue-type filter to the chain's Epic-tier
+        type names (default ``["Epic"]``), so a custom chain whose top tier is
+        e.g. ``Capability`` resolves the right issues.
+        """
+        types_csv = ", ".join(f'"{t}"' for t in (epic_tier_types or ["Epic"]))
+        jql = f'issuetype in ({types_csv}) AND labels = "{label}" ORDER BY key ASC'
         try:
             rows = self._search_with_retry(
                 jql, max_results=False, fields=["key"], use_post=True
@@ -440,6 +684,7 @@ class JiraClient:
         sprint_field: str = "customfield_10020",
         timeline_start_field: str = "",
         timeline_end_field: str = "",
+        chain: list[HierarchyNode] | None = None,
     ) -> tuple[dict[str, EpicData], dict[str, list[str]]]:
         """Fetch every epic needed for a report in as few requests as possible.
 
@@ -455,10 +700,11 @@ class JiraClient:
         if not self._jira:
             return {}, {}
 
+        epic_tier_types = epic_tier_type_names(chain or [])
         label_to_keys: dict[str, list[str]] = {}
         all_keys: list[str] = list(epic_keys)
         for label in labels:
-            keys = self._fetch_epic_keys_by_label(label)
+            keys = self._fetch_epic_keys_by_label(label, epic_tier_types)
             label_to_keys[label] = keys
             all_keys.extend(keys)
 
@@ -475,6 +721,7 @@ class JiraClient:
             sprint_field=sprint_field,
             timeline_start_field=timeline_start_field,
             timeline_end_field=timeline_end_field,
+            chain=chain,
         )
         logger.info(
             "Report fetch: %d epic(s) across %d label(s) → %d resolved",
@@ -484,16 +731,20 @@ class JiraClient:
         )
         return epics_by_key, label_to_keys
 
-    def fetch_epic_summaries_by_label(self, label: str) -> list[tuple[str, str]]:
+    def fetch_epic_summaries_by_label(
+        self, label: str, epic_tier_types: list[str] | None = None
+    ) -> list[tuple[str, str]]:
         """Return ``(key, summary)`` for every Epic carrying *label*.
 
         Lightweight counterpart to :meth:`fetch_epics_by_label` — it does not
         pull child issues, so it is cheap enough to call when opening the
-        per-item customize dialog.
+        per-item customize dialog.  *epic_tier_types* scopes the issue-type
+        filter to the chain's Epic-tier names (default ``["Epic"]``).
         """
         if not self._jira:
             return []
-        jql = f'issuetype = Epic AND labels = "{label}" ORDER BY key ASC'
+        types_csv = ", ".join(f'"{t}"' for t in (epic_tier_types or ["Epic"]))
+        jql = f'issuetype in ({types_csv}) AND labels = "{label}" ORDER BY key ASC'
         logger.debug("Fetching epic summaries for label %r", label)
         return self._fetch_key_summaries(jql)
 
@@ -501,16 +752,38 @@ class JiraClient:
         self,
         epic_key: str,
         epic_link_field: str = "customfield_10014",
+        chain: list[HierarchyNode] | None = None,
+        parent_tier: int = 0,
     ) -> list[tuple[str, str]]:
-        """Return ``(key, summary)`` for the direct stories/tasks of *epic_key*.
+        """Return ``(key, summary)`` for *epic_key*'s children one display tier down.
 
-        Combines the Epic-Link and parent-hierarchy queries (deduplicated),
-        excluding deeper subtasks — mirroring the direct children used in the
-        report. Lightweight; intended for the per-item customize dialog.
+        *parent_tier* is *epic_key*'s own tier (0 for a report Epic, 1 when drilling
+        into a Story), so this returns its tier-``parent_tier+1`` children — the
+        single source the strict-tier-nesting customize dialog drills through.
+
+        With an **empty chain** it combines the Epic-Link and parent queries
+        (deduplicated) — the classic direct-children behaviour.  With a **chain**
+        it fetches the same candidates (Epic-Link *or* parent at the Epic tier,
+        parent deeper, plus any link-edge next-tier node's issue-links) and then
+        keeps only those whose issue type actually resolves to ``parent_tier+1`` —
+        so a type pinned to a deeper tier (e.g. a Task moved to Sub-task) never
+        leaks in at this level, matching :meth:`apply_hierarchy` in the report.
+        Lightweight; for the per-item customize dialog.
         """
         if not self._jira:
             return []
-        logger.debug("Fetching child summaries for %s", epic_key)
+        logger.debug("Fetching tier-%d children for %s", parent_tier + 1, epic_key)
+        chain = chain or []
+        if not chain:
+            return self._direct_child_summaries(epic_key, epic_link_field)
+        return self._chain_tier_summaries(
+            epic_key, epic_link_field, chain, parent_tier
+        )
+
+    def _direct_child_summaries(
+        self, epic_key: str, epic_link_field: str
+    ) -> list[tuple[str, str]]:
+        """``(key, summary)`` for an epic's direct children (Epic-Link + parent)."""
         seen: set[str] = set()
         out: list[tuple[str, str]] = []
         for jql in (
@@ -523,6 +796,79 @@ class JiraClient:
                     out.append((key, summary))
         return out
 
+    def _chain_tier_summaries(
+        self,
+        parent_key: str,
+        epic_link_field: str,
+        chain: list[HierarchyNode],
+        parent_tier: int,
+    ) -> list[tuple[str, str]]:
+        """``(key, summary)`` for *parent_key*'s chain-children at ``parent_tier+1``.
+
+        Mirrors the report fetch: the Epic tier reaches children via Epic-Link *or*
+        parent, deeper tiers via parent; each link-edge next-tier node adds an
+        issue-links read.  The union is then filtered to the issue types that
+        resolve to ``parent_tier+1`` via :class:`HierarchyResolver`.
+        """
+        resolver = HierarchyResolver(chain)
+        nodes = resolver.child_nodes_of(parent_tier)
+        if not nodes:
+            return []
+        seen: set[str] = set()
+        candidates: list[tuple[str, str]] = []
+
+        def _add(rows: list[tuple[str, str]]) -> None:
+            for key, summary in rows:
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append((key, summary))
+
+        if any(n.edge == "parent" for n in nodes):
+            if parent_tier == 0:
+                _add(self._direct_child_summaries(parent_key, epic_link_field))
+            else:
+                _add(
+                    self._fetch_key_summaries(
+                        f"parent = {parent_key} ORDER BY created ASC"
+                    )
+                )
+        for node in nodes:
+            if node.edge == "link":
+                _add(self._chain_child_summaries_link(parent_key, node.link_types))
+
+        if not any(n.issue_type_id for n in chain):
+            # An id-less chain (offline / not yet refreshed) can't be matched by the
+            # issue-type projection; return unfiltered rather than drop everything.
+            return candidates
+        target = parent_tier + 1
+        meta = self.fetch_issue_meta([k for k, _ in candidates])
+
+        def _at_target(key: str) -> bool:
+            tid, tname, _ = meta.get(key, ("", "", ""))
+            return resolver.tier_of(tid, tname) == target
+
+        return [(key, summary) for key, summary in candidates if _at_target(key)]
+
+    def _chain_child_summaries_link(
+        self, epic_key: str, link_types: list[str]
+    ) -> list[tuple[str, str]]:
+        """``(key, summary)`` for *epic_key*'s link-connected children (one tier)."""
+        try:
+            rows = self._search_with_retry(
+                f"key = {epic_key}", max_results=1, fields=["issuelinks"]
+            )
+        except JIRAError as exc:
+            logger.warning("Link-child lookup failed for %s: %s", epic_key, exc)
+            return []
+        targets = _link_targets(rows, link_types)
+        if not targets:
+            return []
+        out: list[tuple[str, str]] = []
+        for batch in _chunks(list(targets), _JQL_IN_BATCH_SIZE):
+            csv = ", ".join(batch)
+            out.extend(self._fetch_key_summaries(f"key in ({csv})"))
+        return out
+
     def _fetch_key_summaries(self, jql: str) -> list[tuple[str, str]]:
         """Run a JQL search returning ``(key, summary)`` pairs (summary only)."""
         try:
@@ -533,6 +879,44 @@ class JiraClient:
             logger.warning("Summary search failed (%s): %s", jql, exc)
             return []
         return [(raw.key, getattr(raw.fields, "summary", "") or "") for raw in results]
+
+    def fetch_issue_meta(self, keys: list[str]) -> dict[str, tuple[str, str, str]]:
+        """Return ``{key: (issue-type id, issue-type name, summary)}`` (batched).
+
+        Lightweight (issue-type + summary projection only) — drives report-item
+        row icons, the display-name placeholder, and the customize dialog's
+        tier filter.  The **name** is carried alongside the id so callers resolve
+        a type by id-then-name (mirroring :meth:`apply_hierarchy`): the same type
+        name can have different ids across projects, so id alone would drop valid
+        children.  Unknown keys are absent.
+        """
+        if not self._jira or not keys:
+            return {}
+        out: dict[str, tuple[str, str, str]] = {}
+        for chunk in _chunks(list(dict.fromkeys(keys)), 50):
+            csv = ", ".join(chunk)
+            try:
+                rows = self._search_with_retry(
+                    f"key in ({csv})",
+                    max_results=False,
+                    fields=["issuetype", "summary"],
+                    use_post=True,
+                )
+            except JIRAError as exc:
+                logger.warning("Issue meta lookup failed (%s): %s", csv, exc)
+                continue
+            for raw in rows:
+                summary = getattr(getattr(raw, "fields", None), "summary", "") or ""
+                out[raw.key] = (
+                    self._issue_type_id_of(raw),
+                    self._issue_type_name_of(raw),
+                    summary,
+                )
+        return out
+
+    def fetch_issue_type_ids(self, keys: list[str]) -> dict[str, str]:
+        """Return ``{issue key: issue-type id}`` for *keys* (see fetch_issue_meta)."""
+        return {k: tid for k, (tid, _n, _s) in self.fetch_issue_meta(keys).items()}
 
     def fetch_fix_version_dates(self, project_key: str) -> dict[str, date | None]:
         """Fetch release dates for all fix versions in a project.
@@ -605,11 +989,7 @@ class JiraClient:
             return []
 
     @staticmethod
-    def _fill_epic_dates_from_children(
-        epic: EpicData,
-        *,
-        include_subtask_timeline: bool = True,
-    ) -> None:
+    def _fill_epic_dates_from_children(epic: EpicData) -> None:
         """Expand epic-level dates to cover the full range of child issues.
 
         The epic's start_date becomes the earliest date and due_date the
@@ -622,9 +1002,11 @@ class JiraClient:
         This matches Jira Cloud Timeline behaviour, which derives epic ranges
         from child sprint assignments when no explicit dates are set.
 
-        When *include_subtask_timeline* is False, children marked as subtasks
-        are excluded from the timeline date collection (estimation dates still
-        include all children).
+        Tier-1 children always pool timeline dates; a tier-2 (sub-task) child
+        expands the timeline range only when ``show`` is set (estimation dates
+        still include all children).  ``show`` encodes the old
+        ``include_subtasks_in_timeline`` flag for the default 2-tier path, so
+        the default Gantt range stays byte-for-byte identical.
 
         All four date categories are collected in a single pass over children.
         """
@@ -648,8 +1030,8 @@ class JiraClient:
         for c in epic.children:
             collect_child_estimation_dates(c, candidate_starts, candidate_ends)
 
-            # Skip subtasks for timeline dates when not included
-            if c.is_subtask and not include_subtask_timeline:
+            # A tier-2 (sub-task) child expands the timeline range only when shown.
+            if c.display_tier == 2 and not c.show:
                 continue
 
             collect_child_timeline_dates(c, tl_starts, tl_ends)
@@ -733,6 +1115,7 @@ class JiraClient:
         sprint_field: str = "customfield_10020",
         timeline_start_field: str = "",
         timeline_end_field: str = "",
+        chain: list[HierarchyNode] | None = None,
     ) -> dict[str, EpicData]:
         """Fetch many epics and all their children in a handful of requests.
 
@@ -742,9 +1125,50 @@ class JiraClient:
         grouped back to their epics client-side.  Returns a mapping of epic key →
         assembled :class:`EpicData`; requested keys not found in Jira are simply
         absent from the result.
+
+        A *custom* chain (any link edge) is delegated to the N-tier
+        :meth:`_fetch_epics_chain`.  A non-custom chain (the migrated
+        ``Epic→Story→Sub-task`` default) still runs this fast path, but the
+        subtask fetch is derived from its Sub-task tier-2 node instead of the
+        ``include_subtasks*`` flags: fetch when that node is shown or estimated.
         """
         if not self._jira or not epic_keys:
             return {}
+
+        if _is_custom(chain):
+            return self._fetch_epics_chain(
+                epic_keys,
+                chain or [],
+                sp_field=sp_field,
+                epic_link_field=epic_link_field,
+                start_date_field=start_date_field,
+                due_date_field=due_date_field,
+                sprint_field=sprint_field,
+                timeline_start_field=timeline_start_field,
+                timeline_end_field=timeline_end_field,
+            )
+
+        tier1_show = True
+        tier1_estimate = True
+        if chain:
+            # A child tier maps many-to-many onto the tier above (a sub-task hangs
+            # off any tier-1 type — Story / Task / Bug), so gate the sub-task fetch
+            # on EVERY tier-2/tier-1 node, not a single representative. Fetch when
+            # the Sub-task tier is shown by any of its nodes, or estimated by any
+            # node AND some tier-1 ancestor + the epic are estimated (else
+            # apply_hierarchy's metrics cascade would drop them anyway, so skipping
+            # the query is safe).
+            root_node = next((n for n in chain if n.display_tier == 0), None)
+            tier1_nodes = [n for n in chain if n.display_tier == 1]
+            tier2_nodes = [n for n in chain if n.display_tier == 2]
+            root_est = root_node.in_estimate if root_node is not None else True
+            any_tier1_est = (
+                any(n.in_estimate for n in tier1_nodes) if tier1_nodes else True
+            )
+            include_subtasks_in_timeline = any(n.show for n in tier2_nodes)
+            include_subtasks = (
+                any(n.in_estimate for n in tier2_nodes) and any_tier1_est and root_est
+            )
 
         unique_keys = list(dict.fromkeys(epic_keys))
         epic_set = set(unique_keys)
@@ -765,7 +1189,7 @@ class JiraClient:
         seen_children: set[str] = set()
 
         def parse_child(raw: Any) -> JiraIssue:
-            return self._parse_child_issue(
+            issue = self._parse_child_issue(
                 raw,
                 sp_field,
                 start_date_field,
@@ -774,6 +1198,11 @@ class JiraClient:
                 timeline_start_field,
                 timeline_end_field,
             )
+            # The view-model treats any non-empty chain as custom and keys child
+            # icons on issue_type_id; set it here (as the chain path does) so a
+            # non-custom chain's Story/Sub-task rows get icons too.
+            issue.issue_type_id = self._issue_type_id_of(raw)
+            return issue
 
         # Phase 1: epics + their direct children, batched into combined queries.
         for batch in _chunks(unique_keys, _COMBINED_BATCH_SIZE):
@@ -813,6 +1242,16 @@ class JiraClient:
                     logger.debug("Ungroupable child row %s — skipping", raw.key)
                     continue
                 issue.is_subtask = False
+                # Mirror the migrated chain's Story tier-1 node (same reason the
+                # subtask phase mirrors tier-2): a migrated chain makes the
+                # view-model treat this as "custom" and read child.show /
+                # display_tier directly, so direct children must carry the
+                # migrated flags instead of the JiraIssue defaults — otherwise a
+                # migrated profile with show_epic_stories_on_timeline=False still
+                # renders story bars + nested summary rows.
+                issue.display_tier = 1
+                issue.show = tier1_show
+                issue.in_estimate = tier1_estimate
                 seen_children.add(issue.key)
                 direct_children[owner].append(issue)
                 child_to_epic[issue.key] = owner
@@ -835,6 +1274,16 @@ class JiraClient:
                     if owner is None:
                         continue
                     issue.is_subtask = True
+                    # Mirror the migrated chain's Sub-task tier so the metrics +
+                    # timeline-date layers can gate purely on display_tier/show
+                    # instead of the include_subtasks* flags (default path stays
+                    # byte-for-byte identical: show drives timeline pooling).
+                    issue.display_tier = 2
+                    issue.show = include_subtasks_in_timeline
+                    issue.in_estimate = include_subtasks
+                    # Record the real parent so apply_hierarchy's cascade can reach
+                    # the tier-1 node above (a non-empty chain re-resolves the flags).
+                    issue.hierarchy_parent_key = issue.parent_key
                     seen_children.add(issue.key)
                     subtasks[owner].append(issue)
 
@@ -843,14 +1292,363 @@ class JiraClient:
         # timeline-only subtasks so metrics treat their parents as leaves.
         for key, epic in epics.items():
             epic.children = direct_children[key] + subtasks[key]
-            self._fill_epic_dates_from_children(
-                epic, include_subtask_timeline=include_subtasks_in_timeline
-            )
-            if not include_subtasks and include_subtasks_in_timeline:
+            if chain:
+                # The chain is authoritative: drop off-chain issue types and
+                # re-resolve display_tier + the show/estimate cascade per type
+                # (mirrors the link-edge BFS). The default all-types chain keeps
+                # every type; the Exclude pool removes one everywhere.
+                self.apply_hierarchy(epic, chain)
+            self._fill_epic_dates_from_children(epic)
+            if not chain and not include_subtasks and include_subtasks_in_timeline:
                 epic.children = _drop_subtasks(epic.children)
             logger.debug("Assembled epic %s: %d children", key, len(epic.children))
 
         return epics
+
+    def enrich_trend_history(self, epics: dict[str, EpicData], sp_field: str) -> None:
+        """Populate in-estimate children's SP/done history from their changelog.
+
+        Called once by the report generator after the fetch (kept out of the
+        structure-assembly fetch so it adds no query there). The trend chart's
+        burnup is reconstructed from these event lists, mirroring Jira: a story
+        estimated at 3 then bumped to 8 steps the scope line twice, and completion
+        is dated by the resolution event. Only the ``in_estimate`` children that
+        feed the chart are fetched, de-duplicated across epics. Best-effort: on any
+        error (or a child with no relevant events) the issue keeps empty histories
+        and the metrics layer falls back to the created/resolved approximation.
+        """
+        if not self._jira:
+            return
+        by_key: dict[str, JiraIssue] = {}
+        for epic in epics.values():
+            for c in epic.children:
+                if c.in_estimate and c.created is not None:
+                    by_key.setdefault(c.key, c)
+        if not by_key:
+            return
+        try:
+            for batch in _chunks(list(by_key), _CHANGELOG_BATCH_SIZE):
+                result = self._jira.search_issues(
+                    f"key in ({', '.join(batch)})",
+                    maxResults=_CHANGELOG_BATCH_SIZE,
+                    expand="changelog",
+                    fields="created",
+                    json_result=True,
+                )
+                for issue in result.get("issues", []):
+                    child = by_key.get(issue.get("key", ""))
+                    if child is None:
+                        continue
+                    histories = issue.get("changelog", {}).get("histories", [])
+                    child.sp_history, child.done_history = self._parse_changelog(
+                        histories, child.created, sp_field
+                    )
+        except Exception as exc:  # noqa: BLE001 - best-effort; trend falls back
+            logger.warning("Changelog enrichment failed (trend falls back): %s", exc)
+
+    @staticmethod
+    def _parse_changelog(
+        histories: list[dict[str, Any]], created: datetime | None, sp_field: str
+    ) -> tuple[list[tuple[datetime, float | None]], list[tuple[datetime, bool]]]:
+        """Reconstruct (sp_history, done_history) from a raw changelog.
+
+        ``sp_history`` is the story-point estimate over time — only built when the
+        changelog actually records an estimate change, with a synthesized initial
+        entry (the value *before* the first change) at the issue's creation. Its
+        last value is the current estimate. ``done_history`` is the resolution
+        set/cleared timeline (``to`` non-null = resolved/done). Either is empty
+        when the changelog carries no such event, so the caller falls back.
+        """
+        sp_changes: list[tuple[datetime, float | None, float | None]] = []
+        done_changes: list[tuple[datetime, bool]] = []
+        for h in histories:
+            dt = JiraClient._parse_dt(h.get("created"))
+            if dt is None:
+                continue
+            for it in h.get("items", []):
+                fid = it.get("fieldId") or ""
+                fname = it.get("field") or ""
+                if fid == sp_field or fname == "Story Points":
+                    sp_changes.append(
+                        (dt, _to_float(it.get("toString")), _to_float(it.get("fromString")))
+                    )
+                elif fname == "resolution":
+                    done_changes.append((dt, it.get("to") is not None))
+        sp_changes.sort(key=lambda e: e[0])
+        done_changes.sort(key=lambda e: e[0])
+
+        sp_history: list[tuple[datetime, float | None]] = []
+        if sp_changes and created is not None:
+            sp_history = [(created, sp_changes[0][2])]
+            sp_history += [(dt, to) for dt, to, _ in sp_changes]
+        return sp_history, done_changes
+
+    def _fetch_epics_chain(
+        self,
+        epic_keys: list[str],
+        chain: list[HierarchyNode],
+        *,
+        sp_field: str,
+        epic_link_field: str,
+        start_date_field: str,
+        due_date_field: str,
+        sprint_field: str,
+        timeline_start_field: str,
+        timeline_end_field: str,
+    ) -> dict[str, EpicData]:
+        """Fetch epics and their descendants by walking a custom *chain*.
+
+        BFS, one tier per chain node (node[0] is the epic tier itself):
+        ``parent`` edges via a batched ``parent in (...)`` query; ``link`` edges
+        by reading each frontier issue's ``issuelinks`` and batch-fetching the
+        matching targets by key.  A cross-tier ``seen`` set and the chain length
+        bound cycles and fan-out.  Each child records its ``hierarchy_parent_key``
+        and ``issue_type_id``; :meth:`apply_hierarchy` then assigns display tiers
+        and AND-resolves the show/estimate cascade.
+        """
+        if not self._jira or not epic_keys:
+            return {}
+
+        unique_keys = list(dict.fromkeys(epic_keys))
+        fields = self._build_field_list(
+            sp_field,
+            epic_link_field,
+            start_date_field,
+            due_date_field,
+            timeline_start_field,
+            timeline_end_field,
+            sprint_field,
+        )
+        if "issuelinks" not in fields:
+            fields = [*fields, "issuelinks"]
+
+        def parse_child(raw: Any) -> JiraIssue:
+            issue = self._parse_child_issue(
+                raw,
+                sp_field,
+                start_date_field,
+                due_date_field,
+                sprint_field,
+                timeline_start_field,
+                timeline_end_field,
+            )
+            issue.issue_type_id = self._issue_type_id_of(raw)
+            return issue
+
+        # Phase 0: the requested epics themselves (tier 0); keep their raw rows
+        # as the first BFS frontier (link edges read their ``issuelinks``).
+        epics: dict[str, EpicData] = {}
+        frontier: list[Any] = []
+        epic_set = set(unique_keys)
+        for batch in _chunks(unique_keys, _COMBINED_BATCH_SIZE):
+            csv = ", ".join(batch)
+            rows = self._search_with_retry(
+                f"key in ({csv})", max_results=False, fields=fields, use_post=True
+            )
+            for raw in rows:
+                if raw.key in epic_set and raw.key not in epics:
+                    epics[raw.key] = self._parse_epic_from_raw(
+                        raw,
+                        start_date_field,
+                        due_date_field,
+                        timeline_start_field,
+                        timeline_end_field,
+                    )
+                    frontier.append(raw)
+
+        children_by_epic: dict[str, list[JiraIssue]] = {k: [] for k in epics}
+        owner_of: dict[str, str] = {k: k for k in epics}  # issue key -> epic key
+        seen: set[str] = set(epics)
+        resolver = HierarchyResolver(chain)
+
+        # Walk the chain by display TIER, not node-by-node. Several issue types can
+        # share a tier (Story + Bug at tier 1; Task + Sub-task at tier 2), and a
+        # child tier maps MANY-TO-MANY onto the tier above (a Task hangs off any
+        # tier-1 item via a link, a Sub-task off any of them via parent). The old
+        # node-by-node walk reassigned `frontier` after every node, so a second
+        # same-tier node (Bug) overwrote the first node's frontier (Story) with its
+        # own — usually empty — children, and any deeper tier then broke on
+        # `if not frontier`. Grouping by tier builds each tier's frontier from the
+        # UNION of all preceding-tier matches, mirroring the customize dialog's
+        # `_chain_tier_summaries`.
+        child_tiers = sorted({n.display_tier for n in chain if n.display_tier > 0})
+        for tier in child_tiers:
+            if not frontier:
+                break
+            tier_nodes = [n for n in chain if n.display_tier == tier]
+            next_frontier: list[Any] = []
+            for raw_child, parent_key in self._chain_tier_children(
+                frontier, tier_nodes, fields
+            ):
+                if raw_child.key in seen:
+                    continue
+                owner = owner_of.get(parent_key)
+                if owner is None:
+                    continue
+                issue = parse_child(raw_child)
+                # Keep only types that resolve to THIS tier (a parent-edge
+                # `parent in (...)` query returns every child type; a deeper-tier
+                # type pulled in here would otherwise leak in and advance under a
+                # parent apply_hierarchy later drops). Mark `seen` only once a node
+                # actually CLAIMS the child — else the tier-1 parent query would
+                # consume a tier-2 Task and the tier-2 link query would then skip it.
+                matched = resolver.node_of_issue(issue)
+                if matched is None or matched.display_tier != tier:
+                    continue
+                seen.add(raw_child.key)
+                issue.hierarchy_parent_key = parent_key
+                children_by_epic[owner].append(issue)
+                owner_of[raw_child.key] = owner
+                next_frontier.append(raw_child)
+            frontier = next_frontier
+
+        for key, epic in epics.items():
+            epic.children = children_by_epic[key]
+            self.apply_hierarchy(epic, chain)
+            self._fill_epic_dates_from_children(epic)
+            logger.debug(
+                "Assembled chain epic %s: %d children", key, len(epic.children)
+            )
+        return epics
+
+    def _chain_tier_children(
+        self, frontier: list[Any], nodes: list[HierarchyNode], fields: list[str]
+    ) -> list[tuple[Any, str]]:
+        """Fetch one tier's children for *frontier*, as ``(raw, parent_key)`` pairs.
+
+        *nodes* are every chain node at this display tier (a tier maps many-to-many
+        onto the tier above). All parent-edge nodes share a single
+        ``parent in (...)`` query — it returns every child type regardless of node,
+        so running it per-node would just duplicate it — while each link-edge node
+        adds one ``issuelinks`` read. Rows are de-duplicated by issue key (first
+        parent wins); the caller filters each row to the tier it resolves to.
+        """
+        out: list[tuple[Any, str]] = []
+        seen_keys: set[str] = set()
+
+        def _emit(raw: Any, parent_key: str) -> None:
+            if raw.key not in seen_keys:
+                seen_keys.add(raw.key)
+                out.append((raw, parent_key))
+
+        # Parent edges: one combined `parent in (frontier)` query for all of them.
+        if any(n.edge == "parent" for n in nodes):
+            parent_keys = [r.key for r in frontier]
+            for batch in _chunks(parent_keys, _JQL_IN_BATCH_SIZE):
+                csv = ", ".join(batch)
+                rows = self._search_with_retry(
+                    f"parent in ({csv}) ORDER BY created ASC",
+                    max_results=False,
+                    fields=fields,
+                    use_post=True,
+                )
+                batch_set = set(batch)
+                for raw in rows:
+                    parent_key = self._parent_key_of(raw)
+                    if parent_key in batch_set:
+                        _emit(raw, parent_key)
+
+        # Link edges: read each frontier issue's issuelinks once per link node.
+        for node in nodes:
+            if node.edge != "link":
+                continue
+            targets = _link_targets(frontier, node.link_types)
+            if not targets:
+                continue
+            for batch in _chunks(list(targets), _JQL_IN_BATCH_SIZE):
+                csv = ", ".join(batch)
+                rows = self._search_with_retry(
+                    f"key in ({csv})", max_results=False, fields=fields, use_post=True
+                )
+                for raw in rows:
+                    parent_key = targets.get(raw.key)
+                    if parent_key:
+                        _emit(raw, parent_key)
+        return out
+
+    @staticmethod
+    def apply_hierarchy(epic: EpicData, chain: list[HierarchyNode]) -> None:
+        """Assign display tiers and resolve the show / estimate axes.
+
+        Each child's ``display_tier`` comes from its chain node (matched by
+        issue-type id, then name).
+
+        Both axes **AND-cascade** up the ``hierarchy_parent_key`` ancestry plus
+        the tier-0 (epic) node — a child is shown / estimated only when its own
+        node *and* every ancestor node (and the epic root) are:
+
+        * ``show`` (visibility) — a hidden parent hides its descendants, so they
+          never render orphaned (a Sub-task whose Story parent is hidden drops
+          off the timeline / nested rows with it).
+        * ``in_estimate`` (metrics) — a parent dropped from the metrics also
+          drops its descendants, so their weight isn't double-counted into an
+          excluded parent.
+        """
+        resolver = HierarchyResolver(chain)
+        node_of = resolver.node_of_issue
+        root = next((n for n in chain if n.display_tier == 0), None)
+
+        # Drop off-chain issue types (the Exclude pane, or types a parent-edge
+        # tier's untyped `parent in (...)` query pulled in): with no matching
+        # node they'd keep JiraIssue defaults (shown + estimated) and leak into
+        # the report.
+        epic.children = [c for c in epic.children if node_of(c) is not None]
+
+        issues_by_key = {c.key: c for c in epic.children}
+        for c in epic.children:
+            node = node_of(c)
+            if node is not None:
+                c.display_tier = node.display_tier
+
+        for c in epic.children:
+            show = True
+            est = True
+            cur: JiraIssue | None = c
+            guard = 0
+            while cur is not None and guard <= len(epic.children):
+                node = node_of(cur)
+                if node is not None:
+                    show = show and node.show
+                    est = est and node.in_estimate
+                pk = cur.hierarchy_parent_key
+                cur = issues_by_key.get(pk) if pk else None
+                guard += 1
+            if root is not None:
+                show = show and root.show
+                est = est and root.in_estimate
+            c.show = show
+            c.in_estimate = est
+
+    @staticmethod
+    def _issue_type_id_of(raw: Any) -> str:
+        """Return the issue-type id from a raw Jira row (``""`` when absent)."""
+        it = JiraClient._get_raw_field(raw, "issuetype")
+        if isinstance(it, dict):
+            return str(it.get("id", ""))
+        return str(getattr(it, "id", "")) if it is not None else ""
+
+    @staticmethod
+    def _issue_type_name_of(raw: Any) -> str:
+        """Return the issue-type display name from a raw Jira row (``""`` absent)."""
+        it = JiraClient._get_raw_field(raw, "issuetype")
+        if isinstance(it, dict):
+            return str(it.get("name", ""))
+        return str(getattr(it, "name", "")) if it is not None else ""
+
+    @staticmethod
+    def _parent_key_of(raw: Any) -> str | None:
+        """Return the ``parent`` field's issue key from a raw Jira row."""
+        parent_obj = getattr(getattr(raw, "fields", None), "parent", None)
+        if parent_obj is not None:
+            key = getattr(parent_obj, "key", None)
+            if key is None and isinstance(parent_obj, dict):
+                key = parent_obj.get("key")
+            if key:
+                return key
+        pf = JiraClient._get_raw_field(raw, "parent")
+        if isinstance(pf, dict):
+            return pf.get("key")
+        return getattr(pf, "key", None) if pf is not None else None
 
     def _parse_epic_from_raw(
         self,

@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Iterator
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from epic_report_generator.core import theming
@@ -32,10 +32,13 @@ from epic_report_generator.core.data_models import (
     collect_child_timeline_dates,
     fmt_date_en,
 )
+from epic_report_generator.core.typst_renderer import icon_ext
 
 logger = logging.getLogger(__name__)
 
 _DATE_FMT = "%B %d, %Y"
+_TICK_TARGET = 10   # ~10 ticks on value axes and date-label axis
+_FRAC_DIGITS = 6    # decimal precision for time-fraction x-coordinates (xs, x-ticks)
 
 
 def _is_label_group(item: ReportItem | None, report: ReportData) -> bool:
@@ -47,10 +50,46 @@ def _is_label_group(item: ReportItem | None, report: ReportData) -> bool:
     )
 
 
-def build_report(report: ReportData) -> dict[str, Any]:
-    """Build the JSON-serialisable payload consumed by ``main.typ``."""
+def _icon_path(type_id: str, icons: dict[str, bytes]) -> str:
+    """Return the Typst icon path for *type_id*, or ``""`` when not cached.
+
+    Only types whose SVG/PNG bytes are present in *icons* yield a path, because
+    Typst's ``image()`` hard-errors on a missing file (see typst_renderer). The
+    extension is sniffed from the bytes (PNG/SVG/…) so it matches the file the
+    renderer writes — a mismatched extension hard-errors the compile.
+    """
+    if not (type_id and type_id in icons):
+        return ""
+    return f"icons/{type_id}.{icon_ext(icons[type_id])}"
+
+
+def _epic_type_id(config: Any) -> str:
+    """The Epic-tier (tier-0) issue-type id of the configured chain, or ``""``.
+
+    Used to icon epic/group/detail rows; empty for the default (no-chain) path.
+    """
+    for node in getattr(config, "issue_hierarchy", None) or []:
+        if node.display_tier == 0 and node.issue_type_id:
+            return node.issue_type_id
+    return ""
+
+
+def build_report(
+    report: ReportData, icons: dict[str, bytes] | None = None
+) -> dict[str, Any]:
+    """Build the JSON-serialisable payload consumed by ``main.typ``.
+
+    *icons* maps issue-type id → icon bytes that the renderer has cached; only
+    those types get an ``icon`` path in the payload (empty otherwise), and the
+    default no-chain path carries no icons at all.
+    """
     config = report.config
     dark = config.dark_mode
+    icons = icons or {}
+    # Nested child rows / per-child timeline `show` only apply once a custom
+    # chain is configured; the default (empty chain) keeps today's output.
+    custom = bool(getattr(config, "issue_hierarchy", None))
+    epic_icon = _icon_path(_epic_type_id(config), icons)
 
     unit = report.metrics[0].estimation_unit if report.metrics else "SP"
 
@@ -80,28 +119,60 @@ def build_report(report: ReportData) -> dict[str, Any]:
         if m.scope_certainty:
             summary_has_certainty = True
 
+    def emit_children(epic: EpicData, overrides: dict[str, Any]) -> None:
+        """Append nested summary rows for an epic's visible chain children.
+
+        Only runs for a custom chain; children are emitted in hierarchy
+        (fetch) order, carrying their per-child certainty override and icon.
+        """
+        nonlocal summary_has_certainty
+        if not custom:
+            return
+        for child in epic.children:
+            if child.display_tier <= 0 or not child.show:
+                continue
+            ov = overrides.get(child.key)
+            cert = ov.scope_certainty if ov is not None else None
+            if cert:
+                summary_has_certainty = True
+            rows.append(
+                _child_row(child, cert, _icon_path(child.issue_type_id, icons))
+            )
+
     for item, epic, metrics in _iter_items(report):
         if _is_label_group(item, report):
             sources = report.label_source_epics[item.key]
-            rows.append(_group_row(item, epic, metrics, len(sources)))
+            rows.append(_group_row(item, epic, metrics, len(sources), epic_icon))
             accumulate(metrics)
             note_certainty(metrics)
             real_epics += len(sources)
             for src_epic, src_metrics in sources:
-                rows.append(_epic_row(src_epic, src_metrics, src_epic.key))
+                rows.append(_epic_row(src_epic, src_metrics, src_epic.key, epic_icon))
                 note_certainty(src_metrics)
+                src_ov = item.child_overrides.get(src_epic.key) if item else None
+                emit_children(src_epic, src_ov.child_overrides if src_ov else {})
             if config.expand_label_details:
                 label_tag = item.display_name or item.key
                 for src_epic, src_metrics in sources:
                     pages.append(
                         _epic_page(
-                            src_epic, src_metrics, config, src_epic.key, label_tag
+                            src_epic,
+                            src_metrics,
+                            config,
+                            src_epic.key,
+                            label_tag,
+                            epic_icon,
                         )
                     )
             else:
                 pages.append(
                     _epic_page(
-                        epic, metrics, config, item.display_name or item.key, None
+                        epic,
+                        metrics,
+                        config,
+                        item.display_name or item.key,
+                        None,
+                        epic_icon,
                     )
                 )
         else:
@@ -110,11 +181,12 @@ def build_report(report: ReportData) -> dict[str, Any]:
                 if item is None or item.kind == "epic"
                 else item.display_name or item.key
             )
-            rows.append(_epic_row(epic, metrics, key_text))
+            rows.append(_epic_row(epic, metrics, key_text, epic_icon))
             accumulate(metrics)
             note_certainty(metrics)
             real_epics += 1
-            pages.append(_epic_page(epic, metrics, config, key_text, None))
+            emit_children(epic, item.child_overrides if item else {})
+            pages.append(_epic_page(epic, metrics, config, key_text, None, epic_icon))
 
     overall = (
         round(weighted_progress_num / weighted_progress_den)
@@ -129,7 +201,11 @@ def build_report(report: ReportData) -> dict[str, Any]:
         {"label": f"Done {unit}", "value": f"{sum_done_sp:.0f}"},
     ]
 
-    timeline_chart = _timeline_data(report) if config.show_timeline_chart else None
+    timeline_chart = (
+        _timeline_data(report, icons, epic_icon)
+        if config.show_timeline_chart
+        else None
+    )
 
     # Appearance customization (NFR-05): accent-family colour overrides and the
     # custom font family, both empty when nothing is configured (stock palette).
@@ -200,10 +276,13 @@ def _aggregate_status(epic: EpicData) -> str:
 # -- summary rows -------------------------------------------------------------
 
 
-def _epic_row(epic: EpicData, metrics: EpicMetrics, key: str) -> dict[str, Any]:
+def _epic_row(
+    epic: EpicData, metrics: EpicMetrics, key: str, icon: str = ""
+) -> dict[str, Any]:
     return {
         "kind": "epic",
         "key": key,
+        "icon": icon,
         "summary": epic.summary,
         "progress": int(round(metrics.progress)),
         "certainty": metrics.scope_certainty,
@@ -216,12 +295,27 @@ def _epic_row(epic: EpicData, metrics: EpicMetrics, key: str) -> dict[str, Any]:
     }
 
 
+def _child_row(child: JiraIssue, certainty: str | None, icon: str) -> dict[str, Any]:
+    """A nested summary row for one visible chain child (Story/Sub-task tier)."""
+    return {
+        "kind": "child",
+        "depth": child.display_tier,
+        "icon": icon,
+        "key": child.key,
+        "summary": child.summary,
+        "progress": int(round(child.progress)),
+        "certainty": certainty,
+        "status": child.status_category,
+    }
+
+
 def _group_row(
-    item: ReportItem, epic: EpicData, metrics: EpicMetrics, n_epics: int
+    item: ReportItem, epic: EpicData, metrics: EpicMetrics, n_epics: int, icon: str = ""
 ) -> dict[str, Any]:
     return {
         "kind": "group",
         "label": item.display_name or item.key,
+        "icon": icon,
         "n-epics": n_epics,
         "progress": int(round(metrics.progress)),
         "certainty": metrics.scope_certainty,
@@ -243,6 +337,7 @@ def _epic_page(
     config: Any,
     key: str,
     label_tag: str | None,
+    icon: str = "",
 ) -> dict[str, Any]:
     unit = metrics.estimation_unit
     kpis = [
@@ -295,6 +390,7 @@ def _epic_page(
 
     return {
         "key": key,
+        "icon": icon,
         "summary": None if key == epic.summary else epic.summary,
         "status": _aggregate_status(epic),
         "label-tag": label_tag,
@@ -338,17 +434,25 @@ def _footer(config: Any) -> dict[str, Any]:
 # -- trend chart data ---------------------------------------------------------
 
 
-def _nice_axis(maxv: float, target: int = 4) -> tuple[float, list[float]]:
-    """Return ``(axis_max, ticks)`` rounded to human-friendly steps."""
+def _nice_axis(maxv: float, target: int = _TICK_TARGET) -> tuple[float, list[float]]:
+    """Return ``(axis_max, ticks)`` rounded to human-friendly steps.
+
+    Targets ~``target`` gridlines so the chart reads as densely as Jira's burnup.
+    The step is floored to 1: both axes are integer-domain (story points / issue
+    counts), so a sub-1 step on a tiny epic
+    would only add fractional half-ticks. ``2.5`` is dropped from the nice steps
+    for the same reason — keep ticks whole.
+    """
     if maxv <= 0:
         return 1, [0, 1]
     raw = maxv / target
     mag = 10 ** math.floor(math.log10(raw))
     step = 10 * mag
-    for m in (1, 2, 2.5, 5, 10):
+    for m in (1, 2, 5, 10):
         if raw <= m * mag:
             step = m * mag
             break
+    step = max(step, 1)
     axis_max = math.ceil(maxv / step) * step
     ticks: list[float] = []
     v = 0.0
@@ -359,14 +463,85 @@ def _nice_axis(maxv: float, target: int = 4) -> tuple[float, list[float]]:
     return axis_out, ticks
 
 
-def _index_ticks(dates: list[date], target: int = 6) -> list[dict[str, Any]]:
-    """Pick ~*target* evenly spaced indices (incl. first/last) with date labels."""
+def _x_days(t: date) -> float:
+    """Linear time coordinate (in days, sub-day aware) for a date or datetime.
+
+    Used to place per-event points and axis ticks proportionally to real time.
+    Converting to a float up front avoids mixing ``date`` and ``datetime`` in
+    subtraction (which raises ``TypeError``).
+    """
+    days = float(t.toordinal())
+    if isinstance(t, datetime):
+        days += (
+            t.hour * 3600 + t.minute * 60 + t.second + t.microsecond / 1e6
+        ) / 86400.0
+    return days
+
+
+def _as_date(t: date) -> date:
+    return t.date() if isinstance(t, datetime) else t
+
+
+def _time_ticks(dates: list[date], target: int = _TICK_TARGET) -> list[dict[str, Any]]:
+    """~*target* date labels placed at their true time-fraction across the range.
+
+    The x-axis is time-proportional, so a tick at calendar day *d* sits at
+    ``(d − t0)/(t1 − t0)`` rather than at an even pixel index. Labels are evenly
+    spaced calendar days from the first to the last sample; ~10 of them match
+    Jira's denser axis, and the 18mm label boxes still don't collide over the
+    landscape-wide chart.
+    """
     n = len(dates)
-    if n <= target:
-        idxs = list(range(n))
-    else:
-        idxs = sorted({round(i * (n - 1) / (target - 1)) for i in range(target)})
-    return [{"i": i, "label": fmt_date_en(dates[i], "%b %d")} for i in idxs]
+    if n < 2:
+        return [{"x": 0.0, "label": fmt_date_en(dates[0], "%b %d")}] if n else []
+    x0, x1 = _x_days(dates[0]), _x_days(dates[-1])
+    span = x1 - x0
+    if span <= 0:
+        return [{"x": 0.0, "label": fmt_date_en(dates[0], "%b %d")}]
+    d0, d1 = _as_date(dates[0]), _as_date(dates[-1])
+    total = (d1 - d0).days
+    step = max(1, round(total / (target - 1))) if total else 1
+    offsets = list(range(0, total + 1, step))
+    if offsets[-1] != total:
+        offsets.append(total)
+    ticks: list[dict[str, Any]] = []
+    for k in offsets:
+        d = d0 + timedelta(days=k)
+        x = max(0.0, min(1.0, (_x_days(d) - x0) / span))
+        ticks.append({"x": round(x, _FRAC_DIGITS), "label": fmt_date_en(d, "%b %d")})
+    return ticks
+
+
+def _week_bands(dates: list[date]) -> list[dict[str, float]]:
+    """Alternating ISO-week background bands as fractional x-ranges in ``[0, 1]``.
+
+    Mirrors Jira's trend chart: every other calendar week gets a faint column so
+    the eye can read week boundaries. Computed from the **time range**
+    ``[t0, t1]`` (Monday-aligned weeks mapped to fractions), not from sample
+    spacing — the points are no longer evenly spaced, so index midpoints would
+    misplace the columns.
+    """
+    n = len(dates)
+    if n < 2:
+        return []
+    x0, x1 = _x_days(dates[0]), _x_days(dates[-1])
+    span = x1 - x0
+    if span <= 0:
+        return []
+    d0, d1 = _as_date(dates[0]), _as_date(dates[-1])
+    bands: list[dict[str, float]] = []
+    week = d0 - timedelta(days=d0.weekday())  # Monday on/before the first day
+    order = 0
+    while week <= d1:
+        week_end = week + timedelta(days=7)
+        if order % 2 == 1:  # shade every other week
+            f0 = max(0.0, (_x_days(week) - x0) / span)
+            f1 = min(1.0, (_x_days(week_end) - x0) / span)
+            if f1 > f0:
+                bands.append({"x0": round(f0, 4), "x1": round(f1, 4)})
+        order += 1
+        week = week_end
+    return bands
 
 
 def _trend_data(metrics: EpicMetrics) -> dict[str, Any] | None:
@@ -375,6 +550,14 @@ def _trend_data(metrics: EpicMetrics) -> dict[str, Any] | None:
     if len(dates) < 2:
         return None
     n = len(dates)
+    # Time-proportional x: each point sits at its real fraction of the span, so
+    # same-day events spread apart instead of collapsing onto one index slot.
+    x0, x1 = _x_days(dates[0]), _x_days(dates[-1])
+    span = x1 - x0
+    if span <= 0:
+        return None
+    xs = [round((_x_days(t) - x0) / span, _FRAC_DIGITS) for t in dates]
+
     total = [round(v, 1) for v in metrics.total_sp_over_time]
     done = [round(v, 1) for v in metrics.completed_sp_over_time]
     cum_iss = list(metrics.cumulative_issues)
@@ -395,7 +578,9 @@ def _trend_data(metrics: EpicMetrics) -> dict[str, Any] | None:
         "done-sp": done,
         "cum-iss": cum_iss,
         "cum-unest": cum_unest,
-        "x-ticks": _index_ticks(dates),
+        "xs": xs,
+        "x-ticks": _time_ticks(dates),
+        "bands": _week_bands(dates),
     }
 
 
@@ -411,12 +596,24 @@ def _resolve_child_timeline_dates(child: JiraIssue) -> tuple[Any, Any]:
 
 def _build_timeline(
     report: ReportData,
+    icons: dict[str, bytes],
+    epic_icon: str,
 ) -> tuple[list[TimelineItem], list[MilestoneItem]]:
     """Assemble Gantt timeline items + milestones (ported from the old renderer)."""
     config = report.config
     items: list[TimelineItem] = []
+    # Custom chain → per-child `show` drives which children get bars; the default
+    # (empty chain) keeps the legacy global-flag gate byte-for-byte.
+    custom = bool(getattr(config, "issue_hierarchy", None))
     show_children = config.show_epic_stories_on_timeline
     show_subtasks = config.show_subtasks_on_timeline
+
+    def displayed(child: JiraIssue) -> bool:
+        if custom:
+            return child.show
+        if not show_children:
+            return False
+        return not (child.is_subtask and not show_subtasks)
 
     def add_epic(
         epic: EpicData, metrics: EpicMetrics, name: str, group: str = ""
@@ -434,26 +631,29 @@ def _build_timeline(
                 group=group,
                 summary=epic.summary,
                 weight=float(weight) if weight else 1.0,
+                display_tier=0,
+                icon=epic_icon,
             )
         )
-        if show_children and epic.children:
-            for child in epic.children:
-                if child.is_subtask and not show_subtasks:
-                    continue
-                c_start, c_end = _resolve_child_timeline_dates(child)
-                if c_start and c_end:
-                    items.append(
-                        TimelineItem(
-                            name=f"  {child.key}",
-                            start_date=c_start,
-                            end_date=c_end,
-                            scope_certainty=None,
-                            progress=child.progress,
-                            is_child=True,
-                            group=group,
-                            summary=child.summary,
-                        )
+        for child in epic.children:
+            if not displayed(child):
+                continue
+            c_start, c_end = _resolve_child_timeline_dates(child)
+            if c_start and c_end:
+                items.append(
+                    TimelineItem(
+                        name=f"  {child.key}",
+                        start_date=c_start,
+                        end_date=c_end,
+                        scope_certainty=None,
+                        progress=child.progress,
+                        is_child=True,
+                        group=group,
+                        summary=child.summary,
+                        display_tier=child.display_tier,
+                        icon=_icon_path(child.issue_type_id, icons),
                     )
+                )
 
     for item, epic, metrics in _iter_items(report):
         if _is_label_group(item, report):
@@ -602,10 +802,12 @@ def _sprint_lane(
     return out
 
 
-def _timeline_data(report: ReportData) -> dict[str, Any] | None:
+def _timeline_data(
+    report: ReportData, icons: dict[str, bytes], epic_icon: str
+) -> dict[str, Any] | None:
     """Build the Gantt chart-data dict, or ``None`` when there is nothing to show."""
     config = report.config
-    items, milestones = _build_timeline(report)
+    items, milestones = _build_timeline(report, icons, epic_icon)
 
     all_dates: list[date] = []
     for it in items:
@@ -671,6 +873,8 @@ def _timeline_data(report: ReportData) -> dict[str, Any] | None:
                 "progress": int(round(it.progress)),
                 "certainty": it.scope_certainty,
                 "child": it.is_child,
+                "depth": it.display_tier,
+                "icon": it.icon,
             }
         )
         if not it.is_child:

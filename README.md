@@ -12,6 +12,7 @@ Epic Report Generator is a desktop app that connects to Jira Cloud, pulls Epic p
 - **Per-Epic detail pages**: a trend chart (total vs. completed SP, cumulative issues, weekend bands) and a metrics sidebar (velocity, cycle time, scope change %, forecast date)
 - **Light and dark themes** built on Material Design with app-specific overlays. The PDF and the app UI follow the same preference
 - **Theme customization**: set a custom accent colour and font (from a file or by Google Fonts name) under Settings → Appearance. The app and the report both update, and a one-click reset restores the defaults
+- **Custom issue-type hierarchy**: per report profile, define which Jira issue types map to the Epic / Story / Sub-task tiers and how they connect (native parent or issue links), with per-type Show/Estimate toggles. Leave it empty for the classic Epic→Story→Sub-task default
 
 ## Functional Requirements
 
@@ -29,6 +30,7 @@ Epic Report Generator is a desktop app that connects to Jira Cloud, pulls Epic p
 - **FR-12. Jira Label Aggregation:** The system must aggregate child issue data (Stories/Tasks) into a high-level "Label Progress Summary" table, including completion percentages. There should be the ability to add a custom display name to each label that will appear in the report.
 - **FR-13. Scope Certainty:** The system must allow users to set Scope certainty as "Low' or "Medium" or "High" for each label and/or epic during the Report configuration ("STEP 1. Configuration").The "Label Certainty" dropdown should include a “Consolidated” option, allowing users to set individual certainty values for each epic associated with the label. While this option is named 'Consolidated' in the configuration settings, the report itself should display 'Low,' 'Medium,' or 'High' based on the average certainty values of the underlying child epics.
 - **FR-14. Report Items Re-ordering:** It should be possible to drag the items in the list to change the order in the final report.
+- **FR-15. Custom Issue-Type Hierarchy:** Each report profile may define a custom issue-type hierarchy — an ordered chain of Jira issue types collapsed into the three display tiers (Epic / Story / Sub-task), where each tier connects to the one above by either the native `parent` relationship or one-or-more issue link types. Per-type **Show** (display) and **Estimate** (metrics) toggles cascade down the chain, replacing the old global subtask checkboxes. An empty chain derives the classic Epic→Story→Sub-task default, so existing profiles are migrated automatically and render unchanged.
 
 ## Non-Functional Requirements
 

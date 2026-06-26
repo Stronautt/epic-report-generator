@@ -93,8 +93,8 @@ For a **label**, every child is an epic, so each row also has its own **gear** b
 
 Customize the report's cover.
 
-| Field | Default | Notes |
-|-------|---------|-------|
+| Control | Default | What it does |
+|---------|---------|--------------|
 | **Report Title** | "Epic Progress Report" | The headline on the cover |
 | **Author** | *empty* | Who created the report |
 | **Project Name** | *from Jira* | Override the project name |
@@ -118,28 +118,50 @@ Customize the report's cover.
 | **Issues Only** | Counts done vs. open issues equally, ignoring size |
 | **Estimates Only** | Weighs purely by size; unestimated issues are skipped |
 
-> **Include subtasks into progress calculation** *(on by default)* counts sub-tasks toward each issue's progress, so a parent with 2 of 3 sub-tasks done shows ~67% instead of all-or-nothing.
+*Which issue types count toward progress — and which are only displayed — is set per type by the **Estimate** / **Show** toggles in the **Issue Hierarchy** section.*
 
 ### Report content
 
-| Option | Default | Adds |
-|--------|:---:|------|
-| **Show detailed metrics** | On | Cycle time, velocity, scope change, and a completion forecast on each epic's page |
+| Control | Default | What it does |
+|---------|:---:|--------------|
+| **Show detailed metrics** | On | Adds cycle time, velocity, scope change, and a completion forecast to each epic's page |
 | **Expand label epics** | On | A separate page per epic under a label (instead of one combined page) |
-
-> **Always use light theme for report** *(on by default)* keeps the PDF light even when the app is in dark mode. Turn it off to let a dark app theme carry through to the report.
+| **Always use light theme for report** | On | Keeps the PDF light even when the app is in dark mode; turn it off to let a dark app theme carry through to the report |
 
 ### Timeline
 
 A Gantt-style timeline page showing when epics start and finish.
 
-| Option | Default | Notes |
-|--------|:---:|-------|
+| Control | Default | What it does |
+|---------|:---:|--------------|
 | **Include timeline page** | On | Turn the whole page on or off |
-| **Show stories/tasks on timeline** | Off | Draw child issues as their own bars |
 | **Fixed Start / End Date** | *empty* | Lock the timeline's date range; leave empty to auto-fit |
 
+Which child tiers appear as their own bars (and expand each epic's range) is set per type by the **Show** toggle in the **Issue Hierarchy** section.
+
 > Epics still appear even without explicit dates: the app falls back to their children's sprint dates, then their estimation dates. *(Fixed dates must be at least 5 days apart; the app nudges them if not.)*
+
+### Issue hierarchy
+
+Jira instances model depth differently — `Epic → Story → Sub-task`, or richer chains like `Capability → Feature → Story → Task → Sub-task` that mix the native **parent** relationship with issue **links**. This section maps *your* instance's issue types onto the report's three display tiers — **Epic**, **Story**, **Sub-task** — so the report fetches the right children no matter how deep the hierarchy goes.
+
+On first open the chain is built automatically from your Jira instance; leave it untouched and the report behaves exactly as before. Drag the handle on any row to reorder the chain. Each active row is one issue type:
+
+| Control | What it does |
+|---------|--------------|
+| **Type** | The Jira issue type, shown with its icon |
+| **Edge** | How this type attaches to the one above it — **Parent** (the native parent/child link) or **Link** (an issue-link relationship) |
+| **Link types** | When the edge is **Link**, pick which link type(s) connect the two tiers (matched in either direction); hidden for **Parent** |
+| **Tier** | Which display tier this type folds into: **Epic**, **Story**, or **Sub-task** |
+| **Show** | Display issues of this type in the report (summary rows and timeline bars) |
+| **Estimate** | Count issues of this type toward progress, totals, and estimate weight |
+
+**Show** and **Estimate** are independent: a sub-task can be *estimated but not shown* (it rolls up silently) or *shown but not estimated* (it appears without affecting the numbers). Turning a row's **Show** or **Estimate** off greys out the same toggle on every tier below it — children can't display or count if their parent doesn't.
+
+| Area | What it does |
+|------|--------------|
+| **Exclude** | Issue types you don't care about sit in the **Exclude** pool below the chain. Drag a type down to park it, or back up to include it; excluded types are ignored when fetching. |
+| **Refresh** | Re-reads your instance's issue types, link types, and icons — useful after an admin adds or renames a type. It keeps your edits where it can and warns (never blocks) if a node's type or link type no longer exists. |
 
 ### Jira field mapping
 

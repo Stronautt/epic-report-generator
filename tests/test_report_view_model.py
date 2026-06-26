@@ -8,17 +8,57 @@ chart geometry is explicitly exercised.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
+
+import pytest
 
 from epic_report_generator.core.data_models import (
+    ChildOverride,
     EpicData,
     EpicMetrics,
+    HierarchyNode,
     JiraIssue,
     ReportConfig,
     ReportData,
     ReportItem,
 )
-from epic_report_generator.core.report_view_model import build_report
+from epic_report_generator.core.report_view_model import _week_bands, build_report
+
+
+def _chain() -> list[HierarchyNode]:
+    """Custom Epic→Story→Sub-task chain (sub-task hidden) used by hierarchy tests."""
+    return [
+        HierarchyNode("10000", "Epic", display_tier=0),
+        HierarchyNode("10001", "Story", display_tier=1, show=True),
+        HierarchyNode("10002", "Sub-task", display_tier=2, show=False),
+    ]
+
+
+def _child(
+    key: str,
+    *,
+    type_id: str = "10001",
+    tier: int = 1,
+    show: bool = True,
+    progress: float = 0.0,
+    summary: str = "Child",
+) -> JiraIssue:
+    return JiraIssue(
+        key=key,
+        summary=summary,
+        status="To Do",
+        status_category="To Do",
+        resolution=None,
+        issue_type="Story",
+        story_points=None,
+        created=None,
+        resolved=None,
+        assignee=None,
+        issue_type_id=type_id,
+        display_tier=tier,
+        show=show,
+        progress=progress,
+    )
 
 
 def _epic(key: str, summary: str = "Summary", children: list[JiraIssue] | None = None) -> EpicData:
@@ -213,7 +253,23 @@ class TestChartData:
         assert chart["total-sp"] == [10.0, 15.0, 20.0]
         assert chart["sp-max"] >= 20
         assert chart["iss-max"] >= max(chart["cum-iss"])
+        # Time-proportional x-axis: per-point fractions (samples a week apart).
+        assert chart["xs"] == [0.0, 0.5, 1.0]
         assert len(chart["x-ticks"]) >= 2
+        assert chart["x-ticks"][0]["x"] == 0.0
+        assert chart["x-ticks"][-1]["x"] == pytest.approx(1.0)
+        assert "bands" in chart  # weekly background bands for the stepped chart
+
+    def test_week_bands_alternate_within_range(self) -> None:
+        # 21 daily samples spanning 3 ISO weeks → shade every other week (1 band),
+        # each fraction inside [0, 1] with x0 < x1.
+        days = [date(2026, 5, 4) + timedelta(days=i) for i in range(21)]
+        bands = _week_bands(days)
+        assert bands  # at least one shaded week
+        for b in bands:
+            assert 0.0 <= b["x0"] < b["x1"] <= 1.0
+        # too sparse → no bands (chart needs >= 2 points anyway)
+        assert _week_bands(days[:1]) == []
 
     def test_no_chart_without_timeseries(self) -> None:
         # Fewer than two data points -> no trend chart.
@@ -237,3 +293,126 @@ class TestChartData:
         assert chart["rows"][0]["start"] is not None
         assert len(chart["ticks"]) >= 1
         assert len(chart["tiers"]) >= 1
+
+
+def _custom_epic_report(
+    children: list[JiraIssue],
+    *,
+    overrides: dict[str, ChildOverride] | None = None,
+    show_timeline: bool = False,
+) -> ReportData:
+    """A single-epic report driven by the custom Epic→Story→Sub-task chain."""
+    e = _epic("E-1", "Epic One", children=children)
+    e.start_date = e.timeline_start = date(2026, 5, 1)
+    e.due_date = e.timeline_end = date(2026, 6, 1)
+    m = _metrics(progress=50.0)
+    item = ReportItem("epic", "E-1", child_overrides=overrides or {})
+    cfg = ReportConfig(
+        show_timeline_chart=show_timeline, issue_hierarchy=_chain()
+    )
+    return ReportData(
+        config=cfg, epics=[e], metrics=[m], resolved_items=[(item, e, m)]
+    )
+
+
+class TestNestedSummaryRows:
+    """Task 5: visible chain children become nested summary rows."""
+
+    def test_default_chain_emits_no_child_rows(self) -> None:
+        """An empty chain keeps the summary epic-only (byte-for-byte default)."""
+        # Children carry show=True/display_tier=1 as the fetch leaves them, but
+        # with no custom chain configured no nested rows are emitted.
+        e = _epic("E-1", "Epic", children=[_child("S-1"), _child("S-2")])
+        m = _metrics()
+        report = ReportData(
+            config=ReportConfig(show_timeline_chart=False),
+            epics=[e],
+            metrics=[m],
+            resolved_items=[(ReportItem("epic", "E-1"), e, m)],
+        )
+        rows = build_report(report)["summary"]["rows"]
+        assert [r["kind"] for r in rows] == ["epic"]
+
+    def test_visible_children_become_rows_in_order(self) -> None:
+        kids = [
+            _child("S-1", progress=100.0, summary="First"),
+            _child("S-2", progress=0.0, summary="Second"),
+            _child("SUB-1", type_id="10002", tier=2, show=False),  # hidden tier
+        ]
+        rows = build_report(_custom_epic_report(kids))["summary"]["rows"]
+        assert [r["kind"] for r in rows] == ["epic", "child", "child"]
+        children = [r for r in rows if r["kind"] == "child"]
+        assert [c["key"] for c in children] == ["S-1", "S-2"]  # hidden one dropped
+        assert [c["depth"] for c in children] == [1, 1]
+        assert children[0]["summary"] == "First"
+        assert children[0]["progress"] == 100
+
+    def test_child_certainty_from_override(self) -> None:
+        kids = [_child("S-1")]
+        overrides = {"S-1": ChildOverride(scope_certainty="High")}
+        payload = build_report(_custom_epic_report(kids, overrides=overrides))
+        rows = payload["summary"]["rows"]
+        child = next(r for r in rows if r["kind"] == "child")
+        assert child["certainty"] == "High"
+        # A certainty anywhere flips the column-visible flag.
+        assert payload["summary"]["has-certainty"] is True
+
+    def test_label_group_nests_children_under_source_epics(self) -> None:
+        e1 = _epic("E-1", "First", children=[_child("S-1")])
+        e2 = _epic("E-2", "Second", children=[_child("S-2")])
+        m1, m2 = _metrics(progress=80.0), _metrics(progress=40.0)
+        merged = _epic("Backend", "Backend")
+        mm = _metrics(progress=60.0)
+        item = ReportItem("label", "lbl", "Backend")
+        cfg = ReportConfig(show_timeline_chart=False, issue_hierarchy=_chain())
+        report = ReportData(
+            config=cfg,
+            epics=[merged],
+            metrics=[mm],
+            resolved_items=[(item, merged, mm)],
+            label_source_epics={"lbl": [(e1, m1), (e2, m2)]},
+        )
+        rows = build_report(report)["summary"]["rows"]
+        assert [r["kind"] for r in rows] == [
+            "group",
+            "epic",
+            "child",
+            "epic",
+            "child",
+        ]
+
+    def test_timeline_uses_per_child_show(self) -> None:
+        story = _child("S-1", progress=25.0)
+        story.timeline_start, story.timeline_end = date(2026, 5, 3), date(2026, 5, 20)
+        hidden = _child("SUB-1", type_id="10002", tier=2, show=False)
+        hidden.timeline_start, hidden.timeline_end = date(2026, 5, 4), date(2026, 5, 9)
+        report = _custom_epic_report([story, hidden], show_timeline=True)
+        chart = build_report(report, icons={"10001": b"<svg/>"})["timeline"]["chart"]
+        keys = [r["key"] for r in chart["rows"]]
+        assert keys == ["E-1", "S-1"]  # hidden sub-task has no bar
+        child_row = next(r for r in chart["rows"] if r["child"])
+        assert child_row["depth"] == 1
+        assert child_row["icon"] == "icons/10001.svg"
+
+
+class TestIconGuard:
+    """Task 5: an icon path is emitted only when the type's bytes are cached."""
+
+    def test_icon_present_only_when_cached(self) -> None:
+        kids = [
+            _child("S-1", type_id="10001"),  # cached
+            _child("S-2", type_id="10009"),  # not cached
+        ]
+        payload = build_report(
+            _custom_epic_report(kids), icons={"10001": b"<svg/>", "10000": b"<svg/>"}
+        )
+        rows = payload["summary"]["rows"]
+        epic_row = next(r for r in rows if r["kind"] == "epic")
+        children = {r["key"]: r for r in rows if r["kind"] == "child"}
+        assert epic_row["icon"] == "icons/10000.svg"  # chain tier-0 type, cached
+        assert children["S-1"]["icon"] == "icons/10001.svg"
+        assert children["S-2"]["icon"] == ""  # uncached → empty, never a path
+
+    def test_no_icons_dict_means_no_paths(self) -> None:
+        rows = build_report(_custom_epic_report([_child("S-1")]))["summary"]["rows"]
+        assert all(r["icon"] == "" for r in rows)

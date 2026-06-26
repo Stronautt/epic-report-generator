@@ -206,6 +206,9 @@ QLabel[status="connected"] {
     padding: 0;
     font-size: 12px;
 }
+#excludedChip {
+    border-radius: 11px;
+}
 #epicKeyChipClose {
     background: transparent;
     border: none;
@@ -457,6 +460,40 @@ QLabel[status="disconnected"] {
 #epicKeyChipClose:hover {
     background-color: @BORDER@;
 }
+#excludedChip {
+    background-color: @SOFTER@;
+    border: 1px solid @BORDER@;
+}
+#excludedChip:hover {
+    background-color: @BORDER@;
+}
+#tierSilo {
+    background-color: @SOFTER@;
+    border: 1px solid @BORDER@;
+    border-radius: 6px;
+}
+#tierSilo #childRow {
+    background-color: rgba(128, 128, 128, 0.07);
+    border: 1px solid @BORDER@;
+    border-radius: 4px;
+}
+QPushButton[addType="true"] {
+    border: 1px dashed @BORDER@;
+    border-radius: 6px;
+    color: @ACCENT@;
+    background-color: transparent;
+    padding: 6px 4px;
+    font-weight: 600;
+    text-align: center;
+}
+QPushButton[addType="true"]:hover {
+    background-color: @SOFT@;
+    border-color: @ACCENT@;
+}
+QPushButton[addType="true"]:disabled {
+    color: @BORDER@;
+    border-color: @BORDER@;
+}
 
 /* ── Epic key tag input container ───────────────────────────────── */
 #epicKeyTagInput {
@@ -660,6 +697,40 @@ QLabel[status="disconnected"] {
 }
 #epicKeyChipClose:hover {
     background-color: @BORDER@;
+}
+#excludedChip {
+    background-color: @SOFT@;
+    border: 1px solid @BORDER@;
+}
+#excludedChip:hover {
+    background-color: @BORDER@;
+}
+#tierSilo {
+    background-color: @SOFT@;
+    border: 1px solid @BORDER@;
+    border-radius: 6px;
+}
+#tierSilo #childRow {
+    background-color: rgba(128, 128, 128, 0.07);
+    border: 1px solid @BORDER@;
+    border-radius: 4px;
+}
+QPushButton[addType="true"] {
+    border: 1px dashed @BORDER@;
+    border-radius: 6px;
+    color: @ACCENT@;
+    background-color: transparent;
+    padding: 6px 4px;
+    font-weight: 600;
+    text-align: center;
+}
+QPushButton[addType="true"]:hover {
+    background-color: @SOFT@;
+    border-color: @ACCENT@;
+}
+QPushButton[addType="true"]:disabled {
+    color: @BORDER@;
+    border-color: @BORDER@;
 }
 
 /* ── Epic key tag input container ───────────────────────────────── */

@@ -9,12 +9,14 @@ from PySide6.QtCore import (
     QMimeData,
     QObject,
     QPoint,
+    QRect,
     QSize,
     Qt,
     QTimer,
     Signal,
 )
 from PySide6.QtGui import (
+    QColor,
     QDrag,
     QDragEnterEvent,
     QDragMoveEvent,
@@ -24,10 +26,13 @@ from PySide6.QtGui import (
     QMouseEvent,
     QPainter,
     QPainterPath,
+    QPen,
     QPixmap,
+    QResizeEvent,
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QBoxLayout,
     QCheckBox,
     QComboBox,
     QCompleter,
@@ -39,15 +44,25 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSpacerItem,
     QVBoxLayout,
     QWidget,
 )
+from shiboken6 import isValid
 
-from epic_report_generator.core.data_models import ChildOverride, ReportItem
+from epic_report_generator.core.data_models import (
+    ChildOverride,
+    HierarchyNode,
+    ReportItem,
+    canonical_default_hierarchy,
+    order_by_keys,
+)
 from epic_report_generator.services.config_manager import (
     DEFAULT_PROFILE_NAME,
     ConfigManager,
@@ -519,6 +534,11 @@ class CollapsibleSection(QWidget):
 
 RE_EPIC_KEY = re.compile(r"^[A-Z][A-Z0-9_]+-\d+$")
 
+# Separator between key and summary in an epic autocomplete suggestion. Picking a
+# suggestion makes the completer insert the full "KEY — summary" display string;
+# that text is NOT a user query, so it must never trigger a picker request.
+EPIC_SUGGESTION_SEP = " — "
+
 # Scope-certainty dropdown entries: (display label, stored data value). Shared by
 # the per-row Cert. combo and the per-child override combos.
 _CERT_ITEMS = [("--", ""), ("Low", "Low"), ("Med", "Medium"), ("High", "High")]
@@ -632,6 +652,10 @@ class _DragHandle(QLabel):
         super().mouseMoveEvent(event)
 
 
+# Fixed width of the leading issue-type icon slot in a report-item row.
+_REPORT_ICON_W = 20
+
+
 class _ReportItemRow(QWidget):
     """A single row in the ReportItemTable."""
 
@@ -639,6 +663,7 @@ class _ReportItemRow(QWidget):
     changed = Signal()  # emits on any field change
     drag_started = Signal(object)  # emits self when the drag handle is dragged
     edit_requested = Signal(object)  # emits self when the customize button is clicked
+    epic_query_changed = Signal(object, str)  # emits (self, query) for epic autocomplete
 
     # Field-outline colours used to flag a validation problem on the row.
     _VALIDATION_COLOR = {"error": "#e53935", "warning": "#ff8f00"}
@@ -666,6 +691,15 @@ class _ReportItemRow(QWidget):
         self._child_order: list[str] = list(child_order or [])
         self._initialised = False
         self._validation_state = ""
+        # Suppresses the autocomplete fetch while we programmatically set the key
+        # (e.g. when a suggestion is picked) so picking never re-opens the popup.
+        self._suppress_epic_query = False
+        # Latched True once a suggestion is committed; blocks a late/pending picker
+        # result from re-opening the popup. Cleared when the user types again.
+        self._picked = False
+        # The epic's Jira summary, shown as the display-name placeholder (resolved
+        # on autocomplete-pick or via the eager meta lookup; empty until known).
+        self._jira_summary = ""
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 2, 0, 2)
         layout.setSpacing(4)
@@ -686,10 +720,22 @@ class _ReportItemRow(QWidget):
         self.kind_combo.currentIndexChanged.connect(lambda: self.changed.emit())
         layout.addWidget(self.kind_combo)
 
+        # Issue-type icon (resolved epic type icon, or a tag glyph for labels).
+        # A dedicated widget, NOT a QLineEdit leading action: the key field's
+        # validation setStyleSheet() re-polishes the line edit and accumulates
+        # the action's side-widget margin, which made the icon↔text gap drift on
+        # every icon resolve / re-select. A fixed slot also keeps the key field's
+        # left edge stable whether or not an icon is present (no jump on resolve).
+        self.type_icon_lbl = QLabel()
+        self.type_icon_lbl.setFixedWidth(_REPORT_ICON_W)
+        self.type_icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.type_icon_lbl)
+
         self.key_edit = QLineEdit(key)
         self.key_edit.setPlaceholderText("PROJ-123")
         self.key_edit.setMinimumWidth(90)
         self.key_edit.textChanged.connect(lambda _: self.changed.emit())
+        self.key_edit.textChanged.connect(self._on_key_edited)
         layout.addWidget(self.key_edit, 2)
 
         self.name_edit = QLineEdit(display_name)
@@ -746,6 +792,71 @@ class _ReportItemRow(QWidget):
         completer.setFilterMode(Qt.MatchFlag.MatchContains)
         self.key_edit.setCompleter(completer)
 
+    def _on_key_edited(self, text: str) -> None:
+        """Request epic autocomplete suggestions as the user types a key."""
+        if EPIC_SUGGESTION_SEP in text:
+            # The completer just inserted a "KEY — summary" suggestion — not a
+            # user query. Ignore it so picking never fires a request for the
+            # full display string (the suppress flag races this textChanged).
+            return
+        if self._suppress_epic_query or self.kind != "epic":
+            return
+        # A real edit: drop the post-pick latch so suggestions can show again.
+        self._picked = False
+        query = text.strip()
+        if query:
+            self.epic_query_changed.emit(self, query)
+
+    def set_epic_completions(self, suggestions: list[tuple[str, str]]) -> None:
+        """Show ``KEY — summary`` autocomplete on the key field (epic rows only).
+
+        Results are shown unfiltered — the Jira issue picker already matched the
+        query against both key and summary, so local filtering would wrongly drop
+        summary matches. Picking a row writes just the issue key.
+        """
+        if self.kind != "epic" or self._picked:
+            return
+        if not suggestions:
+            # No matches → dismiss any stale popup. The completer is unfiltered,
+            # so it would otherwise keep showing the previous query's items even
+            # though the typed text no longer matches them.
+            existing = self.key_edit.completer()
+            if existing is not None:
+                existing.popup().hide()
+                self.key_edit.setCompleter(None)  # type: ignore[arg-type]
+            return
+        display = [f"{k}{EPIC_SUGGESTION_SEP}{s}" if s else k for k, s in suggestions]
+        completer = QCompleter(display, self)
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        completer.setCompletionMode(
+            QCompleter.CompletionMode.UnfilteredPopupCompletion
+        )
+        completer.activated.connect(self._on_epic_completion)
+        self.key_edit.setCompleter(completer)
+        completer.complete()
+
+    def _on_epic_completion(self, text: str) -> None:
+        """Write only the issue key when a ``KEY — summary`` suggestion is picked.
+
+        The suggestion's summary becomes the display-name placeholder right away
+        (the eager meta lookup would otherwise set it ~half a second later).
+        """
+        key, _, summary = text.partition(EPIC_SUGGESTION_SEP)
+        # The completer inserts the full display string synchronously; defer our
+        # clean-key write so it lands last, and suppress the re-fetch it triggers.
+        self._suppress_epic_query = True
+        QTimer.singleShot(
+            0, lambda: self._set_picked_key(key.strip(), summary.strip())
+        )
+
+    def _set_picked_key(self, key: str, summary: str = "") -> None:
+        self._picked = True  # ignore any late/pending picker result until next edit
+        self.key_edit.setText(key)
+        self.key_edit.setCompleter(None)  # type: ignore[arg-type]
+        self._suppress_epic_query = False
+        if summary:
+            self.set_jira_summary(summary)
+
     def _on_kind_changed(self) -> None:
         """Toggle display name enabled/placeholder based on kind."""
         is_label = self.kind_combo.currentData() == "label"
@@ -756,9 +867,13 @@ class _ReportItemRow(QWidget):
             if self._label_completions:
                 self._apply_completer(self._label_completions)
         else:
-            self.name_edit.setPlaceholderText("(auto from Jira)")
-            self.name_edit.setEnabled(False)
-            self.name_edit.clear()
+            # Epics get an editable display name too (overrides the Jira summary
+            # in the report); empty falls back to the fetched summary, shown as
+            # the placeholder once resolved.
+            self.name_edit.setEnabled(True)
+            self.name_edit.setPlaceholderText(
+                self._jira_summary or "Display name (auto from Jira)"
+            )
             self.key_edit.setPlaceholderText("PROJ-123")
             self.key_edit.setCompleter(None)  # type: ignore[arg-type]
 
@@ -808,6 +923,47 @@ class _ReportItemRow(QWidget):
         """Current parent certainty data value (``""`` when unset / consolidated)."""
         return self.certainty_combo.currentData() or ""
 
+    @property
+    def display_name(self) -> str:
+        """Current display-name text (used for both epic and label items)."""
+        return self.name_edit.text().strip()
+
+    @property
+    def effective_name(self) -> str:
+        """The override display name, else the resolved Jira summary (for titles)."""
+        return self.display_name or self._jira_summary
+
+    def set_jira_summary(self, summary: str) -> None:
+        """Cache the epic's Jira summary and show it as the name placeholder.
+
+        Epics only — labels keep their own placeholder. The placeholder is purely
+        visual: an empty field still falls back to the live Jira summary at render
+        time, so a later summary change isn't frozen into the report.
+        """
+        self._jira_summary = summary or ""
+        if self.kind == "epic" and self._jira_summary:
+            self.name_edit.setPlaceholderText(self._jira_summary)
+
+    def set_type_icon(self, icon_bytes: bytes | None) -> None:
+        """Show the row's Jira item icon in the leading icon slot.
+
+        For an epic row *icon_bytes* is the resolved issue-type icon (``None``
+        until known → no icon); a label row always shows the tag glyph. Cleared
+        when the key is empty.
+        """
+        if not self.key:
+            icon = None
+        elif self.kind == "label":
+            icon = _label_tag_icon()
+        elif icon_bytes:
+            icon = _pixmap_icon(icon_bytes)
+        else:
+            icon = None
+        if icon is None or icon.isNull():
+            self.type_icon_lbl.clear()
+        else:
+            self.type_icon_lbl.setPixmap(icon.pixmap(16, 16))
+
     def get_child_overrides(self) -> dict[str, ChildOverride]:
         """Return a deep copy of the per-child overrides (incl. include + nested)."""
         return _coerce_overrides(self._child_overrides)
@@ -834,7 +990,7 @@ class _ReportItemRow(QWidget):
             return None
         if kind == "epic":
             key = key.upper()
-        display_name = self.name_edit.text().strip() if kind == "label" else ""
+        display_name = self.name_edit.text().strip()
         certainty = self.certainty_combo.currentData() or None
         return ReportItem(
             kind=kind,
@@ -851,7 +1007,7 @@ class _ReportItemRow(QWidget):
         return {
             "kind": kind,
             "key": self.key_edit.text().strip(),
-            "display_name": self.name_edit.text().strip() if kind == "label" else "",
+            "display_name": self.name_edit.text().strip(),
             "scope_certainty": self.certainty_combo.currentData() or "",
             "child_overrides": {
                 k: _serialize_override(ov) for k, ov in self._child_overrides.items()
@@ -865,6 +1021,7 @@ class ReportItemTable(QWidget):
 
     items_changed = Signal()
     edit_requested = Signal(object)  # emits the _ReportItemRow to customize
+    epic_query_changed = Signal(object, str)  # emits (row, query) for autocomplete
 
     _MIME_TYPE = "application/x-erg-report-row"
 
@@ -932,6 +1089,7 @@ class ReportItemTable(QWidget):
         row.changed.connect(self.items_changed.emit)
         row.drag_started.connect(self._start_drag)
         row.edit_requested.connect(self.edit_requested.emit)
+        row.epic_query_changed.connect(self.epic_query_changed)
         self._rows.append(row)
         self._rows_layout.addWidget(row)
         # Animate a grow-in for interactive "+ Add Row" insertions, but not
@@ -1106,28 +1264,11 @@ class ReportItemTable(QWidget):
 # up: drag-handle width, key min-width, include-checkbox width, certainty combo
 # width, settings (gear) button width.
 _CHILD_HANDLE_W = 18
+_CHILD_ICON_W = 18
 _CHILD_KEY_W = 90
 _CHILD_INCL_W = 44
 _CHILD_CERT_W = 70
 _CHILD_SETTINGS_W = 22
-
-
-def _order_children(
-    children: list[tuple[str, str]], child_order: list[str]
-) -> list[tuple[str, str]]:
-    """Return *children* sorted by *child_order* (saved drag order).
-
-    Children whose key appears in *child_order* come first, in that order; any
-    child not listed (e.g. newly added in Jira since the order was saved) keeps
-    its fetched position and is appended after the ordered ones. An empty
-    *child_order* leaves the fetched order untouched.
-    """
-    if not child_order:
-        return list(children)
-    rank = {key: i for i, key in enumerate(child_order)}
-    known = sorted((c for c in children if c[0] in rank), key=lambda c: rank[c[0]])
-    unknown = [c for c in children if c[0] not in rank]
-    return [*known, *unknown]
 
 
 class _ChildRow(QWidget):
@@ -1154,6 +1295,7 @@ class _ChildRow(QWidget):
         cert_locked: bool,
         parent_certainty: str,
         show_settings: bool = False,
+        icon_bytes: bytes | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -1176,6 +1318,14 @@ class _ChildRow(QWidget):
         self.drag_handle = _DragHandle()
         self.drag_handle.drag_requested.connect(lambda: self.drag_started.emit(self))
         layout.addWidget(self.drag_handle)
+
+        # Issue-type icon prepended to the key (fixed slot keeps the header aligned).
+        self._icon_lbl = QLabel()
+        self._icon_lbl.setFixedWidth(_CHILD_ICON_W)
+        self._icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        if icon_bytes:
+            self._icon_lbl.setPixmap(_pixmap_icon(icon_bytes).pixmap(14, 14))
+        layout.addWidget(self._icon_lbl)
 
         self._key_lbl = QLabel(key)
         self._key_lbl.setMinimumWidth(_CHILD_KEY_W)
@@ -1426,6 +1576,10 @@ class _AutoSizeScrollArea(QScrollArea):
         return QSize(hint.width() + frame, min(hint.height() + frame, self._max_height))
 
 
+# Heading noun per child display tier (0=Epic / 1=Story / 2=Sub-task).
+_CHILD_TIER_NOUNS = ("Epic", "Standard", "Sub-task")
+
+
 class ChildCustomizeDialog(QDialog):
     """Modal for overriding display name & scope certainty of an item's children.
 
@@ -1455,14 +1609,29 @@ class ChildCustomizeDialog(QDialog):
         children: list[tuple[str, str]],
         overrides: dict[str, ChildOverride],
         child_order: list[str] | None = None,
+        child_icons: dict[str, bytes] | None = None,
+        parent_display_name: str = "",
+        children_tier: int | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        # A label's children are epics (drillable via the gear); an epic's
-        # children are stories/tasks (leaf, no gear).
-        self._show_settings = kind == "label"
-        child_noun = "Epic" if kind == "label" else "Story / Task"
-        self.setWindowTitle(f"Customize “{parent_key}”")
+        # The display tier of the children shown here (0=Epic/1=Story/2=Sub-task).
+        # Back-compat: derive from kind when not given — a label's children are
+        # epics (tier 0), an epic's are stories (tier 1). A row stays drillable
+        # (gets the settings gear) while its tier is above Sub-task, so strict tier
+        # nesting can step Epic → Story → Sub-task.
+        if children_tier is None:
+            children_tier = 0 if kind == "label" else 1
+        self.children_tier = children_tier
+        self._child_icons = child_icons or {}
+        self._show_settings = children_tier < 2
+        child_noun = _CHILD_TIER_NOUNS[children_tier]
+        # Title prefers the item's display name (the report uses it too), keeping
+        # the key alongside it for identification.
+        if parent_display_name and parent_display_name != parent_key:
+            self.setWindowTitle(f"Customize “{parent_display_name}” ({parent_key})")
+        else:
+            self.setWindowTitle(f"Customize “{parent_key}”")
         # Modal dialog — only show a title bar + close button. CustomizeWindowHint
         # is required for the absence of the minimize/maximize hints to take effect
         # (without it Qt keeps default decorations and the WM adds min/max itself).
@@ -1530,7 +1699,9 @@ class ChildCustomizeDialog(QDialog):
         body.addWidget(self._build_header(child_noun))
 
         self._list = _ChildRowList()
-        for key, summary in _order_children(children, child_order or []):
+        for key, summary in order_by_keys(
+            children, child_order or [], key=lambda c: c[0]
+        ):
             child_row = _ChildRow(
                 key,
                 summary,
@@ -1538,6 +1709,7 @@ class ChildCustomizeDialog(QDialog):
                 cert_locked=self._cert_locked,
                 parent_certainty=self._parent_certainty,
                 show_settings=self._show_settings,
+                icon_bytes=self._child_icons.get(key),
             )
             child_row.settings_requested.connect(self.child_settings_requested.emit)
             self._list.add_row(child_row)
@@ -1565,6 +1737,9 @@ class ChildCustomizeDialog(QDialog):
         spacer = QLabel("")
         spacer.setFixedWidth(_CHILD_HANDLE_W)  # aligns under the drag handles
         row.addWidget(spacer)
+        icon_spacer = QLabel("")
+        icon_spacer.setFixedWidth(_CHILD_ICON_W)  # aligns under the issue-type icons
+        row.addWidget(icon_spacer)
         key_lbl = QLabel(f"<b>{child_noun}</b>")
         key_lbl.setMinimumWidth(_CHILD_KEY_W)
         row.addWidget(key_lbl)
@@ -1885,3 +2060,973 @@ class ProfileBar(QWidget):
         self._config.delete_profile(name)
         self.refresh()
         self.profile_changed.emit(self._config.active_profile_name)
+
+
+# ---------------------------------------------------------------------------
+# IssueHierarchyEditor — custom issue-type hierarchy chain constructor
+# ---------------------------------------------------------------------------
+
+# Display titles for the three fixed tiers (cosmetic — drives the silo headers).
+# Atlassian's own issue-type hierarchy levels: Epic → "standard" issues
+# (Story/Task/Bug) → subtask. Renaming these is display-only; the data model and
+# report key off the numeric ``display_tier`` (0/1/2), never these strings.
+_TIER_TITLES = ("Epic Tier", "Standard Tier", "Sub-task Tier")
+
+
+def cascade_flags(checked: list[bool], tiers: list[int]) -> list[bool]:
+    """Per-row "enabled" flags for a by-tier AND cascade.
+
+    A node's toggle is greyed only when an **entire ancestor tier** is off — i.e.
+    some tier above it (a smaller ``display_tier``) has no checked node, so nothing
+    at that level can reach down to it. Same-tier siblings never gate each other,
+    and a deeper tier stays editable as long as *some* node in every ancestor tier
+    is on. Mirrors :func:`JiraClient.apply_hierarchy`, which forces a descendant
+    off only when its ancestry is hidden/unestimated — at the type level, "no node
+    of this tier shows" is what blocks the tiers below. (Position in the list is
+    irrelevant; only ``display_tier`` matters, so siblings listed after an
+    unchecked node aren't dragged down with it.)
+    """
+    any_on: dict[int, bool] = {}
+    for c, t in zip(checked, tiers):
+        any_on[t] = any_on.get(t, False) or c
+    blocked = {t for t, on in any_on.items() if not on}
+    return [not any(b < t for b in blocked) for t in tiers]
+
+
+def _pixmap_icon(icon_bytes: bytes | None) -> QIcon:
+    """Build a small ``QIcon`` from raw SVG/PNG bytes (empty when absent)."""
+    if not icon_bytes:
+        return QIcon()
+    pix = QPixmap()
+    pix.loadFromData(icon_bytes)
+    return QIcon(pix)
+
+
+_TAG_ICON: QIcon | None = None
+
+
+def _label_tag_icon() -> QIcon:
+    """A small grey price-tag glyph for label report items (built once, cached).
+
+    Labels span multiple Jira issue types, so there's no single item icon —
+    this neutral tag stands in for the "label" kind on both light and dark themes.
+    """
+    global _TAG_ICON
+    if _TAG_ICON is not None:
+        return _TAG_ICON
+    s = 16
+    pix = QPixmap(s, s)
+    pix.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor("#9e9e9e"))
+    path = QPainterPath()
+    path.moveTo(0.12 * s, 0.50 * s)  # left point of the tag
+    path.lineTo(0.44 * s, 0.20 * s)
+    path.lineTo(0.84 * s, 0.20 * s)
+    path.lineTo(0.84 * s, 0.80 * s)
+    path.lineTo(0.44 * s, 0.80 * s)
+    path.closeSubpath()
+    p.drawPath(path)
+    # Punch the tag's string hole out of the transparent pixmap.
+    p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+    p.drawEllipse(int(0.34 * s), int(0.43 * s), int(0.14 * s), int(0.14 * s))
+    p.end()
+    _TAG_ICON = QIcon(pix)
+    return _TAG_ICON
+
+
+def _type_tooltip(name: str, type_id: str) -> str:
+    """Tooltip disambiguating same-named issue types by their Jira id.
+
+    Several issue types can share a display name (custom + standard, or per
+    team-managed project), so the id is what tells them apart.
+    """
+    label = name or type_id
+    return f"{label}  —  id {type_id}" if type_id else label
+
+
+class _ListPopup(QFrame):
+    """A button-anchored popup hosting a height-capped, scrollable list.
+
+    A real popup window (``Qt.Popup``) so it closes on an outside click; the
+    inner :class:`QListWidget` caps its height and shows a scrollbar when the
+    offered items overflow. Used by both the per-silo "+ Add" type picker
+    (single click → choose) and the relationship selector (multi-select that
+    stays open on each pick). Deletes itself on hide so a fresh one is built per
+    open.
+    """
+
+    _MAX_H = 260
+
+    def __init__(self, anchor: QWidget) -> None:
+        super().__init__(anchor, Qt.WindowType.Popup)
+        self.setObjectName("listPopup")
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self._anchor = anchor
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(1, 1, 1, 1)
+        self.list = QListWidget()
+        self.list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        # Pointer cursor over every (selectable) item, like a real menu.
+        self.list.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
+        lay.addWidget(self.list)
+
+    def show_below(self) -> None:
+        """Size to the contents (capped) and drop the popup under its anchor."""
+        count = self.list.count()
+        if count:
+            row_h = max(self.list.sizeHintForRow(0), 18)
+            self.list.setFixedHeight(min(self._MAX_H, row_h * count + 6))
+        self.setMinimumWidth(max(self._anchor.width(), 190))
+        self.adjustSize()
+        below = self._anchor.mapToGlobal(QPoint(0, self._anchor.height()))
+        self.move(below)
+        self.show()
+        self.list.setFocus()
+
+    def hideEvent(self, event) -> None:  # noqa: N802
+        super().hideEvent(event)
+        self.deleteLater()
+
+
+class _RelationshipButton(QPushButton):
+    """Compact, fixed-width selector for a tier's edge to the tier above.
+
+    The popup lists **Parent** first, a divider, then the instance's issue
+    link-type names. Parent and link types are mutually exclusive (the model's
+    edge is ``parent`` XOR ``link``): picking Parent clears the links and picking
+    any link clears Parent. The multi-select stays open on each pick and closes
+    on an outside click. The caption shows only first letters (``P`` / ``B,L,R``)
+    so the row never widens; the full selection rides on the tooltip.
+    """
+
+    changed = Signal()
+    _SEP = "─" * 8
+    _PARENT = "\x00parent"  # sentinel key, never a real link-type name
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("relBtn")
+        # A compact flat chip, NOT qt-material's framed "secondary" button (which
+        # paints a wide accent border + full padding). Thin theme-neutral border,
+        # fixed size so a long link selection never widens the row.
+        self.setFixedSize(52, 22)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setStyleSheet(
+            "QPushButton { background: transparent; padding: 0 4px;"
+            " border: 1px solid rgba(128, 128, 128, 0.5); border-radius: 4px;"
+            " font-size: 12px; }"
+            "QPushButton:hover { background: rgba(128, 128, 128, 0.20);"
+            " border-color: rgba(128, 128, 128, 0.8); }"
+            "QPushButton:pressed { background: rgba(128, 128, 128, 0.12); }"
+        )
+        self._names: list[str] = []
+        self._links: list[str] = []
+        self._parent_edge = True
+        self._popup: _ListPopup | None = None
+        self.clicked.connect(self._open)
+        self._refresh()
+
+    def set_link_types(self, names: list[str]) -> None:
+        """Offer *names* as the selectable link types (keeps current selection)."""
+        self._names = list(names)
+        self._refresh()
+
+    def set_from_node(self, edge: str, link_types: list[str]) -> None:
+        """Adopt a node's edge: ``link`` with names → link mode, else Parent."""
+        self._links = list(link_types)
+        self._parent_edge = edge != "link" or not self._links
+        if self._parent_edge:
+            self._links = []
+        self._refresh()
+
+    @property
+    def edge(self) -> str:
+        return "parent" if self._parent_edge else "link"
+
+    def link_types(self) -> list[str]:
+        return [] if self._parent_edge else list(self._links)
+
+    def _toggle(self, key: str) -> None:
+        """Apply a pick, holding the Parent-XOR-links invariant. Testable hook."""
+        if key == self._PARENT:
+            self._parent_edge = True
+            self._links = []
+        elif key in self._links:
+            self._links.remove(key)
+            self._parent_edge = not self._links
+        else:
+            self._links.append(key)
+            self._parent_edge = False
+        self._refresh()
+        self.changed.emit()
+
+    def _refresh(self) -> None:
+        if self._parent_edge:
+            self.setText("P")
+            self.setToolTip("Edge to the tier above: Parent")
+        else:
+            self.setText(",".join((n[:1] or "?").upper() for n in self._links) or "·")
+            self.setToolTip("Edge: link types — " + ", ".join(self._links))
+
+    def _decorate(self, label: str, on: bool) -> str:
+        return ("✓ " if on else "    ") + label
+
+    def _open(self) -> None:
+        pop = _ListPopup(self)
+        lw = pop.list
+        p_item = QListWidgetItem(self._decorate("Parent", self._parent_edge))
+        p_item.setData(Qt.ItemDataRole.UserRole, self._PARENT)
+        lw.addItem(p_item)
+        sep = QListWidgetItem(self._SEP)
+        sep.setFlags(Qt.ItemFlag.NoItemFlags)
+        lw.addItem(sep)
+        for name in self._names:
+            it = QListWidgetItem(self._decorate(name, name in self._links))
+            it.setData(Qt.ItemDataRole.UserRole, name)
+            lw.addItem(it)
+        lw.itemClicked.connect(lambda item: self._on_pick(lw, item))
+        self._popup = pop
+        pop.show_below()
+
+    def _on_pick(self, lw: QListWidget, item: QListWidgetItem) -> None:
+        key = item.data(Qt.ItemDataRole.UserRole)
+        if key is None:  # the divider (NoItemFlags) never fires, but guard anyway
+            return
+        self._toggle(key)
+        for i in range(lw.count()):
+            it = lw.item(i)
+            k = it.data(Qt.ItemDataRole.UserRole)
+            if k is None:
+                continue
+            label = "Parent" if k == self._PARENT else k
+            on = (k == self._PARENT and self._parent_edge) or (
+                k != self._PARENT and k in self._links
+            )
+            it.setText(self._decorate(label, on))
+
+
+_AXIS_ICONS: dict[str, QIcon] = {}
+
+
+def _paint_axis(kind: str, on: bool) -> QPixmap:
+    """A 16px two-state glyph: an eye (``show``) or bars (``estimate``).
+
+    ``on`` paints it in a lit blue; ``off`` greys it and strikes a diagonal slash
+    so the disabled state reads as "crossed out".
+    """
+    s = 16
+    pix = QPixmap(s, s)
+    pix.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    fg = QColor("#3d8bfd") if on else QColor("#9aa0a6")
+    if kind == "show":
+        p.setPen(QPen(fg, 1.5))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        path = QPainterPath()
+        path.moveTo(2, 8)
+        path.quadTo(8, 1.5, 14, 8)
+        path.quadTo(8, 14.5, 2, 8)
+        p.drawPath(path)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(fg)
+        p.drawEllipse(QPoint(8, 8), 2, 2)
+    else:
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(fg)
+        for i, h in enumerate((5, 9, 7)):
+            p.drawRect(3 + i * 4, 12 - h, 3, h)  # baseline 12 keeps bars centred
+    if not on:
+        p.setPen(QPen(QColor("#d9534f"), 1.6))
+        p.drawLine(3, 14, 13, 3)
+    p.end()
+    return pix
+
+
+def _axis_icon(kind: str) -> QIcon:
+    """A checkable-button icon whose On/Off states are the lit/greyed glyph."""
+    icon = _AXIS_ICONS.get(kind)
+    if icon is None:
+        icon = QIcon()
+        icon.addPixmap(_paint_axis(kind, True), QIcon.Mode.Normal, QIcon.State.On)
+        icon.addPixmap(_paint_axis(kind, False), QIcon.Mode.Normal, QIcon.State.Off)
+        _AXIS_ICONS[kind] = icon
+    return icon
+
+
+# Small, flat, circular icon-button style shared by the card's three controls
+# (Show / Estimate toggles + remove), mirroring the report-item icon buttons so
+# they read as compact pills rather than full qt-material framed buttons. The
+# ``{color}`` slot is the resting glyph/text colour.
+_CARD_BTN_QSS = (
+    "QPushButton {{ background: transparent; border: none; padding: 0;"
+    " border-radius: 11px; color: {color}; font-size: 15px; }}"
+    "QPushButton:hover {{ background: rgba(128, 128, 128, 0.20); }}"
+    "QPushButton:pressed {{ background: rgba(128, 128, 128, 0.12); }}"
+)
+
+
+def _axis_toggle(kind: str, tooltip: str) -> QPushButton:
+    """A small, flat, circular checkable toggle for the per-card Show / Estimate
+    axes — styled like the report-item icon buttons (no qt-material frame); the
+    painted icon's On/Off states carry the lit-vs-greyed/crossed glyph."""
+    btn = QPushButton()
+    btn.setCheckable(True)
+    btn.setFixedSize(22, 22)
+    btn.setIcon(_axis_icon(kind))
+    btn.setIconSize(QSize(16, 16))
+    btn.setToolTip(tooltip)
+    btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    btn.setStyleSheet(_CARD_BTN_QSS.format(color="#999"))
+    return btn
+
+
+class _HierarchyItemCard(QWidget):
+    """One issue type within a tier silo — a compact, draggable card.
+
+    Layout: drag handle, type icon + name, the relationship selector (hidden on
+    the Epic tier, which has no tier above it), the Show / Estimate toggle
+    buttons, and a remove (×) button. :meth:`to_node` serialises it back to a
+    :class:`HierarchyNode`; the owning silo overrides ``display_tier`` to its own
+    tier on the way out.
+    """
+
+    drag_started = Signal(object)
+    removed = Signal(object)
+    changed = Signal()
+
+    def __init__(
+        self,
+        node: HierarchyNode,
+        link_type_names: list[str],
+        icon_bytes: bytes | None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("childRow")  # reuse the drop-flash selector
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.type_id = node.issue_type_id
+        self.type_name = node.issue_type
+        self.tier = node.display_tier
+        # Disambiguate same-named issue types by id across the whole card (the
+        # toggles/relationship keep their own tooltips on hover).
+        self.setToolTip(_type_tooltip(node.issue_type, node.issue_type_id))
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(6, 2, 6, 2)
+        lay.setSpacing(5)
+
+        # Every control is added with AlignVCenter so icons/text/buttons of
+        # differing natural heights share one centre line (no high/low drift).
+        mid = Qt.AlignmentFlag.AlignVCenter
+
+        self.drag_handle = _DragHandle()
+        self.drag_handle.drag_requested.connect(lambda: self.drag_started.emit(self))
+        lay.addWidget(self.drag_handle, 0, mid)
+
+        if icon_bytes:
+            icon_lbl = QLabel()
+            pix = QPixmap()
+            pix.loadFromData(icon_bytes)
+            icon_lbl.setPixmap(
+                pix.scaled(
+                    16,
+                    16,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+            icon_lbl.setFixedSize(16, 16)
+            icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            icon_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            lay.addWidget(icon_lbl, 0, mid)
+
+        name_lbl = QLabel(node.issue_type or node.issue_type_id)
+        name_lbl.setToolTip(_type_tooltip(node.issue_type, node.issue_type_id))
+        lay.addWidget(name_lbl, 1, mid)
+
+        self.rel = _RelationshipButton()
+        self.rel.set_link_types(link_type_names)
+        self.rel.set_from_node(node.edge, node.link_types)
+        self.rel.changed.connect(self.changed.emit)
+        lay.addWidget(self.rel, 0, mid)
+        if node.display_tier == 0:
+            self.rel.setVisible(False)  # the Epic tier has no edge above it
+
+        self.show_check = _axis_toggle("show", "Show this tier's issues in the report")
+        self.show_check.setChecked(node.show)
+        self.show_check.toggled.connect(lambda *_: self.changed.emit())
+        lay.addWidget(self.show_check, 0, mid)
+
+        self.est_check = _axis_toggle(
+            "estimate", "Count this tier's issues in the metrics"
+        )
+        self.est_check.setChecked(node.in_estimate)
+        self.est_check.toggled.connect(lambda *_: self.changed.emit())
+        lay.addWidget(self.est_check, 0, mid)
+
+        remove = QPushButton("✕")
+        remove.setFixedSize(22, 22)
+        remove.setCursor(Qt.CursorShape.PointingHandCursor)
+        remove.setToolTip("Remove from the hierarchy")
+        remove.setStyleSheet(_CARD_BTN_QSS.format(color="#DE350B"))  # danger red
+        remove.clicked.connect(lambda: self.removed.emit(self))
+        lay.addWidget(remove, 0, mid)
+
+    def to_node(self) -> HierarchyNode:
+        """Serialise the card's widgets into a :class:`HierarchyNode`."""
+        return HierarchyNode(
+            issue_type_id=self.type_id,
+            issue_type=self.type_name,
+            edge=self.rel.edge,
+            link_types=self.rel.link_types(),
+            display_tier=self.tier,
+            show=self.show_check.isChecked(),
+            in_estimate=self.est_check.isChecked(),
+        )
+
+
+class _TierSilo(QWidget):
+    """One tier column: a titled, drop-accepting card list + a dashed "+ Add".
+
+    Cards reorder within the silo and move between silos (a cross-silo drop
+    changes their ``display_tier``). The "+ Add" button opens a height-capped
+    picker of the issue types not yet placed in *any* silo; choosing one emits
+    :attr:`type_chosen`. The owning editor coordinates drags via shared state.
+    """
+
+    _MIME = "application/x-erg-hierarchy-card"
+    type_chosen = Signal(int, str)  # (tier, type_id)
+
+    def __init__(
+        self,
+        editor: IssueHierarchyEditor,
+        tier: int,
+        title: str,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._editor = editor
+        self.tier = tier
+        self.setObjectName("tierSilo")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setAcceptDrops(True)
+        self._cards: list[_HierarchyItemCard] = []
+        self._available: list[dict] = []
+        self._icons: dict[str, bytes | None] = {}
+        self._add_popup: _ListPopup | None = None
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(6, 6, 6, 6)
+        root.setSpacing(6)
+
+        header = QLabel(title)
+        header.setProperty("subheading", "true")
+        root.addWidget(header)
+
+        self._card_box = QVBoxLayout()
+        self._card_box.setContentsMargins(0, 0, 0, 0)
+        self._card_box.setSpacing(4)
+        root.addLayout(self._card_box)
+
+        self._add_btn = QPushButton("＋  Add")
+        self._add_btn.setProperty("addType", "true")
+        self._add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._add_btn.setToolTip("Add an issue type to this tier")
+        self._add_btn.clicked.connect(self._open_add)
+        root.addWidget(self._add_btn)
+        root.addStretch(1)
+
+    # -- card management -----------------------------------------------------
+
+    @property
+    def cards(self) -> list[_HierarchyItemCard]:
+        return list(self._cards)
+
+    def add_card(self, card: _HierarchyItemCard, index: int = -1) -> None:
+        card.drag_started.connect(self._editor._start_drag)
+        card.changed.connect(self._editor._on_card_changed)
+        card.removed.connect(self._editor._remove_card)
+        if index < 0 or index >= len(self._cards):
+            self._cards.append(card)
+            self._card_box.addWidget(card)
+        else:
+            self._cards.insert(index, card)
+            self._card_box.insertWidget(index, card)
+
+    def remove_card(self, card: _HierarchyItemCard) -> None:
+        if card in self._cards:
+            self._cards.remove(card)
+            self._card_box.removeWidget(card)
+
+    def clear(self) -> None:
+        for card in self._cards:
+            self._card_box.removeWidget(card)
+            card.deleteLater()
+        self._cards.clear()
+
+    def move_within(self, card: _HierarchyItemCard, index: int) -> None:
+        if card not in self._cards:
+            return
+        cur = self._cards.index(card)
+        index = max(0, min(index, len(self._cards) - 1))
+        if index == cur:
+            return
+        self._cards.pop(cur)
+        self._cards.insert(index, card)
+        self._card_box.removeWidget(card)
+        self._card_box.insertWidget(index, card)
+
+    def _insertion_index(self, y: int) -> int:
+        for i, card in enumerate(self._cards):
+            top = card.mapTo(self, card.rect().topLeft()).y()
+            if y < top + card.height() / 2:
+                return i
+        return len(self._cards)
+
+    # -- add picker ----------------------------------------------------------
+
+    def set_available(self, types: list[dict], icons: dict[str, bytes | None]) -> None:
+        """Offer *types* (already filtered to the unused ones) in the picker."""
+        self._available = list(types)
+        self._icons = dict(icons or {})
+        self._add_btn.setEnabled(bool(self._available))
+
+    def _open_add(self) -> None:
+        if not self._available:
+            return
+        pop = _ListPopup(self._add_btn)
+        for t in self._available:
+            it = QListWidgetItem(
+                _pixmap_icon(self._icons.get(t["id"])), t.get("name") or t["id"]
+            )
+            it.setData(Qt.ItemDataRole.UserRole, t["id"])
+            it.setToolTip(_type_tooltip(t.get("name") or "", str(t.get("id", ""))))
+            pop.list.addItem(it)
+
+        def _pick(item: QListWidgetItem) -> None:
+            type_id = item.data(Qt.ItemDataRole.UserRole)
+            pop.hide()
+            self.type_chosen.emit(self.tier, type_id)
+
+        pop.list.itemClicked.connect(_pick)
+        self._add_popup = pop
+        pop.show_below()
+
+    # -- drag/drop -----------------------------------------------------------
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802
+        if self._editor._drag_card is not None and event.mimeData().hasFormat(
+            self._MIME
+        ):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:  # noqa: N802
+        if self._editor._drag_card is None:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        # Live reorder only within the source silo; cross-silo lands on drop.
+        if self._editor._drag_source is self:
+            card = self._editor._drag_card
+            cur = self._cards.index(card)
+            insert_at = self._insertion_index(event.position().toPoint().y())
+            target = insert_at - 1 if insert_at > cur else insert_at
+            if target != cur:
+                self.move_within(card, target)
+
+    def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802
+        if self._editor._drag_card is None:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        index = self._insertion_index(event.position().toPoint().y())
+        self._editor._handle_drop(self, index)
+
+
+class IssueHierarchyEditor(QWidget):
+    """Three-silo constructor for a profile's custom issue-type hierarchy.
+
+    Each tier (Epic / Standard / Sub-task) is a :class:`_TierSilo` column holding
+    the issue types mapped to it, with a "+ Add" picker of the still-unused types
+    and per-card Show / Estimate toggles plus a relationship selector. Cards drag
+    within and between silos (a cross-silo drop changes the type's
+    ``display_tier``). All silos empty ⇒ :meth:`to_hierarchy` returns ``[]`` ⇒ the
+    classic Epic→Standard→Sub-task default. The public surface
+    (``set_types``/``set_hierarchy``/``to_hierarchy``/``set_busy`` +
+    ``changed``/``refresh_requested``) is unchanged from the old chain editor, so
+    the data model and report output stay identical for existing profiles.
+    """
+
+    changed = Signal()
+    refresh_requested = Signal()
+
+    # Below ~this width per column the three silos can't sit side-by-side
+    # legibly, so they stack into one-above-another blocks instead.
+    _MIN_SILO_W = 225
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._types: list[dict] = []
+        self._link_type_names: list[str] = []
+        self._icons: dict[str, bytes | None] = {}
+        self._drag_card: _HierarchyItemCard | None = None
+        self._drag_source: _TierSilo | None = None
+        self._stacked = False  # silos side-by-side until the row gets too narrow
+        self._spacer: QSpacerItem | None = None
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(8)
+
+        # Prompt shown when no types are loaded (empty / disconnected).
+        self._prompt = QLabel(
+            "Connect to Jira and click Refresh from Jira to load issue types, "
+            "then place them across the Epic / Standard / Sub-task tiers with "
+            "each tier's + Add. Leave every tier empty to use the default "
+            "Epic → Standard → Sub-task."
+        )
+        self._prompt.setWordWrap(True)
+        self._prompt.setProperty("hint", "true")
+        root.addWidget(self._prompt)
+
+        self._silos_row = QHBoxLayout()
+        self._silos_row.setContentsMargins(0, 0, 0, 0)
+        self._silos_row.setSpacing(8)
+        self._silos_row.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self._silos: list[_TierSilo] = []
+        for tier, title in enumerate(_TIER_TITLES):
+            silo = _TierSilo(self, tier, title)
+            silo.type_chosen.connect(self._add_type)
+            self._silos.append(silo)
+            self._silos_row.addWidget(silo, 1)
+        root.addLayout(self._silos_row)
+
+        # Inline warnings (stale chain references after a Refresh / Validate).
+        self._warnings = QLabel("")
+        self._warnings.setWordWrap(True)
+        self._warnings.setVisible(False)
+        self._warnings.setStyleSheet("QLabel { color: #ff8f00; }")
+        root.addWidget(self._warnings)
+
+        self._refresh_btn = QPushButton("Refresh from Jira")
+        self._refresh_btn.setProperty("secondary", "true")
+        self._refresh_btn.setToolTip("Re-fetch issue types, link types, and icons")
+        self._refresh_btn.clicked.connect(self.refresh_requested.emit)
+        root.addWidget(self._refresh_btn)
+
+        self._update_prompt()
+
+    # -- responsive layout ---------------------------------------------------
+
+    def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802
+        """Stack the three tier silos vertically when the row gets too narrow."""
+        super().resizeEvent(event)
+        need = 3 * self._MIN_SILO_W + 2 * self._silos_row.spacing()
+        self._relayout(stack=self.width() < need)
+
+    def _relayout(self, *, stack: bool) -> None:
+        """Flip the silos between side-by-side columns and stacked blocks."""
+        if stack == self._stacked:
+            return
+        self._stacked = stack
+        row = self._silos_row
+        if self._spacer is not None:
+            row.removeItem(self._spacer)
+            self._spacer = None
+        if stack:
+            row.setDirection(QBoxLayout.Direction.TopToBottom)
+            for silo in self._silos:
+                row.setStretch(row.indexOf(silo), 0)  # natural height, packed top
+            self._spacer = QSpacerItem(
+                0, 0, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding
+            )
+            row.addItem(self._spacer)
+        else:
+            row.setDirection(QBoxLayout.Direction.LeftToRight)
+            for silo in self._silos:
+                row.setStretch(row.indexOf(silo), 1)  # equal-width columns
+
+    # -- population ----------------------------------------------------------
+
+    def has_types(self) -> bool:
+        """Whether issue types have been loaded from Jira."""
+        return bool(self._types)
+
+    def set_busy(self, busy: bool) -> None:
+        """Toggle the Refresh button while a background fetch runs."""
+        self._refresh_btn.setEnabled(not busy)
+        self._refresh_btn.setText("Refreshing…" if busy else "Refresh from Jira")
+
+    def set_types(
+        self,
+        types: list[dict],
+        link_types: list[dict],
+        icons: dict[str, bytes | None] | None = None,
+    ) -> None:
+        """Load the instance's types/link types, preserving the current chain.
+
+        The chain is re-built from its current nodes; types not in it become
+        available in every silo's "+ Add" picker.
+        """
+        chain = self.to_hierarchy()
+        self._types = list(types)
+        self._link_type_names = [lt["name"] for lt in link_types if lt.get("name")]
+        self._icons = dict(icons or {})
+        # Refine offline-migrated nodes: backfill an empty id by exact type name
+        # so a chain restored without Jira metadata gains real ids (and icons).
+        by_name = {t.get("name"): t["id"] for t in self._types if t.get("name")}
+        for node in chain:
+            if not node.issue_type_id:
+                node.issue_type_id = by_name.get(node.issue_type, "")
+        if not chain and self._types:
+            # First load with no saved chain: materialise the recommended Jira
+            # default — Epic / Story·Task·Bug / Sub-task only, resolved against the
+            # instance's live types. All-parent, so it stays on the fast fetch path
+            # (now type-filtering); any other type is added via each tier's "+ Add".
+            chain = canonical_default_hierarchy(self._types)
+        self.set_hierarchy(chain)
+        self._warnings.setVisible(False)
+
+    def set_hierarchy(self, chain: list[HierarchyNode]) -> None:
+        """Distribute *chain* into the silos by display tier; refresh pickers."""
+        for silo in self._silos:
+            silo.clear()
+        for node in chain:
+            tier = node.display_tier if 0 <= node.display_tier <= 2 else 1
+            self._silos[tier].add_card(self._build_card(node))
+        self._refresh_available()
+        self._apply_cascade()
+        self._update_prompt()
+
+    def to_hierarchy(self) -> list[HierarchyNode]:
+        """Serialise the silos to nodes in tier-then-position order."""
+        out: list[HierarchyNode] = []
+        for silo in self._silos:
+            for card in silo.cards:
+                node = card.to_node()
+                node.display_tier = silo.tier
+                out.append(node)
+        return out
+
+    # -- row construction ----------------------------------------------------
+
+    def _build_card(self, node: HierarchyNode) -> _HierarchyItemCard:
+        return _HierarchyItemCard(
+            node, self._link_type_names, self._icons.get(node.issue_type_id)
+        )
+
+    def _default_node(self, type_id: str, type_name: str) -> HierarchyNode:
+        """A default node for a freshly-added type (tier/show from Jira metadata).
+
+        Tier is guessed from the type's ``hierarchyLevel`` (>=1=Epic, 0=Standard,
+        <0=Sub-task) when known; sub-tasks default to hidden but still estimated.
+        The caller overrides ``display_tier`` to the silo the user added into.
+        """
+        meta = next((t for t in self._types if t["id"] == type_id), {})
+        level = meta.get("hierarchyLevel")
+        subtask = bool(meta.get("subtask"))
+        if subtask or (isinstance(level, int) and level < 0):
+            tier, show = 2, False
+        elif isinstance(level, int) and level >= 1:
+            tier, show = 0, True
+        else:
+            tier, show = 1, True
+        return HierarchyNode(
+            issue_type_id=type_id,
+            issue_type=type_name,
+            display_tier=tier,
+            show=show,
+        )
+
+    def _used_type_ids(self) -> set[str]:
+        return {c.type_id for silo in self._silos for c in silo.cards}
+
+    def _refresh_available(self) -> None:
+        """Offer every loaded type not already placed in a silo to all pickers."""
+        used = self._used_type_ids()
+        avail = [t for t in self._types if t["id"] not in used]
+        for silo in self._silos:
+            silo.set_available(avail, self._icons)
+
+    def _add_type(self, tier: int, type_id: str) -> None:
+        """Add *type_id* into the *tier* silo (from its "+ Add" picker)."""
+        name = next(
+            (t.get("name") or t["id"] for t in self._types if t["id"] == type_id),
+            type_id,
+        )
+        node = self._default_node(type_id, name)
+        node.display_tier = tier  # honour the silo the user added into
+        self._silos[tier].add_card(self._build_card(node))
+        self._refresh_available()
+        self._apply_cascade()
+        self._update_prompt()
+        self.changed.emit()
+
+    def _remove_card(self, card: _HierarchyItemCard) -> None:
+        """Drop *card* (its × button) and re-offer its type in the pickers."""
+        silo = self._silo_of(card)
+        if silo is None:
+            return
+        silo.remove_card(card)
+        card.deleteLater()
+        self._refresh_available()
+        self._apply_cascade()
+        self._update_prompt()
+        self.changed.emit()
+
+    # -- cascade & guards ----------------------------------------------------
+
+    def _on_card_changed(self) -> None:
+        self._apply_cascade()
+        self.changed.emit()
+
+    def _apply_cascade(self) -> None:
+        """Grey each card's Show / Estimate per the down-tier AND cascade.
+
+        Both axes cascade the same way (mirroring :meth:`JiraClient.apply_hierarchy`):
+        a tier with no shown (resp. estimated) node greys the matching toggle of
+        every tier below it, since a hidden/excluded ancestor tier hides/excludes
+        its descendants.
+        """
+        cards: list[_HierarchyItemCard] = []
+        tiers: list[int] = []
+        for silo in self._silos:
+            for card in silo.cards:
+                cards.append(card)
+                tiers.append(silo.tier)
+        show_flags = cascade_flags([c.show_check.isChecked() for c in cards], tiers)
+        est_flags = cascade_flags([c.est_check.isChecked() for c in cards], tiers)
+        for c, sf, ef in zip(cards, show_flags, est_flags):
+            c.show_check.setEnabled(sf)
+            c.est_check.setEnabled(ef)
+
+    def guard_messages(self) -> list[str]:
+        """Blocking guard errors (empty active chain = default → none)."""
+        nodes = self.to_hierarchy()
+        if not nodes:
+            return []
+        msgs: list[str] = []
+        if not any(n.display_tier == 0 for n in nodes):
+            msgs.append("The hierarchy needs at least one Epic-tier (tier 0) type.")
+        # Empty ids are an offline/migration state (a chain restored without Jira
+        # metadata, ids backfilled on the next Refresh) — not real duplicates, so
+        # skip them; otherwise a migrated 3-node chain self-collides and blocks.
+        counts: dict[str, int] = {}
+        for n in nodes:
+            if n.issue_type_id:
+                counts[n.issue_type_id] = counts.get(n.issue_type_id, 0) + 1
+        dups = [
+            n.issue_type
+            for n in nodes
+            if n.issue_type_id and counts[n.issue_type_id] > 1
+        ]
+        if dups:
+            names = ", ".join(dict.fromkeys(dups))
+            msgs.append(f"Duplicate issue type(s) in the chain: {names}")
+        return msgs
+
+    def stale_warnings(self) -> list[str]:
+        """Non-blocking warnings for chain refs missing from the loaded metadata."""
+        if not self._types:
+            return []
+        known_types = {t["id"] for t in self._types}
+        known_links = set(self._link_type_names)
+        out: list[str] = []
+        for node in self.to_hierarchy():
+            if node.issue_type_id not in known_types:
+                out.append(
+                    f"Issue type '{node.issue_type or node.issue_type_id}' "
+                    "no longer exists in Jira."
+                )
+            for lt in node.link_types:
+                if lt not in known_links:
+                    out.append(f"Link type '{lt}' no longer exists in Jira.")
+        return out
+
+    def show_warnings(self, messages: list[str]) -> None:
+        """Render *messages* in the inline warning label (hidden when empty)."""
+        if messages:
+            self._warnings.setText(" • ".join(messages))
+            self._warnings.setVisible(True)
+        else:
+            self._warnings.clear()
+            self._warnings.setVisible(False)
+
+    # -- drag coordination ---------------------------------------------------
+
+    def _silo_of(self, card: QWidget) -> _TierSilo | None:
+        for silo in self._silos:
+            if card in silo.cards:
+                return silo
+        return None
+
+    def _start_drag(self, card: _HierarchyItemCard) -> None:
+        source = self._silo_of(card)
+        if source is None:
+            return
+        self._drag_card = card
+        self._drag_source = source
+
+        drag = QDrag(card)
+        mime = QMimeData()
+        mime.setData(_TierSilo._MIME, b"card")
+        drag.setMimeData(mime)
+        accent = card.palette().highlight().color()
+        pixmap = card.grab()
+        drag.setPixmap(lifted_card_pixmap(pixmap, accent))
+        drag.setHotSpot(QPoint(12, pixmap.height() // 2))
+
+        ghost = QGraphicsOpacityEffect(card)
+        ghost.setOpacity(0.4)
+        card.setGraphicsEffect(ghost)
+
+        drag.exec(Qt.DropAction.MoveAction)  # blocks until the drop completes
+
+        # The card may have been rebuilt on a cross-silo drop; guard the wrapper.
+        if isValid(card):
+            card.setGraphicsEffect(None)
+            if self._silo_of(card) is not None:
+                flash_highlight(card, accent, selector="#childRow")
+        self._drag_card = None
+        self._drag_source = None
+
+    def _handle_drop(self, target: _TierSilo, index: int) -> None:
+        """Move the in-flight card into *target* (a cross-silo drop retiers it)."""
+        card = self._drag_card
+        source = self._drag_source
+        if card is None or source is None:
+            return
+        if source is target:
+            # The live dragMoveEvent already repositioned the card using the
+            # same-cell compensation; re-apply it here so a lower-half drop
+            # doesn't overshoot by one (the raw insertion index counts the
+            # dragged card's own slot). Mirrors dragMoveEvent above.
+            cur = target._cards.index(card)
+            target.move_within(card, index - 1 if index > cur else index)
+        else:
+            # Rebuild the card in the target silo at its new tier, preserving the
+            # type's show / estimate / relationship state.
+            node = card.to_node()
+            node.display_tier = target.tier
+            source.remove_card(card)
+            card.deleteLater()
+            target.add_card(self._build_card(node), index)
+            # The dragged wrapper is gone; stop _start_drag touching it.
+            self._drag_card = None
+        self._refresh_available()
+        self._apply_cascade()
+        self._update_prompt()
+        self.changed.emit()
+
+    def _update_prompt(self) -> None:
+        """Show the connect/refresh prompt only when nothing is loaded or set."""
+        empty = not self._types and not self._used_type_ids()
+        self._prompt.setVisible(empty)

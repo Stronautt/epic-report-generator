@@ -57,6 +57,30 @@ class TestDefaults:
         # Lives inside each profile, like the other Report Content toggles.
         assert "report_force_light" in PROFILE_KEYS
 
+    def test_issue_hierarchy_default_empty(self, tmp_path: Path) -> None:
+        mgr = _make_manager(tmp_path)
+        assert mgr.get("issue_hierarchy") == []
+
+    def test_issue_hierarchy_is_profile_scoped(self) -> None:
+        # The custom chain belongs to the report profile, not global config.
+        assert "issue_hierarchy" in PROFILE_KEYS
+
+    def test_issue_hierarchy_round_trips(self, tmp_path: Path) -> None:
+        chain = [
+            {"issue_type_id": "1", "issue_type": "Epic", "display_tier": 0},
+            {
+                "issue_type_id": "2",
+                "issue_type": "Sub-task",
+                "display_tier": 2,
+                "show": False,
+            },
+        ]
+        mgr = _make_manager(tmp_path)
+        mgr.set("issue_hierarchy", chain)
+        reloaded = _make_manager(tmp_path)
+        reloaded._load()
+        assert reloaded.get("issue_hierarchy") == chain
+
 
 class TestSetAndGet:
     """Setting values should persist and be retrievable."""
