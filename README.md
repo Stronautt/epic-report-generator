@@ -18,27 +18,45 @@ Epic Report Generator is a desktop app that connects to Jira Cloud, pulls Epic p
 
 - **FR-01. Jira API Integration:** The system must connect to Jira's REST API using user-provided credentials (API Token/Basic Auth) to fetch issue data.
 - **FR-02. Configuration (Epics Extraction):** The app must allow users to define Epic keys to specify which issues should be included in the report.
-- **FR-03. Report Metadata:** Users must be able to specify report metadata: "Report Title", "Author Name", "Project Display Name, "Report Date".
-- **FR-04. Custom Field Mapping:** The system must allow users to specify custom Jira field IDs (e.g., customfield_10106) for "Story Points" and "Epic Link" to ensure compatibility with Jira instances using non-standard field naming.
+- **FR-03. Report Metadata:** Users must be able to specify report metadata: "Report Title", "Author Name", "Project Display Name", and "Report Date".
+- **FR-04. Custom Field Mapping:** The system must allow users to specify custom Jira field IDs (e.g., `customfield_10106`) for "Story Points" and "Epic Link" to ensure compatibility with Jira instances using non-standard field naming.
 - **FR-05. Epic-Level Aggregation:** The system must aggregate child issue data (Stories/Tasks) into a high-level "Epic Progress Summary" table, including completion percentages.
 - **FR-06. Burndown/Burnup Visualization:** The app must generate time-series charts for each Epic showing Total Story Points, Completed Story Points, Cumulative Issues, and Unestimated Issues over time.
 - **FR-07. Velocity Calculation:** The system must calculate a rolling velocity based on the last 4 weeks of work (e.g., "4.0 SP/wk") to drive completion estimates.
 - **FR-08. Cycle Time Analysis:** The system must calculate the Average Cycle Time (in days) for issues within a specific Epic.
 - **FR-09. Scope Change Tracking:** The app must calculate and report the percentage of Scope Change to indicate how much an Epic's requirements have grown since its inception.
 - **FR-10. Predictive Forecasting:** Based on current velocity and remaining story points, the system must generate a Forecast Completion Date for each Epic.
-- **FR-11. PDF Report Generation:** The app must compile all tables and charts into a multi-page PDF document.
-- **FR-12. Jira Label Aggregation:** The system must aggregate child issue data (Stories/Tasks) into a high-level "Label Progress Summary" table, including completion percentages. There should be the ability to add a custom display name to each label that will appear in the report.
-- **FR-13. Scope Certainty:** The system must allow users to set Scope certainty as "Low' or "Medium" or "High" for each label and/or epic during the Report configuration ("STEP 1. Configuration").The "Label Certainty" dropdown should include a “Consolidated” option, allowing users to set individual certainty values for each epic associated with the label. While this option is named 'Consolidated' in the configuration settings, the report itself should display 'Low,' 'Medium,' or 'High' based on the average certainty values of the underlying child epics.
-- **FR-14. Report Items Re-ordering:** It should be possible to drag the items in the list to change the order in the final report.
-- **FR-15. Custom Issue-Type Hierarchy:** Each report profile may define a custom issue-type hierarchy — an ordered chain of Jira issue types collapsed into the three display tiers (Epic / Story / Sub-task), where each tier connects to the one above by either the native `parent` relationship or one-or-more issue link types. Per-type **Show** (display) and **Estimate** (metrics) toggles cascade down the chain, replacing the old global subtask checkboxes. An empty chain derives the classic Epic→Story→Sub-task default, so existing profiles are migrated automatically and render unchanged.
+- **FR-11. PDF Report Generation & Styling:** The app must compile all tables and charts into a multi-page PDF document. It must support adding a customizable footer (e.g., `"CONFIDENTIAL — {company}"`) to every page and offer an "Always use light theme for report" option to override dark UI themes during export.
+- **FR-12. Jira Label Aggregation & Drill-Down:** The system must aggregate child issue data into a high-level "Label Progress Summary" table. Users must be able to drill down into any report row to view, rename, reorder, or exclude underlying child items (epics in a label, or stories/tasks in an epic), with these adjustments persisting between sessions.
+- **FR-13. Scope Certainty:** The system must allow users to set Scope certainty ("Low", "Medium", "High") during configuration. The "Label Certainty" dropdown must include a "Consolidated" option to display an average calculated from underlying child epics. The final report's "Scope Certainty" column must render conditionally, displaying only if at least one certainty value has been configured.
+- **FR-14. Interactive Hierarchy Customization:** Users must be able to drag-and-drop rows to manually re-order report items, rename them, or drop undesired items from both high-level lists and deep-dive drill-downs.
+- **FR-15. Flexible Issue-Type Mapping:** The system must map complex, multi-tiered Jira hierarchies (e.g., `Capability` → `Feature` → `Story` → `Task` → `Sub-task`) into the report's three standardized display tiers: "Epic", "Story", and "Sub-task". 
+- **FR-16. Interactive Chain Configuration:** The system must provide a drag-and-drop interface with drag-handles on each row to allow users to manually reorder the active hierarchy chain.
+- **FR-17. Advanced Edge Definition (Parent vs. Link):** For each issue type in the hierarchy, the system must support connecting to the tier above using either:
+    * **Parent Relationship:** Jira's native parent/child link.
+    * **Link Relationship:** One or more specified issue-link types (matched bidirectionally), displaying a multi-select dropdown for link types only when "Link" is active.
+- **FR-18. Granular Display & Estimation Toggles:** Each active row must expose two independent controls:
+    * **Show:** Toggles the display of this issue type (summary rows, timeline bars, icons) in the final report.
+    * **Estimate:** Dictates whether issues of this type count toward progress percentages, metrics, and estimate weight.
+- **FR-19. Cascading Toggle Validation:** Disabling either "Show" or "Estimate" on a parent row must automatically disable and grey out that toggle for all child tiers below it in the chain (ensuring nested children cannot render or be counted if their parent type is ignored).
+- **FR-20. Exclude Pool Partitioning:** The UI must feature an "Exclude" pool where users can park unneeded Jira issue types. Parked types must be ignored during data fetching, and users must be able to drag them back into the active chain at any time.
+- **FR-21. Zero-Configuration Fallback:** On the first launch, the app must automatically pull configuration data from Jira to construct a default chain. If left unmodified, the system must seamlessly fall back to the standard `Epic` → `Story` → `Sub-task` processing behavior.
+- **FR-22. Non-Blocking Live Schema Sync:** The system must provide a "Refresh" capability to fetch updated issue types, link types, and icons from the Jira instance. The sync process must retain existing user-configured hierarchy mappings and, if a previously configured issue/link type no longer exists in Jira, warn the user rather than block app execution.
+- **FR-23. In-App Interactive Preview:** The app must render a fully scrollable, window-fitted preview of the generated report so users can read the entire document before exporting.
+- **FR-24. Data & Connection Validation:** The app must feature a "Validate" tool to check epics and labels against Jira's API. It must block report generation on critical errors (e.g., missing issues) while flagging warnings for non-critical anomalies.
+- **FR-25. Built-In Help & Guidance:** The interface must feature an easily accessible Help panel to assist users with configuration and syntax directly in-app.
 
 ## Non-Functional Requirements
 
-- **NFR-01. Security (Auth):** The application must not store plain-text passwords; it should prefer Jira API Tokens and environment variables for sensitive data.
-- **NFR-02. Portability:** The application should be cross-platform (Windows/Mac/Linux).
-- **NFR-03. Reliability:** The system must include error handling for API connection failures and provide meaningful logs to the user.
-- **NFR-04. UI:** The “Epic Progress Summary” should be configured to fit precisely on a single page, with the layout automatically scaling its vertical dimensions based on the cumulative height of the tables
-- **NFR-05. UI:** The app and the report must support theme customization — a custom accent colour and a custom font (loaded from a file or by Google Fonts name), applied to both the UI and the generated PDF, persisted between sessions, and resettable to defaults.
+-   **NFR-01. Security (Auth):** The application must not store plain-text passwords; it must secure sensitive credentials using Jira API Tokens and system environment variables.
+-   **NFR-02. Portability & Distribution:** The application must be cross-platform (Windows, macOS, Linux). macOS builds must support native `.dmg` installation and comply with App Store sandboxing requirements (via TestFlight support).
+-   **NFR-03. Reliability & Connection Resilience:** The system must gracefully handle network failures, slow speeds, or dead Jira API connections without crashing or locking up the UI.
+-   **NFR-04. Dynamic UI Layout:** The "Epic Progress Summary" page and generated PDFs must dynamically adjust their vertical scaling based on the cumulative height of tables, preventing text clipping or unnatural overflows.
+-   **NFR-05. App & Report Theming:** The app must support theme customization (accent color, font loader via file or Google Fonts) persisted between sessions. It must include a default "System" theme that syncs live with the operating system's light/dark settings.
+-   **NFR-06. Performance (Non-Blocking UI):** Long-running tasks—such as authenticating with Jira, fetching massive issue datasets, and compiling PDF outputs—must run asynchronously, ensuring the UI remains snappy and responsive.
+-   **NFR-07. Multi-Language / CJK Character Support:** The application must correctly render Chinese, Japanese, and Korean (CJK) characters both in the UI screens and in the exported PDF reports.
+-   **NFR-08. UX State Persistence:** The application must remember and restore user preferences between sessions, including the window size/position, the last-used export directory, and customized row configurations.
+-   **NFR-09. Backward Compatibility:** The system must gracefully handle legacy configuration files (such as migrating old global subtask/timeline checkboxes onto the new three-silo hierarchy model) automatically on first launch without breaking existing setups.
 
 ## Quick start
 
